@@ -1,0 +1,7 @@
+Kestrel / V0.beta / (dark slightly transparent gray) Developed By Open Intelagence.
+
+  > | Chat With Model (:model name here:)
+  | Select Model(s).
+  | Configure Kestrel.
+  | Import Models.
+  | Exit.

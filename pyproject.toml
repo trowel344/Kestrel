@@ -1,0 +1,52 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "W", "I"]
+ignore = [
+  "E501",   # long lines are intentional in compact CLI/UI formatting
+  "E402",   # module-level lazy imports are used to keep heavy deps import-free
+  "W605",   # intentional backslash escapes in strings/UI frames
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["B905"]  # several scripts zip pairwise, differing-length iterables
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kestrel"
+version = "1.1.0"
+description = "Hardware-aware local model orchestration, conversion, and management"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "gguf>=0.19",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+convert = [
+    "torch>=2.0",
+    "safetensors",
+]
+
+[project.scripts]
+kestrel = "kestrel.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kestrel*"]
