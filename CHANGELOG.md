@@ -2,6 +2,37 @@
 
 All notable changes are documented here. Kestrel follows semantic versioning.
 
+## [1.2.0] - 2026-08-03
+
+### Added
+
+- Experimental expert pruning in the converter: `convert --experts-keep K` and
+  `--expert-importance file` (always `>= num_experts_per_tok` and `< n_exp`;
+  opt-in, never the default). The emitted GGUF is fully self-consistent:
+  catalog, metadata, and every write loop agree on the kept expert count.
+- Memory-adaptive launch mode via `run/chat --target auto|balanced|quality|speed`:
+  `quality` disables MTP and shrinks the ubatch; `speed` (experimental, never
+  auto-selected) relaxes the 8 GiB MTP auto-disable and raises the CPU-MoE batch
+  only when RAM >= 4096 MiB and never lowers an existing batch.
+- Persistent llama.cpp capability cache (keyed by binary mtime+size), so the
+  `--help`/`--version` probe subprocess is skipped on repeated launches.
+- `run/chat --warm-cache`: bounded 64 MiB pre-read of the model and sidecars to
+  prime the page cache for faster loads.
+- Ollama listing TTL cache (4s) with invalidation on `pull_ollama`, so the menu
+  no longer re-spawns `ollama list` on every redraw.
+- Uniform `--kv-cache-type` choices (`f16/bf16/q8_0/q4_0/q4_1`) across
+  `run`/`chat`/`benchmark`.
+- Ollama blob isolation: a GGUF blob is only reused when it lives inside a
+  managed Ollama root, closing arbitrary-file disclosure via tampered modelfiles.
+
+### Fixed
+
+- `detect_gpu` misalignment when nvidia-smi reports GPU names containing commas.
+- Clear exit message when llama.cpp crashes; clear "exceeded 30 minutes" message
+  instead of a raw `subprocess.TimeoutExpired` traceback.
+- Reject `convert --file` names starting with `-` (flag-injection guard); hint
+  at `--include`.
+
 ## Unreleased
 
 - Add a stdlib-only terminal UI layer (`kestrel.ui`) with ANSI colors, framed

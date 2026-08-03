@@ -22,4 +22,4 @@ def __getattr__(name):
     globals()[name] = value
     return value
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
