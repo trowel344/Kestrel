@@ -33,6 +33,13 @@ All notable changes are documented here. Kestrel follows semantic versioning.
 - Reject `convert --file` names starting with `-` (flag-injection guard); hint
   at `--include`.
 
+### Developer
+
+- Add `scripts/benchmark_speedups.py`, a stdlib-only, no-real-binary benchmark
+  that reproduces the per-launch wall-clock the new caches remove (capability
+  probe, `ollama list`, and `--warm-cache` pre-read) for verification on
+  hardware during the release gate.
+
 ## Unreleased
 
 - Add a stdlib-only terminal UI layer (`kestrel.ui`) with ANSI colors, framed

@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -195,12 +196,20 @@ class VersionResolutionTests(unittest.TestCase):
 
     def test_falls_back_to_pyproject_when_metadata_missing(self):
         namespace = ModuleType("kestrel")
+        root = Path(__file__).resolve().parents[1]
+        pyproject_version = None
+        for line in (root / "pyproject.toml").read_text().splitlines():
+            match = re.match(r'^version\s*=\s*["\']([^"\']+)["\']', line.strip())
+            if match:
+                pyproject_version = match.group(1)
+                break
+        self.assertIsNotNone(pyproject_version)
         with mock.patch.dict(
             "sys.modules", {"kestrel": namespace}
         ), mock.patch.object(
             _metadata, "version", side_effect=_metadata.PackageNotFoundError("kestrel")
         ):
-            self.assertEqual(_kestrel_version(), "1.1.0")
+            self.assertEqual(_kestrel_version(), pyproject_version)
 
     def test_falls_back_to_unknown_without_metadata_or_pyproject(self):
         namespace = ModuleType("kestrel")
