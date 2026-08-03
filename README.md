@@ -409,3 +409,39 @@ unwired vLLM prototypes are preserved under `research/archive`, outside the
 installed package. See `research/README.md` for the evidence and promotion
 gate. An external Python process cannot manage llama.cpp tensor residency
 without a supported API or patch.
+
+## Repository layout
+
+```
+kestrel/                 installable package (the supported surface)
+  cli.py                 command-line entry point, menus, --target planning
+  config.py              config/env loading
+  ui.py                  stdlib terminal UI (menus, tables, prompts)
+  model_store.py         local + Ollama model discovery, blob resolution
+  core/planner.py        memory-adaptive placement planning
+  core/pipeline.py       programmatic llama.cpp wrapper
+  backends/llama_cpp.py  process launch, capability probe, metrics
+  gguf/converter.py      Qwen3.5-MoE NVFP4 -> GGUF conversion (+ expert pruning)
+  gguf/metadata.py       GGUF metadata parsing
+  gguf/audit.py          sidecar / cold-snapshot auditing
+  analysis/              heuristic analysis (MoE routes, Q1 cascade quality)
+  providers/             remote runtimes (Ollama, Kimi)
+
+scripts/                 developer / release tooling
+  run_test.py            dependency-light unit suite
+  full_model_suite.py    end-to-end real-model performance suite
+  benchmark.py           real-GGUF benchmark
+  benchmark_speedups.py  stdlib-only loading-speedup benchmark (no real binary)
+  check_wheel.py         CI wheel-content boundary inspection
+
+tools/                   small native binaries + sources for GGUF repairs
+research/archive/        pre-llama.cpp prototypes (deliberately unsupported)
+tests/                   unit tests mirroring the kestrel package
+docs (root)              README.md, RELEASE_GATES.md, PRODUCTION_AUDIT.md,
+                         SECURITY.md, CONTRIBUTING.md, CHANGELOG.md
+```
+
+Everything outside `kestrel/` is tooling, tests, or history. The public API is
+only `kestrel.__version__`, `kestrel.InferencePipeline`,
+`kestrel.LlamaCppBackend` and `kestrel.NVFP4Converter` (exported lazily so
+importing `kestrel` never pulls torch/transformers/vllm/safetensors).

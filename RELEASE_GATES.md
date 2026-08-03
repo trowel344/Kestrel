@@ -42,3 +42,30 @@ unit tests alone is not a release claim.
   controls.
 - License, changelog, contribution guide, security policy and release notes are
   present before a public GitHub release.
+
+## Reference machine and validation runbook
+
+The documented reference hardware is an RTX 4060 Laptop with 8188 MiB VRAM and
+a local llama.cpp build that supports `--fit`, `--fit-target`, `--cpu-moe`,
+mmap, quantized K/V caches and `--spec-type draft-mtp`.
+
+Before disclosing converter completion, validate on a volume with at least
+80 GiB free: produce a full GGUF, run llama.cpp tensor validation, compare
+deterministic prompts against the Hugging Face source, and measure output
+divergence. Concretely:
+
+```bash
+kestrel doctor
+kestrel run /path/to/model.gguf --dry-run
+kestrel run /path/to/model.gguf
+python scripts/run_test.py
+python scripts/benchmark.py /path/to/model.gguf
+python scripts/benchmark_speedups.py
+```
+
+`run_test.py` is the automated unit suite and must pass before any release
+claim. `benchmark.py` is the real-model runbook benchmark; neither replaces a
+full end-to-end `scripts/full_model_suite.py` run with a real GGUF and `llama-server`.
+The numbers from `benchmark_speedups.py` are per-launch/redraw wall-clock
+deltas at the Python level, not token throughput, and still need hardware
+re-validation against a real model.

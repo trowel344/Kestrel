@@ -1,11 +1,7 @@
 # Changelog
-
 All notable changes are documented here. Kestrel follows semantic versioning.
-
 ## [1.2.0] - 2026-08-03
-
 ### Added
-
 - Experimental expert pruning in the converter: `convert --experts-keep K` and
   `--expert-importance file` (always `>= num_experts_per_tok` and `< n_exp`;
   opt-in, never the default). The emitted GGUF is fully self-consistent:
@@ -24,23 +20,23 @@ All notable changes are documented here. Kestrel follows semantic versioning.
   `run`/`chat`/`benchmark`.
 - Ollama blob isolation: a GGUF blob is only reused when it lives inside a
   managed Ollama root, closing arbitrary-file disclosure via tampered modelfiles.
-
 ### Fixed
-
 - `detect_gpu` misalignment when nvidia-smi reports GPU names containing commas.
 - Clear exit message when llama.cpp crashes; clear "exceeded 30 minutes" message
   instead of a raw `subprocess.TimeoutExpired` traceback.
 - Reject `convert --file` names starting with `-` (flag-injection guard); hint
   at `--include`.
-
 ### Developer
-
 - Add `scripts/benchmark_speedups.py`, a stdlib-only, no-real-binary benchmark
   that reproduces the per-launch wall-clock the new caches remove (capability
   probe, `ollama list`, and `--warm-cache` pre-read) for verification on
   hardware during the release gate.
 
-## Unreleased
+## 1.1.0
+
+- Add Qwen3.5-122B-A10B NVFP4 conversion, GGUF auditing and memory-aware
+  llama.cpp launch planning.
+- Add conservative CPU-MoE placement, quantized KV defaults and CUDA OOM retry.
 
 - Add a stdlib-only terminal UI layer (`kestrel.ui`) with ANSI colors, framed
   boxes, width-aware wrapping, aligned tables, and validated prompts; the
@@ -100,8 +96,4 @@ All notable changes are documented here. Kestrel follows semantic versioning.
   stability gate pass, while the measured 6.33 tok/s decode rate correctly
   keeps the 10-15 tok/s release gate closed.
 
-## 1.1.0
-
-- Add Qwen3.5-122B-A10B NVFP4 conversion, GGUF auditing and memory-aware
   llama.cpp launch planning.
-- Add conservative CPU-MoE placement, quantized KV defaults and CUDA OOM retry.
