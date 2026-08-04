@@ -1039,108 +1039,6 @@ def cmd_status(args):
         print(ui.box("Optimization profile", "\n".join(profile_lines)))
 
 
-def cmd_kimi(args):
-    from .providers.kimi import DEFAULT_BASE_URL, KimiClient, KimiError
-
-    client = KimiClient(
-        base_url=args.base_url or USER_CONFIG.kimi_base_url,
-        model=args.model or USER_CONFIG.kimi_model,
-    )
-    if args.check:
-        print(ui.box("Kimi K3 support", "\n".join([
-            ui.kv("Remote API", "supported", value_color=ui.green),
-            ui.kv("Endpoint", client.base_url or DEFAULT_BASE_URL, value_color=ui.cyan),
-            ui.kv("Model", client.model, value_color=ui.bold),
-            ui.kv(
-                "Credentials",
-                "configured" if client.configured() else "missing",
-                value_color=ui.green if client.configured() else ui.red,
-            ),
-            ui.kv("Local checkpoint", "unsupported on this machine", value_color=ui.yellow),
-            ui.kv("Reason", "2.8T MXFP4 weights exceed local disk, RAM, and VRAM"),
-        ])))
-        return
-    if args.local:
-        raise SystemExit(
-            "Local Kimi K3 is not supported: the 2.8T MXFP4 checkpoint is "
-            "roughly 1.4 TB before runtime overhead, and llama.cpp does not "
-            "yet implement the complete K3 architecture. Use `kestrel kimi` "
-            "for the official API path."
-        )
-
-    messages = []
-    if args.system:
-        messages.append({"role": "system", "content": args.system})
-
-    one_shot = bool(args.prompt)
-    if not one_shot:
-        print(ui.box("Kimi K3", "\n".join([
-            ui.kv("Model", client.model, value_color=ui.bold),
-            ui.kv(
-                "Credentials",
-                "configured" if client.configured() else "missing",
-                value_color=ui.green if client.configured() else ui.red,
-            ),
-            "",
-            ui.dim("Type a message and press Enter. /help lists session commands."),
-        ])))
-    pending = " ".join(args.prompt) if one_shot else None
-    while True:
-        if pending is None:
-            try:
-                pending = input(
-                    f"{ui.cyan(ui.bold('kimi-k3')) if ui.USE_ANSI else 'kimi-k3'}> "
-                ).strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-            if pending in {"/exit", "/quit"}:
-                return
-            if pending == "/clear":
-                messages = [item for item in messages if item["role"] == "system"]
-                pending = None
-                print(f"  {ui.info_mark()} History cleared.")
-                continue
-            if pending == "/help":
-                print("  " + ui.dim("/clear  forget this conversation"))
-                print("  " + ui.dim("/model  show the active model and endpoint"))
-                print("  " + ui.dim("/exit, /quit  leave this session"))
-                pending = None
-                continue
-            if pending == "/model":
-                print(
-                    f"  {ui.kv('Model', client.model, value_color=ui.bold)}\n"
-                    f"  {ui.kv('Endpoint', client.base_url or DEFAULT_BASE_URL, value_color=ui.cyan)}"
-                )
-                pending = None
-                continue
-            if not pending:
-                pending = None
-                continue
-        messages.append({"role": "user", "content": pending})
-        try:
-            result = client.complete(
-                messages,
-                reasoning_effort=args.reasoning_effort,
-                max_tokens=args.max_tokens,
-            )
-        except KimiError as exc:
-            raise SystemExit(f"Kimi error: {exc}") from exc
-        if args.show_reasoning and result.reasoning_content:
-            print(ui.dim("[reasoning]"))
-            print(result.reasoning_content)
-            print(ui.dim("[/reasoning]"))
-        print(result.content)
-        # K3 uses preserved-thinking history. Keep the complete assistant
-        # message, including reasoning_content and future tool-call fields.
-        messages.append(result.raw_message)
-        if args.verbose and result.usage:
-            print(f"usage: {result.usage}", file=sys.stderr)
-        if one_shot:
-            return
-        pending = None
-
-
 def cmd_setup(args):
     current = KestrelConfig() if args.reset else load_config()
     model = args.model or current.default_model
@@ -1169,8 +1067,6 @@ def cmd_setup(args):
         default_model=model,
         models_dir=args.models_dir or current.models_dir,
         llama_cpp_dir=llama_dir,
-        kimi_base_url=args.kimi_base_url or current.kimi_base_url,
-        kimi_model=args.kimi_model or current.kimi_model,
     )
     target = save_config(configured)
     print(ui.box("Kestrel configuration saved", "\n".join([
@@ -1182,9 +1078,6 @@ def cmd_setup(args):
         ),
         ui.kv("Models directory", configured.models_dir or "platform default"),
         ui.kv("llama.cpp", configured.llama_cpp_dir),
-        ui.kv("Kimi model", configured.kimi_model),
-        "",
-        ui.dim("Kimi key: read from KIMI_API_KEY or MOONSHOT_API_KEY (not stored)"),
     ])))
 
 
@@ -1196,8 +1089,6 @@ def _save_default_model(model: str | Path) -> None:
             default_model=value,
             models_dir=current.models_dir,
             llama_cpp_dir=current.llama_cpp_dir,
-            kimi_base_url=current.kimi_base_url,
-            kimi_model=current.kimi_model,
         )
     )
 
@@ -2247,24 +2138,11 @@ def main():
     chat = sub.add_parser("chat", help="Chat with the configured local model")
     _add_local_run_options(chat, model_optional=True)
 
-    kimi = sub.add_parser("kimi", help="Chat with Kimi K3 through Moonshot's API")
-    kimi.add_argument("prompt", nargs="*", help="one-shot prompt; omit for interactive chat")
-    kimi.add_argument("--model")
-    kimi.add_argument("--base-url")
-    kimi.add_argument("--reasoning-effort", choices=("low", "high", "max"), default="high")
-    kimi.add_argument("--max-tokens", type=int, default=4096)
-    kimi.add_argument("--system")
-    kimi.add_argument("--show-reasoning", action="store_true")
-    kimi.add_argument("--verbose", action="store_true")
-    kimi.add_argument("--check", action="store_true", help="show remote and local K3 support")
-    kimi.add_argument("--local", action="store_true", help="check the local K3 path and fail honestly")
 
     setup = sub.add_parser("setup", help="Save safe local defaults (never API keys)")
     setup.add_argument("--model", help="default local GGUF, directory, or tested alias")
     setup.add_argument("--models-dir", help="managed model download directory")
     setup.add_argument("--llama-cpp-dir")
-    setup.add_argument("--kimi-base-url")
-    setup.add_argument("--kimi-model")
     setup.add_argument(
         "--reset",
         action="store_true",
@@ -2431,8 +2309,6 @@ def main():
         cmd_status(args)
     elif args.command in ("run", "chat"):
         cmd_run(args)
-    elif args.command == "kimi":
-        cmd_kimi(args)
     elif args.command == "setup":
         cmd_setup(args)
     elif args.command == "benchmark":

@@ -288,12 +288,15 @@ def plan_runtime(
     if (
         requested_gpu_layers == "auto"
         and cpu_moe
+        and model.n_experts > 0
         and total_vram
         and total_vram <= 8192
     ):
         # llama.cpp's fitter currently accounts poorly for some mixed
         # CPU-MoE/CUDA layouts. Use the measured Qwen3.5-122B-A10B placement;
         # retain the conservative four-layer fallback for unknown MoE shapes.
+        # Dense models are left to llama.cpp's own fitter so they offload as
+        # many layers as fit instead of being pinned to four CPU layers.
         verified_layers = 12 if is_qwen35_122b_a10b else 4
         gpu_layers = str(min(verified_layers, max(0, model.n_layers)))
 

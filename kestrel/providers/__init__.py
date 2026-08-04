@@ -1,5 +1,5 @@
-"""Optional remote model providers used by the Kestrel CLI."""
+"""Remote model providers used by the Kestrel CLI."""
 
-from .kimi import KimiClient, KimiError
+from .ollama import OllamaClient, OllamaError
 
-__all__ = ["KimiClient", "KimiError"]
+__all__ = ["OllamaClient", "OllamaError"]

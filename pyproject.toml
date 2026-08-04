@@ -10,8 +10,7 @@ ignore = [
   "W605",   # intentional backslash escapes in strings/UI frames
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"scripts/*.py" = ["B905"]  # several scripts zip pairwise, differing-length iterables
+
 
 [build-system]
 requires = ["setuptools>=77"]
@@ -19,7 +18,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kestrel"
-version = "1.2.0"
+version = "1.0.0"
 description = "Hardware-aware local model orchestration, conversion, and management"
 readme = "README.md"
 license = "MIT"

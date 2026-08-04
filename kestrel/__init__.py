@@ -2,7 +2,8 @@
 
 Only the llama.cpp runtime wrapper and the validated converter are exported.
 Historical Python inference, expert-cache, router, and speculation prototypes
-live outside the installable package under ``research/archive``.
+were removed from the repository before release and remain recoverable via git
+history.
 """
 
 from importlib import import_module
@@ -22,4 +23,4 @@ def __getattr__(name):
     globals()[name] = value
     return value
 
-__version__ = "1.2.0"
+__version__ = "1.0.0"

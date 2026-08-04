@@ -1,7 +1,0 @@
-include CHANGELOG.md
-include CONTRIBUTING.md
-include LICENSE
-include PRODUCTION_AUDIT.md
-include README.md
-include RELEASE_GATES.md
-include SECURITY.md
