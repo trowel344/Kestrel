@@ -10,14 +10,16 @@ copying weights.
 ## Quick start
 
 ```bash
-pip install .
-kestrel doctor                    # check GPU, RAM, and llama.cpp capabilities
-kestrel setup --model /path/to/model.gguf
-kestrel chat                      # chat with the configured default model
+# one-command install (creates a virtual environment)
+./install.sh
+.venv/bin/kestrel doctor          # check GPU, RAM, and llama.cpp capabilities
+.venv/bin/kestrel setup --model /path/to/model.gguf
+.venv/bin/kestrel chat            # chat with the configured default model
 ```
 
-For the interactive menu, run `kestrel` or `kestrel menu`. Skip setup and pass a
-model directly: `kestrel chat /path/to/model.gguf`.
+Or install with pip directly: `pip install .`. For the interactive menu, run
+`kestrel` or `kestrel menu`. Skip setup and pass a model:
+`kestrel chat /path/to/model.gguf`.
 
 ## Command reference
 
@@ -55,10 +57,13 @@ binary, and support for fitting, CPU MoE, mmap, quantized KV cache, and MTP.
 
 ## Install
 
-```console
-pip install .
-pip install '.[convert]'   # only if you will convert NVFP4 models
+```bash
+./install.sh                  # isolated .venv install (recommended)
+pip install .                 # install into current environment
+pip install '.[convert]'      # also install NVFP4 conversion extras (torch)
 ```
+
+See `./install.sh --help` for options (`--convert`, `--dir`).
 
 ## Repository layout
 
@@ -83,6 +88,8 @@ The public API is `kestrel.__version__`, `kestrel.InferencePipeline`,
 ## Getting help
 
 - `kestrel --help`, `kestrel <command> --help`
+- Report issues: see [CONTRIBUTING.md](CONTRIBUTING.md#reporting-an-issue)
+- Contact: trowel344@gmail.com
 
 ## License
 

@@ -24,6 +24,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+authors = [{ name = "Kestrel maintainers", email = "trowel344@gmail.com" }]
 dependencies = [
     "numpy",
     "gguf>=0.19",
@@ -37,6 +38,10 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/trowel344/Kestrel"
+Issues = "https://github.com/trowel344/Kestrel/issues"
 
 [project.optional-dependencies]
 convert = [
