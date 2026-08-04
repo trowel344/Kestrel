@@ -1,0 +1,41 @@
+---
+name: Bug report
+about: Report a problem so it can be fixed
+title: "[bug] "
+labels: bug
+assignees: ""
+---
+
+## Environment
+
+- Kestrel version: <!-- `kestrel --version` -->
+- Python version: <!-- e.g. 3.12 -->
+- OS: <!-- e.g. Linux (Ubuntu 24.04) -->
+
+Paste the full output of `kestrel doctor`:
+
+```text
+
+```
+
+## What happened
+
+Describe the problem. Include the exact command you ran:
+
+```bash
+
+```
+
+## Expected behavior
+
+What did you expect to happen instead?
+
+## Steps to reproduce
+
+1.
+2.
+3.
+
+## Additional context
+
+Model name/path, config, logs, screenshots, or anything else that helps.

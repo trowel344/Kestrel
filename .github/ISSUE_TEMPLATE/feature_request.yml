@@ -1,0 +1,24 @@
+---
+name: Feature request
+about: Suggest an idea for Kestrel
+title: "[feature] "
+labels: enhancement
+assignees: ""
+---
+
+## Problem
+
+What problem are you trying to solve? What are you trying to do that Kestrel
+doesn't support today?
+
+## Proposed solution
+
+Describe the behavior or command you'd like to see.
+
+## Alternatives
+
+Anything you've already tried or considered?
+
+## Additional context
+
+Model, hardware, use case, or links that help explain the request.
