@@ -101,9 +101,11 @@ def gpu_bandwidth_gb_s(name: str | None) -> float:
     if not name:
         return DEFAULT_GPU_BANDWIDTH_GB_S
     lowered = name.lower()
-    for key, value in _GPU_BANDWIDTH_TABLE:
-        if key in lowered:
-            return value
+    # Match the longest (most specific) key first so a model like "rtx 4060 ti"
+    # is not captured by the shorter substring "rtx 4060".
+    matches = [(len(key), value) for key, value in _GPU_BANDWIDTH_TABLE if key in lowered]
+    if matches:
+        return max(matches)[1]
     return DEFAULT_GPU_BANDWIDTH_GB_S
 
 
@@ -239,12 +241,7 @@ def plan_runtime(
     total_vram = max(0, hardware.vram_total_mib)
     free_vram = max(0, hardware.vram_free_mib)
 
-    if total_vram:
-        # Keep room for the display server, CUDA context, and allocation
-        # fragmentation. Small GPUs need a proportionally larger guard.
-        fit_target = max(1024, min(3072, int(total_vram * 0.18)))
-    else:
-        fit_target = 1024
+    fit_target = _fit_target_mib(total_vram)
 
     usable_vram_bytes = max(0, free_vram - fit_target) * MIB
     model_is_larger_than_vram = bool(
@@ -255,58 +252,25 @@ def plan_runtime(
         if requested_cpu_moe is None
         else requested_cpu_moe
     )
-    threads = 0
-    if cpu_moe and hardware.logical_cpu_count:
-        # CPU-MoE decode is memory-bandwidth bound. Leaving two logical CPUs
-        # for CUDA/runtime work and avoiding very large thread teams performed
-        # best in the real-model sweep (14 threads on a 16-thread hybrid CPU).
-        threads = min(14, max(1, hardware.logical_cpu_count - 2))
+    threads = _tune_threads(cpu_moe, hardware.logical_cpu_count)
 
-    # Smaller physical batches reduce temporary CUDA allocations. Logical
-    # batches can remain larger for prompt throughput.
-    if total_vram and total_vram <= 8192:
-        batch_size, ubatch_size = 512, 128
-    elif total_vram and total_vram <= 16384:
-        batch_size, ubatch_size = 1024, 256
-    else:
-        batch_size, ubatch_size = 2048, 512
-
-    is_qwen35_122b_a10b = (
-        model.n_layers == 48
-        and model.n_experts == 256
-        and model.n_experts_used == 8
-        and model.hidden_size == 3072
-        and model.expert_ff_size == 1024
+    verified = _is_qwen35_122b_a10b(model)
+    batch_size, ubatch_size = _select_batch_sizes(
+        total_vram,
+        cpu_moe=cpu_moe,
+        verified=verified,
     )
-    if cpu_moe and total_vram and total_vram <= 8192 and is_qwen35_122b_a10b:
-        # Verified on an RTX 4060 Laptop 8 GiB at a real 2048-token context.
-        # This model's hybrid graph needs a smaller physical batch, while 12
-        # dense layers fit in 4.51 GiB and materially reduce host-side traffic.
-        batch_size, ubatch_size = 256, 64
-
-    gpu_layers = requested_gpu_layers
-    if (
-        requested_gpu_layers == "auto"
-        and cpu_moe
-        and model.n_experts > 0
-        and total_vram
-        and total_vram <= 8192
-    ):
-        # llama.cpp's fitter currently accounts poorly for some mixed
-        # CPU-MoE/CUDA layouts. Use the measured Qwen3.5-122B-A10B placement;
-        # retain the conservative four-layer fallback for unknown MoE shapes.
-        # Dense models are left to llama.cpp's own fitter so they offload as
-        # many layers as fit instead of being pinned to four CPU layers.
-        verified_layers = 12 if is_qwen35_122b_a10b else 4
-        gpu_layers = str(min(verified_layers, max(0, model.n_layers)))
-
-    # The current cache hook launches CUDA work from CPU mul_mat_id and then
-    # synchronizes its result back to the CPU graph. It is slower on both the
-    # compact harness and the full calibrated 122B artifact, and enabling it
-    # also disables CPU weight repacking. Force it off for CPU-MoE plans;
-    # explicit --moe-cache budgets can still opt into controlled experiments.
-    moe_cache = "off" if cpu_moe and model.n_experts > 0 else "auto"
-    moe_cache_budget_mib = 0
+    gpu_layers = _resolve_verified_placement(
+        requested_gpu_layers,
+        cpu_moe=cpu_moe,
+        n_experts=model.n_experts,
+        total_vram=total_vram,
+        verified=verified,
+        n_layers=model.n_layers,
+    )
+    moe_cache, moe_cache_budget_mib = _select_moe_cache(
+        cpu_moe, model.n_experts
+    )
 
     return _apply_mode(
         RuntimePlan(
@@ -334,6 +298,93 @@ def plan_runtime(
         model=model,
         ram_available_mib=hardware.ram_available_mib,
     )
+
+
+def _fit_target_mib(total_vram: int) -> int:
+    """Keep room for the display server, CUDA context, and allocation
+    fragmentation. Small GPUs need a proportionally larger guard."""
+    if total_vram:
+        return max(1024, min(3072, int(total_vram * 0.18)))
+    return 1024
+
+
+def _tune_threads(cpu_moe: bool, logical_cpu_count: int) -> int:
+    if not cpu_moe or not logical_cpu_count:
+        return 0
+    # CPU-MoE decode is memory-bandwidth bound. Leaving two logical CPUs
+    # for CUDA/runtime work and avoiding very large thread teams performed
+    # best in the real-model sweep (14 threads on a 16-thread hybrid CPU).
+    return min(14, max(1, logical_cpu_count - 2))
+
+
+def _is_qwen35_122b_a10b(model: ModelProfile) -> bool:
+    return (
+        model.n_layers == 48
+        and model.n_experts == 256
+        and model.n_experts_used == 8
+        and model.hidden_size == 3072
+        and model.expert_ff_size == 1024
+    )
+
+
+def _select_batch_sizes(
+    total_vram: int,
+    *,
+    cpu_moe: bool,
+    verified: bool,
+) -> tuple[int, int]:
+    # Smaller physical batches reduce temporary CUDA allocations. Logical
+    # batches can remain larger for prompt throughput.
+    if total_vram and total_vram <= 8192:
+        batch_size, ubatch_size = 512, 128
+    elif total_vram and total_vram <= 16384:
+        batch_size, ubatch_size = 1024, 256
+    else:
+        batch_size, ubatch_size = 2048, 512
+
+    if cpu_moe and total_vram and total_vram <= 8192 and verified:
+        # Verified on an RTX 4060 Laptop 8 GiB at a real 2048-token context.
+        # This model's hybrid graph needs a smaller physical batch, while 12
+        # dense layers fit in 4.51 GiB and materially reduce host-side traffic.
+        batch_size, ubatch_size = 256, 64
+    return batch_size, ubatch_size
+
+
+def _resolve_verified_placement(
+    requested_gpu_layers: str,
+    *,
+    cpu_moe: bool,
+    n_experts: int,
+    total_vram: int,
+    verified: bool,
+    n_layers: int,
+) -> str:
+    if not (
+        requested_gpu_layers == "auto"
+        and cpu_moe
+        and n_experts > 0
+        and total_vram
+        and total_vram <= 8192
+    ):
+        return requested_gpu_layers
+    # llama.cpp's fitter currently accounts poorly for some mixed
+    # CPU-MoE/CUDA layouts. Use the measured Qwen3.5-122B-A10B placement;
+    # retain the conservative four-layer fallback for unknown MoE shapes.
+    # Dense models are left to llama.cpp's own fitter so they offload as
+    # many layers as fit instead of being pinned to four CPU layers.
+    verified_layers = 12 if verified else 4
+    return str(min(verified_layers, max(0, n_layers)))
+
+
+def _select_moe_cache(cpu_moe: bool, n_experts: int) -> tuple[str, int]:
+    # The current cache hook launches CUDA work from CPU mul_mat_id and then
+    # synchronizes its result back to the CPU graph. It is slower on both the
+    # compact harness and the full calibrated 122B artifact, and enabling it
+    # also disables CPU weight repacking. Force it off for CPU-MoE plans;
+    # explicit --moe-cache budgets can still opt into controlled experiments.
+    if cpu_moe and n_experts > 0:
+        return "off", 0
+    return "auto", 0
 
 
 def _apply_mode(

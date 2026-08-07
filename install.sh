@@ -59,6 +59,15 @@ else
   "$PIP" install --quiet "."
 fi
 
+echo "==> Verifying installed kestrel launcher"
+VERSION_OUT="$("$KESTREL" --version 2>&1)" || true
+if ! printf '%s\n' "$VERSION_OUT" | grep -E '^kestrel [0-9]+\.[0-9]+\.[0-9]+' >/dev/null 2>&1; then
+  echo "error: 'kestrel --version' did not report a 'kestrel <semver>' line; got:" >&2
+  printf '%s\n' "$VERSION_OUT" >&2
+  echo "The pip install may have failed. Check the pip output above." >&2
+  exit 1
+fi
+
 echo
 echo "Kestrel installed successfully."
 echo

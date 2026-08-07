@@ -1,8 +1,22 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 build/
 dist/
+
+# Tooling caches
 .ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtualenvs and local state
 .venv/
+venv/
+
+# Kestrel runtime artifacts
 benchmark_results/
+tests/.testconfig.toml

@@ -90,7 +90,7 @@ def blue(text: str) -> str:
 
 
 def magenta(text: str) -> str:
-    return color(35, str(text))
+    return color(35, text)
 
 
 def cyan(text: str) -> str:
@@ -110,7 +110,7 @@ def warn_mark() -> str:
 
 
 def info_mark() -> str:
-    return cyan("i") if USE_UTF8 else cyan("i")
+    return cyan("i")
 
 
 def bullet() -> str:
@@ -358,7 +358,7 @@ def key_hint() -> str:
     return "Use up/down to move, Enter to select, q to quit"
 
 
-def _menu_item(label: str, description: str, *, selected: bool) -> str:
+def _menu_item(label: str, description: str, *, selected: bool, limit: int | None = None) -> str:
     marker = "▸" if USE_UTF8 else ">"
     rail = "│" if USE_UTF8 else "|"
     segments: list[tuple] = []
@@ -373,7 +373,7 @@ def _menu_item(label: str, description: str, *, selected: bool) -> str:
     segments.append((bold if (selected and USE_ANSI) else None, label))
     if description:
         segments.append((dim if USE_ANSI else None, f"  {description}"))
-    return _truncate_segments(segments, width())
+    return _truncate_segments(segments, limit if limit is not None else width())
 
 
 def _menu_window_end(first: int, available: int, total: int) -> int:
@@ -413,12 +413,15 @@ def select(
     if hint is None:
         hint = key_hint()
 
+    try:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+    except (OSError, ValueError):
+        size = os.terminal_size((80, 24))
+    col_width = max(40, min(size.columns, 120))
+    line_count = max(6, size.lines)
+
     def rows() -> int:
-        try:
-            size = shutil.get_terminal_size(fallback=(80, 24))
-        except (OSError, ValueError):
-            size = os.terminal_size((80, 24))
-        return max(6, size.lines)
+        return line_count
 
     def available() -> int:
         chrome = 1 if title else 0
@@ -440,7 +443,7 @@ def select(
             lines.append(dim(f"↑ {first} more"))
         for index in range(first, end):
             label, description = options[index]
-            lines.append(_menu_item(label, description, selected=index == cursor))
+            lines.append(_menu_item(label, description, selected=index == cursor, limit=col_width))
         if end < len(options):
             lines.append(dim(f"↓ {len(options) - end} more"))
         return lines

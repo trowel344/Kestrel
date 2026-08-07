@@ -18,9 +18,9 @@ from kestrel.gguf.converter import (
     GGML_TYPE_Q4_0,
     MODEL_DIR,
     NVFP4Converter,
+    _quantize_q1_0_buffer,
     dequantize_nvfp4,
     dequantize_q4_0,
-    quantize_q1_0,
 )
 
 
@@ -72,7 +72,9 @@ def _source_q1(converter: NVFP4Converter, layer: int, expert: int, tensor: str) 
             raise KeyError(f"missing source tensor {prefix}.{projection}")
         chunks.append(dequantize_nvfp4(*values))
     matrix = chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
-    return quantize_q1_0(matrix)
+    # The matrix is freshly allocated here, so consume it in place instead of
+    # copying the full f32 tensor for the Q1_0 pass.
+    return _quantize_q1_0_buffer(matrix)
 
 
 def audit_cascade(
@@ -88,7 +90,14 @@ def audit_cascade(
     import gguf
 
     converter = NVFP4Converter(model_dir)
-    reader = gguf.GGUFReader(q4_gguf)
+    try:
+        reader = gguf.GGUFReader(q4_gguf)
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot parse the Q4 GGUF with the installed gguf reader. "
+            "Kestrel writes expert tensors in llama.cpp ne-order, which the "
+            f"reader reverses and then cannot reshape: {exc}"
+        ) from exc
     tensors = {tensor.name: tensor for tensor in reader.tensors}
     rng = np.random.default_rng(seed)
     results = []
@@ -110,7 +119,7 @@ def audit_cascade(
             data = np.asarray(tensor.data)
             for expert in experts:
                 direct = _source_q1(converter, layer, int(expert), tensor_name)
-                cascade = quantize_q1_0(dequantize_q4_0(data[int(expert)]))
+                cascade = _quantize_q1_0_buffer(dequantize_q4_0(data[int(expert)]))
                 results.append(CascadeSample(
                     layer=layer,
                     expert=int(expert),

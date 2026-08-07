@@ -41,10 +41,12 @@ python3 -m venv .venv
 pip install -e '.[convert]'   # add conversion extras if you need torch
 ```
 
-Run the linter before submitting changes:
+Run the linter and test suite before submitting changes:
 
 ```bash
-ruff check kestrel/
+pip install -e '.[dev,convert]'   # pytest + ruff + conversion extras
+ruff check kestrel/ tests/
+python -m pytest                   # hermetic; runs fully offline
 ```
 
 ## Submitting changes

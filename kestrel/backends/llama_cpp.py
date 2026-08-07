@@ -51,9 +51,10 @@ def default_llama_cpp_dir(dirs: tuple[str, ...] | None = None) -> str:
     without setting KESTREL_LLAMA_CPP_DIR. An explicit override still wins.
     """
     override = os.environ.get("KESTREL_LLAMA_CPP_DIR")
-    if override:
+    ordered = _candidate_dirs(dirs)
+    if override and ordered and ordered[0] == override:
         return override
-    for directory in _candidate_dirs(dirs):
+    for directory in ordered:
         if _find_binary(directory, "llama-server") or _find_binary(
             directory, "llama-cli"
         ):
@@ -140,6 +141,29 @@ def _capability_cache_write(binary: str, help_text: str, version: str) -> None:
         pass
 
 
+def _load_capabilities(binary: str, refresh: bool) -> LlamaCppCapabilities:
+    """Probe ``binary``'s capabilities, using/populating the on-disk cache.
+
+    Avoids the per-launch ``--help``/``--version`` subprocesses (and the CUDA
+    contexts some builds initialize per invocation) by keying the persisted
+    result on the binary's identity unless ``refresh`` forces a re-probe.
+    """
+    cached = None if refresh else _capability_cache_read(binary)
+    if cached is not None:
+        help_text, version = cached
+    else:
+        help_result = subprocess.run(
+            [binary, "--help"], capture_output=True, text=True, timeout=15
+        )
+        version_result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=15
+        )
+        help_text = help_result.stdout + help_result.stderr
+        version = (version_result.stdout or version_result.stderr).strip()
+        _capability_cache_write(binary, help_text, version)
+    return LlamaCppCapabilities(help_text=help_text, version=version)
+
+
 class LlamaCppBackend:
     def __init__(
         self,
@@ -158,9 +182,13 @@ class LlamaCppBackend:
         cache_type_k: str = "q8_0",
         cache_type_v: str = "q8_0",
         use_mmap: bool = True,
+        use_mlock: bool = False,
         n_threads: int = 0,
         llama_cpp_dir: str | None = None,
         moe_cache: str = "auto",
+        direct_io: bool = False,
+        tensor_split: str | None = None,
+        extra_args: list[str] | None = None,
     ):
         self.model_path = model_path
         self.n_gpu_layers = n_gpu_layers
@@ -177,6 +205,10 @@ class LlamaCppBackend:
         self.cache_type_k = cache_type_k
         self.cache_type_v = cache_type_v
         self.use_mmap = use_mmap
+        self.use_mlock = use_mlock
+        self.direct_io = direct_io
+        self.tensor_split = tensor_split
+        self.extra_args = list(extra_args or ())
         self.n_threads = max(0, n_threads)
         self.moe_cache = moe_cache
         self.llama_cpp_dir = llama_cpp_dir or default_llama_cpp_dir()
@@ -226,41 +258,13 @@ class LlamaCppBackend:
     def server_capabilities(self, refresh: bool = False) -> LlamaCppCapabilities:
         if self._server_capabilities is not None and not refresh:
             return self._server_capabilities
-        binary = self.server_binary
-        cached = None if refresh else _capability_cache_read(binary)
-        if cached is not None:
-            help_text, version = cached
-        else:
-            help_result = subprocess.run(
-                [binary, "--help"], capture_output=True, text=True, timeout=15
-            )
-            version_result = subprocess.run(
-                [binary, "--version"], capture_output=True, text=True, timeout=15
-            )
-            help_text = help_result.stdout + help_result.stderr
-            version = (version_result.stdout or version_result.stderr).strip()
-            _capability_cache_write(binary, help_text, version)
-        self._server_capabilities = LlamaCppCapabilities(help_text=help_text, version=version)
+        self._server_capabilities = _load_capabilities(self.server_binary, refresh)
         return self._server_capabilities
 
     def capabilities(self, refresh: bool = False) -> LlamaCppCapabilities:
         if self._capabilities is not None and not refresh:
             return self._capabilities
-        binary = self.binary
-        cached = None if refresh else _capability_cache_read(binary)
-        if cached is not None:
-            help_text, version = cached
-        else:
-            help_result = subprocess.run(
-                [binary, "--help"], capture_output=True, text=True, timeout=15
-            )
-            version_result = subprocess.run(
-                [binary, "--version"], capture_output=True, text=True, timeout=15
-            )
-            help_text = help_result.stdout + help_result.stderr
-            version = (version_result.stdout or version_result.stderr).strip()
-            _capability_cache_write(binary, help_text, version)
-        self._capabilities = LlamaCppCapabilities(help_text=help_text, version=version)
+        self._capabilities = _load_capabilities(self.binary, refresh)
         return self._capabilities
 
     def _resolved_spec_type(self, caps: LlamaCppCapabilities) -> str | None:
@@ -271,6 +275,62 @@ class LlamaCppBackend:
             requested = "draft-mtp"
         return requested if requested in caps.spec_types else None
 
+    def _common_engine_args(self, caps: LlamaCppCapabilities) -> list[str]:
+        """Flags shared by llama-cli (interactive/one-shot) and llama-server.
+
+        Single source of truth for model sizing and engine tuning so the CLI
+        does not re-assemble them and drift (e.g. the server path once dropped
+        ``--fit``, letting serve OOM where run would not).
+        """
+        args = [
+            "-ngl", str(self.n_gpu_layers),
+            "-c", str(self.n_ctx),
+            "-b", str(self.n_batch),
+            "-ub", str(self.n_ubatch),
+        ]
+        if self.n_threads and caps.supports("--threads"):
+            args += ["--threads", str(self.n_threads)]
+        if self.n_threads and caps.supports("--threads-batch"):
+            args += ["--threads-batch", str(self.n_threads)]
+
+        # Direct I/O bypasses the page cache and loads uncached model weights
+        # at sequential disk speed; it is fastest on a cold launch from NVMe.
+        # It is opt-in (the default mmap path wins on warm, cache-resident
+        # reloads), and direct I/O implicitly disables mmap.
+        if self.direct_io and caps.supports("--direct-io"):
+            args += ["--no-mmap", "--direct-io"]
+        elif self.use_mmap and caps.supports("--mmap"):
+            args.append("--mmap")
+        elif caps.supports("--no-mmap"):
+            args.append("--no-mmap")
+        if self.tensor_split and caps.supports("--tensor-split"):
+            args += ["--tensor-split", self.tensor_split]
+        if self.use_mlock and caps.supports("--mlock"):
+            args.append("--mlock")
+        if self.fit and caps.supports("--fit"):
+            args += ["--fit", "on"]
+            if caps.supports("--fit-target"):
+                args += ["--fit-target", str(self.fit_target_mib)]
+        if self.cpu_moe and caps.supports("--cpu-moe"):
+            args.append("--cpu-moe")
+        if self.moe_cache != "auto" and caps.supports("--moe-cache"):
+            args += ["--moe-cache", self.moe_cache]
+        if self.cache_type_k and caps.supports("--cache-type-k"):
+            args += ["--cache-type-k", self.cache_type_k]
+        if self.cache_type_v and caps.supports("--cache-type-v"):
+            args += ["--cache-type-v", self.cache_type_v]
+        if caps.supports("--flash-attn"):
+            args += ["--flash-attn", "auto"]
+
+        spec_type = self._resolved_spec_type(caps)
+        if spec_type:
+            args += ["--spec-type", spec_type]
+            if caps.supports("--spec-draft-n-max"):
+                args += ["--spec-draft-n-max", str(self.spec_draft_n)]
+        if self.extra_args:
+            args += self.extra_args
+        return args
+
     def _base_cmd(self) -> list[str]:
         caps = self.capabilities()
         if not Path(self.model_path).is_file():
@@ -279,42 +339,32 @@ class LlamaCppBackend:
         cmd = [
             self.binary,
             "-m", self.model_path,
-            "-ngl", str(self.n_gpu_layers),
-            "-c", str(self.n_ctx),
-            "-b", str(self.n_batch),
-            "-ub", str(self.n_ubatch),
             "--temp", str(self.temp),
             "--seed", str(self.seed),
         ]
-        if self.n_threads and caps.supports("--threads"):
-            cmd += ["--threads", str(self.n_threads)]
-        if self.n_threads and caps.supports("--threads-batch"):
-            cmd += ["--threads-batch", str(self.n_threads)]
+        cmd += self._common_engine_args(caps)
+        return cmd
 
-        if self.use_mmap and caps.supports("--mmap"):
-            cmd.append("--mmap")
-        elif caps.supports("--no-mmap"):
-            cmd.append("--no-mmap")
-        if self.fit and caps.supports("--fit"):
-            cmd += ["--fit", "on"]
-            if caps.supports("--fit-target"):
-                cmd += ["--fit-target", str(self.fit_target_mib)]
-        if self.cpu_moe and caps.supports("--cpu-moe"):
-            cmd.append("--cpu-moe")
-        if self.moe_cache != "auto" and caps.supports("--moe-cache"):
-            cmd += ["--moe-cache", self.moe_cache]
-        if self.cache_type_k and caps.supports("--cache-type-k"):
-            cmd += ["--cache-type-k", self.cache_type_k]
-        if self.cache_type_v and caps.supports("--cache-type-v"):
-            cmd += ["--cache-type-v", self.cache_type_v]
-        if caps.supports("--flash-attn"):
-            cmd += ["--flash-attn", "auto"]
-
-        spec_type = self._resolved_spec_type(caps)
-        if spec_type:
-            cmd += ["--spec-type", spec_type]
-            if caps.supports("--spec-draft-n-max"):
-                cmd += ["--spec-draft-n-max", str(self.spec_draft_n)]
+    def build_server_cmd(
+        self,
+        *,
+        host: str = "127.0.0.1",
+        port: int = 8080,
+        alias: str | None = None,
+        embeddings: bool = False,
+    ) -> list[str]:
+        caps = self.server_capabilities()
+        cmd = [
+            self.server_binary,
+            "-m", self.model_path,
+            "--host", host,
+            "--port", str(port),
+        ]
+        if alias:
+            cmd += ["--alias", alias]
+        cmd += self._common_engine_args(caps)
+        if embeddings and caps.supports("--embeddings"):
+            cmd.append("--embeddings")
         return cmd
 
     def _build_interactive_cmd(self) -> list[str]:
@@ -376,6 +426,33 @@ class LlamaCppBackend:
             raise RuntimeError(f"llama.cpp failed with exit {result.returncode}:\n{detail}")
         return result.stdout.strip()
 
+    def _finalize_stream(self, started: float, *, suppress_error: bool = False) -> None:
+        """Collect metrics and tear down the streaming subprocess exactly once.
+
+        Runs even when a consumer abandons the generator early (GeneratorExit),
+        so the child is always terminated and the temporary stderr file is
+        always closed instead of leaking.
+        """
+        if self._proc is None:
+            return
+        err = None
+        try:
+            returncode = self._proc.wait()
+            elapsed = time.perf_counter() - started
+            self._stderr_file.seek(0)
+            stderr = self._stderr_file.read()
+            self.last_metrics = self._parse_metrics(stderr, elapsed, returncode)
+            if returncode != 0:
+                err = RuntimeError(
+                    f"llama.cpp failed with exit {returncode}:\n{stderr[-2000:]}"
+                )
+        finally:
+            self._stderr_file.close()
+            self._stderr_file = None
+            self._proc = None
+        if err is not None and not suppress_error:
+            raise err
+
     def generate_stream(self, prompt: str, max_tokens: int = 256) -> Iterator[str]:
         cmd = self._build_cmd(prompt, max_tokens)
         self._stderr_file = tempfile.TemporaryFile(mode="w+")
@@ -387,19 +464,25 @@ class LlamaCppBackend:
             text=True,
             bufsize=1,
         )
-        assert self._proc.stdout is not None
-        while True:
-            chunk = self._proc.stdout.readline()
-            if chunk == "":
-                break
-            yield chunk
-        returncode = self._proc.wait()
-        elapsed = time.perf_counter() - started
-        self._stderr_file.seek(0)
-        stderr = self._stderr_file.read()
-        self.last_metrics = self._parse_metrics(stderr, elapsed, returncode)
-        if returncode != 0:
-            raise RuntimeError(f"llama.cpp failed with exit {returncode}:\n{stderr[-2000:]}")
+        terminating = False
+        try:
+            assert self._proc.stdout is not None
+            while True:
+                chunk = self._proc.stdout.readline()
+                if chunk == "":
+                    break
+                yield chunk
+        except GeneratorExit:
+            # Consumer stopped early: still clean up, but don't replace the
+            # GeneratorExit with a failure raised from the cleanup path.
+            terminating = True
+            self._finalize_stream(started, suppress_error=True)
+            raise
+        finally:
+            if not terminating:
+                # Drain/record metrics and always clean up the child + temp
+                # file, whether the stream completed or an error was raised.
+                self._finalize_stream(started)
 
     def close(self):
         if self._proc and self._proc.poll() is None:

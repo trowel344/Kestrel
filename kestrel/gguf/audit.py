@@ -24,48 +24,37 @@ def _integer(value: Any, default: int = 0) -> int:
         return default
 
 
-def audit_snapshot(
-    fields: dict[str, Any],
-    tensors: list[tuple[str, int]],
-    *,
-    source_config: dict[str, Any] | None = None,
-    source_tokenizer_config: dict[str, Any] | None = None,
-) -> list[AuditFinding]:
-    """Audit already-decoded GGUF metadata and tensor records.
-
-    This pure-data layer is intentionally independent of the GGUF reader so the
-    structural failure rules can be tested with small fixtures.
-    """
-
-    findings: list[AuditFinding] = []
-
+def _finding_record(findings: list[AuditFinding]):
     def error(code: str, message: str):
         findings.append(AuditFinding("error", code, message))
 
     def warning(code: str, message: str):
         findings.append(AuditFinding("warning", code, message))
 
+    return error, warning
+
+
+def _audit_blocks(
+    fields: dict[str, Any],
+    names: list[str],
+    source_config: dict[str, Any] | None,
+    error,
+) -> None:
     arch = str(fields.get("general.architecture", "unknown"))
     block_count = _integer(fields.get(f"{arch}.block_count"))
     mtp_layers = _integer(fields.get(f"{arch}.nextn_predict_layers"))
-    names = [name for name, _ in tensors]
-    block_ids = sorted(
-        {
-            int(match.group(1))
-            for name in names
-            if (match := re.match(r"blk\.(\d+)\.", name))
-        }
-    )
-    nextn_blocks = sorted(
-        {
-            int(match.group(1))
-            for name in names
-            if ".nextn." in name
-            and (match := re.match(r"blk\.(\d+)\.", name))
-        }
-    )
+    re_blk = re.compile(r"blk\.(\d+)\.")
+    blk_ids: set[int] = set()
+    nextn_ids: set[int] = set()
+    for name in names:
+        match = re_blk.match(name)
+        if match:
+            blk_ids.add(int(match.group(1)))
+            if ".nextn." in name:
+                nextn_ids.add(int(match.group(1)))
+    block_ids = sorted(blk_ids)
+    nextn_blocks = sorted(nextn_ids)
 
-    source_text = None
     if source_config:
         source_text = source_config.get("text_config", source_config)
         target_layers = _integer(source_text.get("num_hidden_layers"))
@@ -99,6 +88,8 @@ def audit_snapshot(
                     "MTP tensors exist but nextn_predict_layers is missing or zero.",
                 )
 
+
+def _audit_tokenizer(fields: dict[str, Any], error) -> None:
     token_types = fields.get("tokenizer.ggml.token_type")
     tokens = fields.get("tokenizer.ggml.tokens") or []
     if token_types is None:
@@ -129,24 +120,33 @@ def audit_snapshot(
                 f"(first IDs: {empty_ids[:5]}).",
             )
 
-    if source_tokenizer_config:
-        if source_tokenizer_config.get("chat_template") and "tokenizer.chat_template" not in fields:
-            error(
-                "CHAT_TEMPLATE_MISSING",
-                "The source chat template exists but is absent from the GGUF.",
-            )
-        if source_tokenizer_config.get("bos_token") is None and "tokenizer.ggml.bos_token_id" in fields:
-            error(
-                "FABRICATED_BOS",
-                f"GGUF declares BOS ID {fields['tokenizer.ggml.bos_token_id']} "
-                "but the source tokenizer has no BOS token.",
-            )
-        if source_tokenizer_config.get("pad_token") and "tokenizer.ggml.padding_token_id" not in fields:
-            error(
-                "PAD_TOKEN_MISSING",
-                "The source pad token exists but tokenizer.ggml.padding_token_id is absent.",
-            )
 
+def _audit_vocab_source_config(
+    fields: dict[str, Any],
+    source_tokenizer_config: dict[str, Any] | None,
+    error,
+) -> None:
+    if not source_tokenizer_config:
+        return
+    if source_tokenizer_config.get("chat_template") and "tokenizer.chat_template" not in fields:
+        error(
+            "CHAT_TEMPLATE_MISSING",
+            "The source chat template exists but is absent from the GGUF.",
+        )
+    if source_tokenizer_config.get("bos_token") is None and "tokenizer.ggml.bos_token_id" in fields:
+        error(
+            "FABRICATED_BOS",
+            f"GGUF declares BOS ID {fields['tokenizer.ggml.bos_token_id']} "
+            "but the source tokenizer has no BOS token.",
+        )
+    if source_tokenizer_config.get("pad_token") and "tokenizer.ggml.padding_token_id" not in fields:
+        error(
+            "PAD_TOKEN_MISSING",
+            "The source pad token exists but tokenizer.ggml.padding_token_id is absent.",
+        )
+
+
+def _audit_f32(tensors: list[tuple[str, int]], warning) -> None:
     f32_count = sum(dtype == 0 for _, dtype in tensors)
     if f32_count > len(tensors) // 2:
         warning(
@@ -155,6 +155,29 @@ def audit_snapshot(
             "need F32 for llama.cpp CPU kernels, but a majority-F32 artifact likely "
             "expanded supported BF16 matrices and increases memory and I/O.",
         )
+
+
+def audit_snapshot(
+    fields: dict[str, Any],
+    tensors: list[tuple[str, int]],
+    *,
+    source_config: dict[str, Any] | None = None,
+    source_tokenizer_config: dict[str, Any] | None = None,
+) -> list[AuditFinding]:
+    """Audit already-decoded GGUF metadata and tensor records.
+
+    This pure-data layer is intentionally independent of the GGUF reader so the
+    structural failure rules can be tested with small fixtures.
+    """
+
+    findings: list[AuditFinding] = []
+    error, warning = _finding_record(findings)
+
+    names = [name for name, _ in tensors]
+    _audit_blocks(fields, names, source_config, error)
+    _audit_tokenizer(fields, error)
+    _audit_vocab_source_config(fields, source_tokenizer_config, error)
+    _audit_f32(tensors, warning)
 
     return findings
 
@@ -168,9 +191,7 @@ def audit_cold_sidecar_snapshot(
     """Validate the intentionally minimal experts-only cold-sidecar layout."""
 
     findings: list[AuditFinding] = []
-
-    def error(code: str, message: str):
-        findings.append(AuditFinding("error", code, message))
+    error, _warning = _finding_record(findings)
 
     arch = str(fields.get("general.architecture", "unknown"))
     if arch != "qwen35moe":
@@ -310,7 +331,30 @@ def audit_gguf(
     import gguf
 
     model_path = Path(path).expanduser().resolve()
-    reader = gguf.GGUFReader(str(model_path))
+    try:
+        reader = gguf.GGUFReader(str(model_path))
+    except Exception as exc:
+        # The reference gguf reader rejects Kestrel's llama.cpp-ne-order
+        # quantized expert tensors (dims are stored fastest-first, which the
+        # library interprets in reverse). Audit should report that cleanly
+        # instead of crashing with a traceback.
+        return {
+            "model": str(model_path),
+            "size_bytes": model_path.stat().st_size,
+            "architecture": "unknown",
+            "artifact_kind": "cold_sidecar" if cold_sidecar else "model",
+            "tensor_count": 0,
+            "errors": 1,
+            "warnings": 0,
+            "valid": False,
+            "findings": [
+                AuditFinding(
+                    "error",
+                    "GGUF_UNPARSEABLE",
+                    f"the installed gguf reader could not parse this GGUF: {exc}",
+                ).as_dict()
+            ],
+        }
     arch = _field_contents(reader, "general.architecture") or "unknown"
     keys = {
         "general.architecture",

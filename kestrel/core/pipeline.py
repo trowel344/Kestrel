@@ -75,23 +75,34 @@ class InferencePipeline:
             n_threads=n_threads,
             llama_cpp_dir=llama_cpp_dir,
         )
+        self._strategy = (
+            "mtp" if self.backend._resolved_spec_type(self.backend.capabilities()) else "none"
+        )
 
     def _discover_gguf(self) -> str:
         if not self.model_dir:
             return ""
-        beside_directory = self.model_dir.rstrip(os.sep) + ".gguf"
-        inside_directory = os.path.join(self.model_dir, "model.gguf")
+        directory = self.model_dir.rstrip(os.sep)
+        beside_directory = directory + ".gguf"
+        inside_directory = os.path.join(directory, "model.gguf")
         for candidate in (inside_directory, beside_directory):
             if os.path.isfile(candidate):
                 return candidate
+        # Fall back to any GGUF in the directory (supported by llama.cpp,
+        # including the first shard of a split model, whose sibling shards the
+        # loader resolves automatically).
+        try:
+            candidates = sorted(Path(directory).glob("*.gguf"))
+        except OSError:
+            candidates = []
+        if candidates:
+            return str(candidates[0])
         return beside_directory
 
     def generate(self, prompt: str, max_tokens: int = 256) -> tuple[str, dict]:
         text = self.backend.generate(prompt, max_tokens=max_tokens)
         summary = self.backend.last_metrics.as_dict()
-        summary["strategy"] = (
-            "mtp" if self.backend._resolved_spec_type(self.backend.capabilities()) else "none"
-        )
+        summary["strategy"] = self._strategy
         summary["model"] = self.gguf_path
         return text, summary
 

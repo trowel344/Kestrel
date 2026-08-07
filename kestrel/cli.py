@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import TextIO
 
 from . import ui
 from .backends.llama_cpp import (
@@ -30,6 +31,7 @@ from .core.planner import (
     plan_runtime,
     predict_decode_tokens_per_second,
 )
+from .errors import KestrelError, MissingModelError, ServiceError
 
 try:
     USER_CONFIG = load_config()
@@ -80,6 +82,30 @@ def _ttl_cache(seconds: float):
 
 @_ttl_cache(seconds=5)
 def detect_gpu() -> dict | None:
+    """Return the aggregated GPU profile across all devices.
+
+    The returned dict keeps the historical single-GPU shape (``name``,
+    ``vram_total_mb``, ``vram_free_mb``) for callers, plus ``count`` and
+    ``devices`` so multi-GPU rigs can fit and tensor-split over combined VRAM.
+    """
+    return _aggregate_gpu(detect_gpus())
+
+
+def _aggregate_gpu(devices: list[dict]) -> dict | None:
+    if not devices:
+        return None
+    if len(devices) == 1:
+        return {**devices[0], "count": 1, "devices": devices}
+    return {
+        "name": ", ".join(device["name"] for device in devices),
+        "vram_total_mb": sum(device["vram_total_mb"] for device in devices),
+        "vram_free_mb": sum(device["vram_free_mb"] for device in devices),
+        "count": len(devices),
+        "devices": devices,
+    }
+
+
+def detect_gpus() -> list[dict]:
     try:
         result = subprocess.run(
             [
@@ -92,17 +118,24 @@ def detect_gpu() -> dict | None:
             timeout=5,
         )
         if result.returncode != 0 or not result.stdout.strip():
-            return None
-        # Split the memory columns from the right so a vendor name containing a
-        # comma ("Foo, Inc. ...") does not misalign the following columns.
-        head, total, free = result.stdout.splitlines()[0].rsplit(",", 2)
-        return {
-            "name": head.strip() or "unknown",
-            "vram_total_mb": int(total.strip()),
-            "vram_free_mb": int(free.strip()),
-        }
+            return []
+        devices = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            # Split the memory columns from the right so a vendor name containing a
+            # comma ("Foo, Inc. ...") does not misalign the following columns.
+            head, total, free = line.rsplit(",", 2)
+            devices.append(
+                {
+                    "name": head.strip() or "unknown",
+                    "vram_total_mb": int(total.strip()),
+                    "vram_free_mb": int(free.strip()),
+                }
+            )
+        return devices
     except (FileNotFoundError, subprocess.SubprocessError, ValueError, IndexError):
-        return None
+        return []
 
 
 @_ttl_cache(seconds=5)
@@ -242,6 +275,49 @@ def read_gguf_config(gguf_path: str) -> dict:
     return read_planner_metadata(gguf_path)
 
 
+def _safetensors_info(directory: str) -> dict:
+    """Report config.json summary + param estimate for a safetensors model dir."""
+    base = Path(directory)
+    info: dict = {
+        "type": "safetensors",
+        "path": str(base),
+        "size_bytes": sum(p.stat().st_size for p in base.glob("*.safetensors")),
+    }
+    config_file = base / "config.json"
+    if not config_file.is_file():
+        info["config"] = {"error": "no config.json present"}
+        return info
+    try:
+        config = json.loads(config_file.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        info["config"] = {"error": f"unreadable config.json: {exc}"}
+        return info
+    info["config"] = {
+        key: config.get(key)
+        for key in (
+            "architectures",
+            "model_type",
+            "n_layer",
+            "num_hidden_layers",
+            "n_experts",
+            "num_local_experts",
+            "num_experts_per_tok",
+            "hidden_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "intermediate_size",
+            "max_position_embeddings",
+        )
+    }
+    hidden = config.get("hidden_size") or config.get("d_model")
+    layers = config.get("num_hidden_layers") or config.get("n_layer")
+    if hidden and layers:
+        intermediate = config.get("intermediate_size") or 4 * hidden
+        params = layers * (4 * hidden * hidden + 3 * hidden * intermediate)
+        info["estimated_params_b"] = round(params / 1e9, 2)
+    return info
+
+
 def _warm_page_cache(paths: list[str]) -> None:
     """Prime the OS page cache for model files before llama.cpp starts.
 
@@ -354,9 +430,12 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
         requested_gpu_layers = args.gpu_layers
         context_size = args.ctx_size
         if context_size == "auto":
-            context_size, context_reason = _select_context_size(model_info, gpu_info)
+            context_size, context_reason, overcommitted = _select_context_size(
+                model_info, gpu_info
+            )
         else:
             context_reason = "explicit user setting"
+            overcommitted = False
         requested_cpu_moe = {"on": True, "off": False, "auto": None}[args.cpu_moe]
     plan = plan_runtime(
         model,
@@ -412,27 +491,125 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
         else "uncalibrated-model-estimate"
     )
     result["context_reason"] = context_reason
+    result["memory_overcommit"] = overcommitted
     return result
 
 
-def _select_context_size(model_info: dict, gpu_info: dict | None) -> tuple[int, str]:
-    """Choose a conservative context tier from actual weight and memory fit.
+def _kv_cache_bytes_per_token(model_info: dict) -> float:
+    """Rough Q8 KV-cache bytes per token from the model architecture.
 
-    This is deliberately a tiered policy, not a claim that all architectures
-    have identical KV-cache costs. llama.cpp's allocator remains the final
-    authority and Kestrel's startup retry handles inaccurate driver headroom.
+    GQA/MoE models only store the KV-projection values (n_kv_heads * head_dim)
+    per layer per token, not the full hidden size; using the value dim keeps
+    the estimate from over- or under-counting by the GQA ratio. Falls back to
+    the hidden size when the KV dim is unreadable, and returns 0.0 when the
+    architecture is unreadable so callers pick a conservative context instead
+    of assuming a large one is safe.
     """
+    values_per_token = None
+    try:
+        if model_info.get("type") == "gguf":
+            cfg = read_gguf_config(model_info["path"])
+            layers = cfg["n_layer"]
+            hidden = cfg["hidden"]
+            if cfg.get("n_kv_heads") and cfg.get("head_dim"):
+                values_per_token = cfg["n_kv_heads"] * cfg["head_dim"]
+        else:
+            cfg_path = Path(model_info["path"]) / "config.json"
+            cfg = json.loads(cfg_path.read_text())
+            layers = cfg.get("num_hidden_layers") or cfg.get("n_layer") or 0
+            hidden = cfg.get("hidden_size") or cfg.get("d_model") or 0
+            heads = cfg.get("num_key_value_heads")
+            head_dim = cfg.get("head_dim")
+            if head_dim is None and hidden and cfg.get("num_attention_heads"):
+                head_dim = hidden / cfg["num_attention_heads"]
+            if heads and head_dim:
+                values_per_token = heads * head_dim
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0
+    if not layers or not hidden:
+        return 0.0
+    if not values_per_token:
+        values_per_token = hidden
+    # K and V state per token, quantized KV (q8_0 ≈ 1.06 bytes/value) plus
+    # bookkeeping overhead for the rope/scratch blocks.
+    return 2.0 * int(layers) * int(values_per_token) * 1.1
 
+
+def _select_context_size(model_info: dict, gpu_info: dict | None) -> tuple[int, str, bool]:
+    """Choose a context tier that cannot push the host into an OOM crash.
+
+    Returns ``(context, reason, overcommitted)``. ``overcommitted`` is True
+    when the model file itself cannot fit alongside the launch overhead in
+    free RAM + swap; in that case Kestrel picks the smallest context and the
+    caller surfaces an explicit warning instead of silently paging the host.
+    """
     model_size = model_file_size(model_info.get("path") or "")
-    vram = (gpu_info or {}).get("vram_total_mb", 0) * 1024**2
+    vram_free = (gpu_info or {}).get("vram_free_mb", 0) * 1024**2
     ram = _available_ram_mib() * 1024**2
-    if vram and model_size <= vram * 0.70:
-        return 32768, "weights leave substantial GPU headroom"
-    if vram and model_size <= vram * 0.86:
-        return 8192, "weights fit GPU memory with limited KV headroom"
-    if model_size <= ram + vram * 0.55:
-        return 8192, "weights fit with RAM offload"
-    return 2048, "model is paging-bound; preserving working-memory headroom"
+    memory = _memory_snapshot()
+    swap_free = max(
+        0,
+        memory.get("swap_total_mib", 0) - memory.get("swap_used_mib", 0),
+    ) * 1024**2
+    kv_per_token = _kv_cache_bytes_per_token(model_info)
+    overhead = 1536 * 1024**2  # CUDA runtime, compute scratch, tokenizer, OS
+    fit_margin = 1024 * 1024**2  # reserve llama.cpp keeps via --fit-target
+
+    # Model weights resident on the GPU: they and the KV cache must both fit in
+    # free VRAM together with the CUDA runtime and the fit reserve. Selecting a
+    # large context just because the weights fit (ignoring the KV cache that
+    # also lives in VRAM) OOMs the GPU for every model that is barely small
+    # enough to offload whole, e.g. a ~20 GiB MoE on a 24 GiB card.
+    if vram_free and model_size:
+        weights_budget = vram_free - fit_margin - overhead
+        if weights_budget > 0 and model_size <= weights_budget:
+            kv_budget = weights_budget - model_size
+            if kv_per_token <= 0:
+                return (
+                    8192,
+                    "GPU-resident; conservative default; KV cache cost unknown",
+                    False,
+                )
+            chosen = 512
+            for tier in (512, 1024, 2048, 4096, 8192, 16384, 32768):
+                if tier * kv_per_token <= kv_budget:
+                    chosen = tier
+            if chosen >= 32768:
+                reason = "GPU-resident; ample VRAM for weights and KV cache"
+            elif chosen >= 4096:
+                reason = "GPU-resident; KV cache fits alongside the weights"
+            else:
+                reason = "GPU-resident; KV cache constrains context on this GPU"
+            return chosen, reason, False
+
+    # Everything else shares free RAM/swap with the KV cache and compute
+    # scratch. Beyond that point llama.cpp pages the host and the OS can OOM.
+    headroom = ram + swap_free
+    if model_size + overhead > headroom:
+        return (
+            512,
+            "model exceeds available RAM+swap; smallest context to reduce OOM risk",
+            True,
+        )
+    # Keep the KV cache mostly in RAM; only a sliver of swap credit is allowed
+    # so a borderline model still gets a workable, conservative context.
+    budget = max(0.0, (ram + swap_free * 0.5 - model_size - overhead) * 0.8)
+    if kv_per_token <= 0:
+        chosen, reason = 8192, "conservative default; KV cache cost unknown"
+    else:
+        chosen = 512
+        for tier in (512, 1024, 2048, 4096, 8192, 16384, 32768):
+            if tier * kv_per_token <= budget:
+                chosen = tier
+        if chosen >= 8192:
+            reason = "ample RAM headroom for weights and KV cache"
+        elif chosen >= 4096:
+            reason = "moderate RAM headroom for weights and KV cache"
+        elif chosen >= 2048:
+            reason = "RAM-bound; moderate context to preserve stability"
+        else:
+            reason = "RAM-bound; conservative context to avoid memory pressure"
+    return chosen, reason, False
 
 
 def _context_size_arg(value: str) -> int | str:
@@ -459,14 +636,45 @@ def _cpu_moe_thread_sweep(logical_cpu_count: int) -> str:
     return ",".join(str(value) for value in sorted(candidates))
 
 
-def build_llama_cmd(model_info: dict, config: dict, args=None):
-    """Return ``(command, llama_cli_version)`` for the planned interactive run.
+def _flatten_extra(values: list[str] | None) -> list[str]:
+    """Flatten ``--extra`` strings (shell-whitespace separated) into tokens."""
+    if not values:
+        return []
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(shlex.split(value))
+    return tokens
 
-    The version comes from the same backend that built the command so callers
-    do not pay for a second ``--help``/``--version`` capability probe.
+
+def _tensor_split_arg(gpu: dict | None, explicit: str | None) -> str | None:
+    """Return a llama.cpp ``--tensor-split`` ratio list.
+
+    An explicit user value wins. Otherwise, when more than one GPU is present,
+    ratios are derived from each device's free VRAM (a rough load-balance
+    heuristic; llama.cpp re-uses them as fraction denominators). Single-GPU and
+    unknown layouts return ``None`` so the backend keeps its default.
+    """
+    if explicit:
+        return explicit
+    devices = (gpu or {}).get("devices") or []
+    if len(devices) < 2:
+        return None
+    free = [max(0, int(device.get("vram_free_mb") or 0)) for device in devices]
+    total = sum(free)
+    if total <= 0:
+        return None
+    ratios = [f"{value * 100 // total}" for value in free]
+    return ",".join(ratios)
+
+
+def _configure_backend(model_info: dict, config: dict, args=None) -> LlamaCppBackend:
+    """Build the LlamaCppBackend from a planned runtime config.
+
+    Shared by the interactive and server launch builders so backend
+    construction and engine-tune arguments have a single source of truth.
     """
     use_mtp = config["use_mtp"] and not (args and args.no_mtp)
-    backend = LlamaCppBackend(
+    return LlamaCppBackend(
         model_path=model_info["path"],
         n_gpu_layers=config["gpu_layers"],
         n_ctx=config["context_size"],
@@ -482,6 +690,13 @@ def build_llama_cmd(model_info: dict, config: dict, args=None):
         cache_type_k=args.kv_cache_type if args else config["cache_type_k"],
         cache_type_v=args.kv_cache_type if args else config["cache_type_v"],
         use_mmap=not (args and args.no_mmap),
+        use_mlock=bool(args and args.mlock),
+        direct_io=bool(args and args.direct_io),
+        tensor_split=_tensor_split_arg(
+            (args and getattr(args, "_gpu", None)) or detect_gpu(),
+            getattr(args, "tensor_split", None) or None,
+        ),
+        extra_args=_flatten_extra(args.extra if args else None),
         n_threads=(
             args.threads
             if args and args.threads is not None
@@ -494,7 +709,6 @@ def build_llama_cmd(model_info: dict, config: dict, args=None):
             else config["moe_cache"]
         ),
     )
-    return backend._build_interactive_cmd(), backend.capabilities().version
 
 
 def _run_with_oom_retries(
@@ -567,6 +781,14 @@ def _run_with_oom_retries(
                     "(stderr shown above).",
                     file=sys.stderr,
                 )
+                from .engine import matches_too_old_signature
+
+                if matches_too_old_signature(error_text):
+                    print(
+                        "  Hint: this model may need a newer llama.cpp engine. "
+                        "Run `kestrel engine status`, then `kestrel engine update`.",
+                        file=sys.stderr,
+                    )
             return returncode
 
         def flag_value(flag: str) -> str | None:
@@ -618,50 +840,195 @@ def _cached_gguf_path(source_path: str) -> str:
     return source_path.rstrip(os.sep) + ".gguf"
 
 
-def cmd_run(args):
+def _human_stream(args) -> TextIO:
+    """Stream for human-readable output: stderr under ``--json`` so that
+    stdout stays a single parseable JSON document (the agent contract)."""
+    return sys.stderr if getattr(args, "json", False) else sys.stdout
+
+
+def _finish_json(args, result: dict) -> int:
+    """Emit ``result`` as JSON on stdout and return its exit code.
+
+    Prints nothing when ``--json`` is not set, so non-JSON callers keep their
+    existing human output and this is a no-op.
+    """
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(result) + "\n")
+    return int(result.get("exit_code", 0))
+
+
+def _print_failure(exc, *, json_output: bool) -> int:
+    """Render a :class:`KestrelError` consistently and return its exit code.
+
+    Under ``--json`` the failure is a single stable document on **stdout**:
+    ``{"error": {"code", "message", "hint"}}``. Otherwise a ``Error:`` prose
+    line plus an optional hint go to stderr.
+    """
+    if json_output:
+        print(json.dumps({"error": exc.as_dict()}, indent=2, default=str))
+    else:
+        print(f"Error: {exc.message}", file=sys.stderr)
+        if getattr(exc, "hint", None):
+            print(f"  Hint: {exc.hint}", file=sys.stderr)
+    return getattr(exc, "exit_code", 1)
+
+
+def _oneshot_run(backend, cmd: list[str], args) -> int:
+    """Run a one-shot generation and return its exit code.
+
+    The completion text is always shown on the human stream; under ``--json``
+    a structured result (output + token counts + timings + command) is the
+    only thing written to stdout.
+    """
+    oneshot = backend._build_cmd(args.prompt, int(args.max_tokens))
+    try:
+        output = backend.generate(args.prompt, int(args.max_tokens))
+    except (RuntimeError, FileNotFoundError) as exc:
+        return _finish_json(
+            args,
+            {
+                "model": args.model,
+                "status": "error",
+                "error": str(exc),
+                "exit_code": 1,
+                "command": oneshot,
+            },
+        )
+    metrics = backend.last_metrics
+    print(output, file=_human_stream(args))
+    return _finish_json(
+        args,
+        {
+            "model": args.model,
+            "status": "ok",
+            "exit_code": metrics.returncode,
+            "duration_s": round(metrics.elapsed_seconds, 3),
+            "prompt_tokens": metrics.prompt_tokens,
+            "output_tokens": metrics.output_tokens,
+            "prompt_tokens_per_second": metrics.prompt_tokens_per_second,
+            "output_tokens_per_second": metrics.output_tokens_per_second,
+            "command": oneshot,
+            "output": output,
+        },
+    )
+
+
+def _wait_ready(host: str, port: int, *, timeout: float, interval: float = 0.25) -> bool:
+    """Poll ``/health`` (then ``/v1/health``) until llama-server reports ready
+    or ``timeout`` expires.
+
+    Returns True only after a confirmed HTTP 200. Best-effort: connection
+    refusals (server still booting) are retried, not treated as failures.
+    """
+    import urllib.error
+    import urllib.request
+
+    deadline = time.perf_counter() + timeout
+    while True:
+        for path in ("/health", "/v1/health"):
+            url = f"http://{host}:{port}{path}"
+            try:
+                with urllib.request.urlopen(url, timeout=max(0.5, interval)) as resp:
+                    if resp.status == 200:
+                        return True
+            except (urllib.error.URLError, TimeoutError, OSError):
+                pass
+        if time.perf_counter() >= deadline:
+            return False
+        time.sleep(interval)
+
+
+def _resolve_ollama_native(name: str) -> str | None:
+    """Resolve an Ollama model to its local GGUF blob so Kestrel can run it
+    through its own planned llama.cpp runtime instead of delegating to the
+    Ollama daemon.
+
+    Returns ``None`` for cloud-hosted models (no reusable local GGUF), which
+    then keep the ``ollama run`` passthrough.
+    """
+    try:
+        from .model_store import resolve_ollama_blob
+
+        blob = resolve_ollama_blob(name)
+    except Exception:
+        return None
+    return str(blob) if blob is not None else None
+
+
+def _prepare_run_model(args):
+    """Resolve the requested model, converting/placing it for the Kestrel
+    runtime and producing the fitting config.
+
+    Falls back to passthrough for cloud-only Ollama models, raising
+    ``SystemExit`` exactly where the old ``cmd_run`` did. Returns ``None``
+    when the Ollama adapter has taken over in dry-run mode, otherwise a
+    ``(model_info, config)`` pair."""
     if not args.model:
-        args.model = os.environ.get("KESTREL_MODEL") or USER_CONFIG.default_model
-        if not args.model and _resolve_model_alias("qwen3.5:122b-10a"):
-            args.model = "qwen3.5:122b-10a"
-        if not args.model:
-            raise SystemExit(
-                "Error: no model selected. Pass a GGUF path or set KESTREL_MODEL."
-            )
+        args.model = _default_model(
+            args,
+            error="Error: no model selected. Pass a GGUF path or set KESTREL_MODEL.",
+        )
     if args.model.startswith("ollama://"):
         name = args.model.removeprefix("ollama://")
-        if args.dry_run:
-            print("Runtime: Ollama adapter")
-            print("Command: " + shlex.join(["ollama", "run", name]))
+        blob = _resolve_ollama_native(name)
+        if blob is not None:
+            out = _human_stream(args)
             print(
-                "Note: context and placement are owned by the Ollama runtime for this adapter."
+                ui.dim(
+                    f"Ollama model {name} resolved to local GGUF: {blob}"
+                ),
+                file=out,
             )
-            return
-        try:
-            result = subprocess.run(["ollama", "run", name])
-        except FileNotFoundError as exc:
-            raise SystemExit("Error: Ollama is not installed") from exc
-        raise SystemExit(result.returncode)
+            print(
+                ui.dim(
+                    "Running through the Kestrel runtime with fit and context "
+                    "guardrails (Ollama runtime bypassed)."
+                ),
+                file=out,
+            )
+            args.model = blob
+        else:
+            if args.dry_run:
+                out = _human_stream(args)
+                print("Runtime: Ollama adapter", file=out)
+                print("Command: " + shlex.join(["ollama", "run", name]), file=out)
+                print(
+                    "Note: context and placement are owned by the Ollama runtime for this adapter.",
+                    file=out,
+                )
+                return None
+            try:
+                result = subprocess.run(["ollama", "run", name])
+            except FileNotFoundError as exc:
+                raise SystemExit("Error: Ollama is not installed") from exc
+            raise SystemExit(result.returncode)
     model_info = detect_model(args.model)
     if model_info is None:
-        raise SystemExit(f"Error: could not resolve model or GGUF path: {args.model}")
+        raise MissingModelError(
+            f"could not resolve model or GGUF path: {args.model}",
+            hint="check the model name and run `kestrel models list`",
+        )
     if model_info["type"] == "safetensors" and not model_info["path"]:
-        raise SystemExit(
-            "Model is not downloaded. Download it first:\n"
-            f"  huggingface-cli download {model_info['hub_id']}"
+        raise MissingModelError(
+            "model source exists but its safetensors are not downloaded",
+            hint=f"huggingface-cli download {model_info['hub_id']}",
         )
 
     gpu_info = detect_gpu()
-    print(ui.kv("Model", args.model, value_color=ui.bold))
+    args._gpu = gpu_info
+    out = _human_stream(args)
+    print(ui.kv("Model", args.model, value_color=ui.bold), file=out)
     if gpu_info:
         print(
             ui.kv(
                 "GPU",
                 f"{gpu_info['name']} ({gpu_info['vram_free_mb']}/{gpu_info['vram_total_mb']} MiB free)",
                 value_color=ui.green,
-            )
+            ),
+            file=out,
         )
     else:
-        print(ui.kv("GPU", "not detected; planning a CPU-compatible launch", value_color=ui.yellow))
+        print(ui.kv("GPU", "not detected; planning a CPU-compatible launch", value_color=ui.yellow), file=out)
 
     if model_info["type"] == "safetensors":
         output = _cached_gguf_path(model_info["path"])
@@ -680,39 +1047,23 @@ def cmd_run(args):
         model_info = {"type": "gguf", "path": output, "gguf_name": output}
 
     config = estimate_config(model_info, gpu_info, args)
-    run_env = None
-    hot_model_path = None
-    cold_model_path = None
-    if args.moe_hot_model and args.moe_cold_model:
-        raise SystemExit("Error: --moe-hot-model and --moe-cold-model are mutually exclusive")
-    if args.moe_hot_model:
-        hot_model_path = str(Path(args.moe_hot_model).expanduser().resolve())
-        if not Path(hot_model_path).is_file():
-            raise SystemExit(f"Error: MoE hot sidecar does not exist: {hot_model_path}")
-        if config["moe_cache"] != "on":
-            raise SystemExit(
-                "Error: --moe-hot-model requires --moe-cache on or an explicit MiB budget"
-            )
-        run_env = os.environ.copy()
-        run_env.pop("LLAMA_MOE_COLD_GGUF", None)
-        run_env["LLAMA_MOE_HOT_GGUF"] = hot_model_path
-    if args.moe_cold_model:
-        cold_model_path = str(Path(args.moe_cold_model).expanduser().resolve())
-        if not Path(cold_model_path).is_file():
-            raise SystemExit(f"Error: MoE cold sidecar does not exist: {cold_model_path}")
-        if config["moe_cache"] != "on":
-            raise SystemExit(
-                "Error: --moe-cold-model requires --moe-cache on or an explicit MiB budget"
-            )
-        run_env = os.environ.copy()
-        run_env.pop("LLAMA_MOE_HOT_GGUF", None)
-        run_env["LLAMA_MOE_COLD_GGUF"] = cold_model_path
-    cmd, llama_cli_version = build_llama_cmd(model_info, config, args)
+    return model_info, config
 
+
+def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None, cold_model_path=None):
+    """Print the explainable runtime plan, notes and command block before
+    launching the interactive/runtime execution phase of ``run``."""
+    out = _human_stream(args)
     mtp_enabled = "--spec-type" in cmd
+    direct_io = bool(args.direct_io and "--direct-io" in cmd)
     plan_lines = [
         ui.kv("Model size", f"{config['model_size_gib']:.2f} GiB", value_color=ui.bold),
         ui.kv("GPU layers", f"{config['gpu_layers']} (llama.cpp fit enabled)", value_color=ui.cyan),
+        ui.kv(
+            "Load path",
+            "direct I/O (uncached)" if direct_io else "mmap",
+            value_color=ui.cyan if direct_io else None,
+        ),
         ui.kv("VRAM safety margin", f"{args.fit_target or config['fit_target_mib']} MiB"),
         ui.kv("CPU MoE", "enabled" if config["cpu_moe"] else "disabled",
               value_color=ui.green if config["cpu_moe"] else ui.dim),
@@ -752,8 +1103,15 @@ def cmd_run(args):
             value_color=ui.green if (predicted and predicted >= 10) else ui.yellow,
         )
     )
-    print(ui.box("Runtime plan", "\n".join(plan_lines)))
+    print(ui.box("Runtime plan", "\n".join(plan_lines)), file=out)
     notes = []
+    if config.get("memory_overcommit"):
+        notes.append(
+            "This model file is larger than the free RAM + swap on this host. "
+            "Context was reduced to the minimum to avoid an OOM crash, but "
+            "expect heavy disk paging and low speed. Free memory or use a "
+            "smaller quant/tier to run it comfortably."
+        )
     if predicted and predicted < 10:
         if cold_model_path:
             notes.append(
@@ -775,26 +1133,239 @@ def cmd_run(args):
         else:
             notes.append(f"this llama.cpp build does not expose draft-mtp ({llama_cli_version})")
     for note in notes:
-        print(f"  {ui.warn_mark()} {ui.yellow(note)}")
+        print(f"  {ui.warn_mark()} {ui.yellow(note)}", file=out)
     command_lines = []
     if hot_model_path:
         command_lines.append(f"  LLAMA_MOE_HOT_GGUF={shlex.quote(hot_model_path)}")
     command_lines.append("  " + shlex.join(cmd))
-    print(ui.box("Command", "\n".join(command_lines), title_color=ui.cyan))
-    if args.dry_run:
+    print(ui.box("Command", "\n".join(command_lines), title_color=ui.cyan), file=out)
+
+
+def cmd_run(args):
+    prepared = _prepare_run_model(args)
+    if prepared is None:
         return
-    if args.warm_cache:
-        warm_paths = [model_info["path"]]
-        if cold_model_path:
-            warm_paths.append(cold_model_path)
-        if hot_model_path:
-            warm_paths.append(hot_model_path)
-        print(ui.dim("Warming the model page cache before launch..."))
-        _warm_page_cache(warm_paths)
-    retries = 0 if args.no_oom_retry else 2
-    raise SystemExit(
-        _run_with_oom_retries(cmd, max_retries=retries, env=run_env)
+    model_info, config = prepared
+    run_env = None
+    hot_model_path = None
+    cold_model_path = None
+    if args.moe_hot_model and args.moe_cold_model:
+        raise SystemExit("Error: --moe-hot-model and --moe-cold-model are mutually exclusive")
+    if args.moe_hot_model:
+        hot_model_path = str(Path(args.moe_hot_model).expanduser().resolve())
+        if not Path(hot_model_path).is_file():
+            raise SystemExit(f"Error: MoE hot sidecar does not exist: {hot_model_path}")
+        if config["moe_cache"] != "on":
+            raise SystemExit(
+                "Error: --moe-hot-model requires --moe-cache on or an explicit MiB budget"
+            )
+        run_env = os.environ.copy()
+        run_env.pop("LLAMA_MOE_COLD_GGUF", None)
+        run_env["LLAMA_MOE_HOT_GGUF"] = hot_model_path
+    if args.moe_cold_model:
+        cold_model_path = str(Path(args.moe_cold_model).expanduser().resolve())
+        if not Path(cold_model_path).is_file():
+            raise SystemExit(f"Error: MoE cold sidecar does not exist: {cold_model_path}")
+        if config["moe_cache"] != "on":
+            raise SystemExit(
+                "Error: --moe-cold-model requires --moe-cache on or an explicit MiB budget"
+            )
+        run_env = os.environ.copy()
+        run_env.pop("LLAMA_MOE_HOT_GGUF", None)
+        run_env["LLAMA_MOE_COLD_GGUF"] = cold_model_path
+    backend = _configure_backend(model_info, config, args)
+    cmd = backend._build_interactive_cmd()
+    llama_cli_version = backend.capabilities().version
+
+    _print_run_plan(
+        args,
+        config,
+        cmd,
+        llama_cli_version,
+        hot_model_path=hot_model_path,
+        cold_model_path=cold_model_path,
     )
+    direct_io = bool(args.direct_io and "--direct-io" in cmd)
+    if args.dry_run:
+        return _finish_json(
+            args,
+            {
+                "model": args.model,
+                "dry_run": True,
+                "model_path": model_info["path"],
+                "command": cmd,
+            },
+        )
+    if args.prompt:
+        return _oneshot_run(backend, cmd, args)
+    if args.warm_cache:
+        if direct_io:
+            print(
+                ui.dim(
+                    "--warm-cache has no effect with --direct-io "
+                    "(direct I/O bypasses the page cache)."
+                ),
+                file=_human_stream(args),
+            )
+        else:
+            warm_paths = [model_info["path"]]
+            if cold_model_path:
+                warm_paths.append(cold_model_path)
+            if hot_model_path:
+                warm_paths.append(hot_model_path)
+            print(ui.dim("Warming the model page cache before launch..."), file=_human_stream(args))
+            _warm_page_cache(warm_paths)
+    retries = 0 if args.no_oom_retry else 2
+    rc = _run_with_oom_retries(cmd, max_retries=retries, env=run_env)
+    return _finish_json(args, {"model": args.model, "exit_code": rc})
+
+
+def _build_server_cmd(model_info: dict, config: dict, args=None) -> list[str]:
+    """Build a ``llama-server`` command from a planned runtime configuration.
+
+    Delegates argument assembly to ``LlamaCppBackend.build_server_cmd`` so the
+    server path shares the exact engine tuning flags as interactive runs
+    (including ``--fit``, which was previously dropped and let serve OOM where
+    run would not).
+    """
+    backend = _configure_backend(model_info, config, args)
+    return backend.build_server_cmd(
+        host=getattr(args, "host", "127.0.0.1"),
+        port=getattr(args, "port", 8080),
+        alias=getattr(args, "alias", None),
+        embeddings=bool(args and args.embeddings),
+    )
+
+
+def cmd_serve(args):
+    """Serve the planned model over an OpenAI-compatible llama-server endpoint."""
+    if not args.model:
+        args.model = _default_model(
+            args,
+            error="Error: no model selected. Pass a GGUF path or set KESTREL_MODEL.",
+        )
+    if args.model.startswith("ollama://"):
+        name = args.model.removeprefix("ollama://")
+        blob = _resolve_ollama_native(name)
+        if blob is not None:
+            print(
+                ui.dim(
+                    f"Ollama model {name} resolved to local GGUF: {blob} "
+                    "(serving via Kestrel's llama-server runtime)"
+                ),
+                file=_human_stream(args),
+            )
+            args.model = blob
+        else:
+            raise SystemExit(
+                "Error: kestrel serve hosts GGUF models through llama-server. "
+                "For Ollama models use `ollama serve`/`ollama run`."
+            )
+    model_info = detect_model(args.model)
+    if model_info is None:
+        raise MissingModelError(
+            f"could not resolve model or GGUF path: {args.model}",
+            hint="check the model name and run `kestrel models list`",
+        )
+    if model_info["type"] == "safetensors" and not model_info["path"]:
+        raise MissingModelError(
+            "model source exists but its safetensors are not downloaded",
+            hint=f"huggingface-cli download {model_info['hub_id']}",
+        )
+    if model_info["type"] == "safetensors":
+        output = _cached_gguf_path(model_info["path"])
+        if os.path.isfile(output):
+            print(ui.kv("Cached GGUF", output))
+        elif args.no_convert:
+            raise SystemExit(
+                "Model is safetensors but no cached GGUF exists. "
+                "Remove --no-convert or pass a GGUF file."
+            )
+        else:
+            from .gguf.converter import NVFP4Converter
+
+            converter = NVFP4Converter(model_info["path"], include_mtp=False)
+            converter.convert(output)
+        model_info = {"type": "gguf", "path": output, "gguf_name": output}
+
+    gpu_info = detect_gpu()
+    args._gpu = gpu_info
+    config = estimate_config(model_info, gpu_info, args)
+    cmd = _build_server_cmd(model_info, config, args)
+    host = args.host
+    port = args.port
+    out = _human_stream(args)
+    print(ui.box(
+        "Serving",
+        "\n".join([
+            ui.kv("Model", model_info["path"], value_color=ui.bold),
+            ui.kv("Engine", "llama-server"),
+            ui.kv("URL", f"http://{host}:{port}", value_color=ui.cyan),
+            ui.kv("Context", f"{config['context_size']} ({config['context_reason']})"),
+            ui.kv("GPU layers", str(config["gpu_layers"])),
+            ui.kv("CPU MoE", "enabled" if config["cpu_moe"] else "disabled"),
+            "",
+            "OpenAI-compatible endpoints: /v1/chat/completions, /v1/completions, /v1/models",
+            "Press Ctrl+C to stop the server.",
+        ]),
+        title_color=ui.green,
+    ), file=out)
+    if args.dry_run:
+        print("  " + shlex.join(cmd), file=out)
+        return _finish_json(
+            args,
+            {
+                "model": args.model,
+                "dry_run": True,
+                "url": f"http://{host}:{port}",
+                "command": cmd,
+            },
+        )
+    if not args.wait and not getattr(args, "json", False):
+        raise SystemExit(_run_with_oom_retries(list(cmd)))
+    proc = subprocess.Popen(list(cmd))
+    result = {
+        "model": args.model,
+        "url": f"http://{host}:{port}",
+        "host": host,
+        "port": port,
+        "command": cmd,
+    }
+    timeout = float(args.wait) if args.wait else 30.0
+    print(
+        ui.dim(f"Waiting for the server on http://{host}:{port}/health ..."),
+        file=out,
+    )
+    started = time.perf_counter()
+    ready = _wait_ready(host, port, timeout=timeout)
+    elapsed = round(time.perf_counter() - started, 3)
+    if not ready:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise SystemExit(
+            _print_failure(
+                ServiceError(
+                    f"llama-server did not become ready on "
+                    f"http://{host}:{port}/health within {timeout:.0f}s.",
+                    hint=(
+                        "Check the llama-server output above for load errors "
+                        "(CUDA OOM, missing GGUF, or an incompatible quant) and "
+                        "free GPU memory before retrying."
+                    ),
+                ),
+                json_output=bool(getattr(args, "json", False)),
+            )
+        )
+    result["status"] = "ready"
+    result["exit_code"] = 0
+    result["ready_after_s"] = elapsed
+    print(ui.green("Server is ready."), file=out)
+    _finish_json(args, result)
+    proc.wait()
+    raise SystemExit(proc.returncode)
 
 
 def cmd_build(_args):
@@ -819,11 +1390,290 @@ def cmd_build(_args):
     )
 
 
+def _engine_dir(args) -> str:
+    from .backends.llama_cpp import default_llama_cpp_dir
+
+    directory = getattr(args, "dir", None)
+    if directory:
+        return str(Path(directory).expanduser().resolve())
+    override = os.environ.get("KESTREL_LLAMA_CPP_DIR")
+    if override:
+        return override
+    if USER_CONFIG.llama_cpp_dir:
+        return USER_CONFIG.llama_cpp_dir
+    return default_llama_cpp_dir()
+
+
+def cmd_engine(args):
+    from . import engine
+
+    directory = _engine_dir(args)
+    command = args.engine_command
+    out = _human_stream(args)
+    js = bool(getattr(args, "json", False))
+
+    if command == "status":
+        try:
+            status = engine.engine_status(
+                directory, check_remote=not getattr(args, "no_remote", False)
+            )
+        except engine.EngineError:
+            raise
+        if js:
+            print(json.dumps(status, indent=2, default=str))
+            return
+        rows: list[tuple[str, str, object]] = [
+            ("Directory", status["directory"], None),
+            ("Git", "yes" if status["git"] else "no", None),
+            ("Remote", status["remote"] or "—", None),
+            ("Branch", status["branch"] or "detached", None),
+            ("Commit", (status["commit"] or "—")[:12], None),
+            ("Managed", "yes" if status["manifest"] else "no", None),
+        ]
+        if status["git"] and status["remote"]:
+            if status["behind"] is None:
+                rows.append(("Stale", "unknown (remote unreachable)", ui.dim))
+            elif status["stale"]:
+                rows.append(
+                    (
+                        "Stale",
+                        f"{status['behind']} behind upstream — run `kestrel engine update`",
+                        ui.red,
+                    )
+                )
+            else:
+                rows.append(("Up to date", "current", None))
+        if status["dirty"]:
+            rows.append(("Dirty", "uncommitted changes", ui.yellow))
+        if status.get("artifacts"):
+            present = [name for name, artifact in status["artifacts"].items() if artifact["exists"]]
+            rows.append(("Built", ", ".join(present) or "none", None))
+        body = "\n".join(ui.kv(key, value, value_color=color) for key, value, color in rows)
+        print(ui.box("Engine", body, title_color=ui.cyan), file=out)
+        return
+
+    try:
+        if command == "update":
+            result = engine.update(
+                directory,
+                dry_run=getattr(args, "dry_run", False),
+                force=getattr(args, "force", False),
+                remote=getattr(args, "remote", None),
+            )
+        elif command == "rebuild":
+            result = engine.rebuild(directory, dry_run=getattr(args, "dry_run", False))
+        elif command == "set":
+            result = {"status": "adopted", "directory": directory, **engine.adopt(directory, getattr(args, "remote", None)).as_dict()}
+        else:
+            raise SystemExit(f"unknown engine subcommand: {command}")
+    except engine.EngineError:
+        raise
+
+    if js:
+        print(json.dumps(result, indent=2, default=str))
+        return
+    if result.get("status") == "up_to_date":
+        print(ui.kv("Engine", "already up to date", value_color=ui.green), file=out)
+        return
+    if result.get("status") == "dry_run":
+        print(
+            ui.kv("Engine", "rebuild planned (dry run)"),
+            file=out,
+        )
+    for key, value in result.items():
+        if key in ("directory", "cmake_flags", "targets", "artifacts", "status"):
+            continue
+        print(ui.kv(key.replace("_", " ").title(), value), file=out)
+    print(ui.kv("Status", result.get("status", "")), file=out)
+
+
+def cmd_self_update(args):
+    """Update the running Kestrel package from its source tree or a wheel.
+
+    ``--wheel`` may be a local path or an ``https://`` URL. When ``--sha256``
+    is given the artifact is verified before install (trusted distribution).
+    The currently-installed package is snapshotted first and restored on a
+    failed post-install check, so an update can never leave Kestrel broken.
+    """
+    from hashlib import sha256
+
+    repo = getattr(args, "repo", None) or os.environ.get("KESTREL_REPO")
+    wheel = getattr(args, "wheel", None)
+    if wheel:
+        artifact = _materialize_wheel(wheel)
+        source_sha = args.sha256.lower().replace("sha256:", "") if args.sha256 else None
+        source_label = str(wheel)
+    else:
+        if repo is None:
+            root = Path(__file__).resolve().parents[1]
+            repo = str(root) if (root / ".git").is_dir() else None
+        if repo is None:
+            raise SystemExit(
+                "Error: cannot locate the Kestrel repository (set --repo or --wheel)"
+            )
+        artifact, source_sha = repo, None
+        source_label = repo
+
+    from_version = _kestrel_version()
+    out = _human_stream(args)
+    js = bool(getattr(args, "json", False))
+    plan = {
+        "status": "planned",
+        "from_version": from_version,
+        "to_version": None,
+        "rolled_back": False,
+        "source": source_label,
+        "dry_run": bool(args.dry_run),
+    }
+
+    if source_sha:
+        actual = sha256(Path(artifact).read_bytes()).hexdigest()
+        if actual != source_sha:
+            from .errors import IntegrityError
+
+            raise IntegrityError(
+                f"SHA256 mismatch for {source_label}",
+                hint="refusing to install an unverified artifact",
+            )
+
+    if args.dry_run:
+        plan["status"] = "dry_run"
+        plan["to_version"] = "pending"
+        if js:
+            print(json.dumps(plan, indent=2, default=str))
+            return
+        print(ui.kv("Source", source_label, value_color=ui.bold), file=out)
+        print(f"  Would install Kestrel from {source_label} via pip.", file=out)
+        return
+
+    backup = _snapshot_installed()
+    print(ui.kv("Source", source_label, value_color=ui.bold), file=out)
+    install = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            artifact,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if install.returncode != 0:
+        raise SystemExit(f"Error: install failed:\n{install.stderr[-2000:]}")
+
+    ok, version = _post_install_check()
+    rolled_back = False
+    if not ok and backup is not None:
+        _restore_install(backup)
+        ok, version = _post_install_check()
+        rolled_back = True
+    if not ok:
+        from .errors import IntegrityError
+
+        raise IntegrityError(
+            f"post-install verification failed for {source_label}",
+            hint="Kestrel may require a manual reinstall; the previous install was not restorable",
+        )
+
+    if js:
+        plan["status"] = "rolled_back" if rolled_back else "updated"
+        plan["to_version"] = version
+        plan["rolled_back"] = rolled_back
+        print(json.dumps(plan, indent=2, default=str))
+        return
+    if rolled_back:
+        print(f"Installation rolled back; Kestrel still at {version}.", file=out)
+    else:
+        print(
+            f"Updated Kestrel to {version}. Restart the shell for changes to take effect.",
+            file=out,
+        )
+
+
+def _materialize_wheel(target: str) -> str:
+    """Return a local path for ``target`` (downloading https wheels to temp)."""
+    if not target.startswith(("http://", "https://")):
+        return target
+    import tempfile
+    import urllib.request
+
+    with urllib.request.urlopen(target, timeout=60) as response:
+        suffix = Path(target).suffix or ".whl"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            shutil.copyfileobj(response, handle)
+            return handle.name
+
+
+def _snapshot_installed():
+    """Copy the installed ``kestrel`` package for rollback, or ``None``.
+
+    Editable (source-tree) installs are not snapshotted — the source tree is
+    not modified by ``pip install`` so it needs no rollback.
+    """
+    import shutil
+    import tempfile
+
+    try:
+        import kestrel
+    except ImportError:
+        return None
+    src = Path(kestrel.__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[1]
+    if not src.is_dir() or src.is_relative_to(repo_root):
+        return None
+    backup_root = Path(tempfile.mkdtemp(prefix="kestrel-snapshot-"))
+    backup = backup_root / src.name
+    shutil.copytree(src, backup)
+    return {"from": src, "to": backup}
+
+
+def _restore_install(snapshot) -> None:
+    import shutil
+
+    src, backup = snapshot["from"], snapshot["to"]
+    shutil.rmtree(src, ignore_errors=True)
+    shutil.copytree(backup, src)
+
+
+def _post_install_check() -> tuple[bool, str]:
+    """Return ``(ok, version)`` by loading kestrel in a fresh interpreter."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib.metadata as m; print(m.version('kestrel'))",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    version = result.stdout.strip()
+    return (result.returncode == 0 and bool(re.match(r"^\d+(\.\d+)+", version))), version
+
+
 def cmd_convert(args):
     model_info = detect_model(args.model)
     if not model_info or model_info["type"] != "safetensors" or not model_info["path"]:
         raise SystemExit("Error: conversion input must be a downloaded safetensors model")
     output = args.output or _cached_gguf_path(model_info["path"])
+    if args.generic:
+        from .gguf.converter import generic_convert_hf_to_gguf
+
+        try:
+            _command, _code = generic_convert_hf_to_gguf(
+                model_info["path"],
+                output,
+                outtype=args.outtype,
+                llama_cpp_dir=LLAMA_CPP_DIR,
+            )
+        except FileNotFoundError as exc:
+            raise SystemExit(f"Error: {exc}") from exc
+        except RuntimeError as exc:
+            raise SystemExit(f"Error: {exc}") from exc
+        print(f"Converted {model_info['path']} → {output}")
+        return
     from .gguf.converter import NVFP4Converter
 
     NVFP4Converter(
@@ -842,10 +1692,286 @@ def cmd_convert(args):
     ).convert(output)
 
 
-def cmd_doctor(_args):
+# byte thresholds for the disk-space sanity checks (fail below CRITICAL,
+# warn below the softer bound; GGs are routinely many GiB).
+_CHECK_DISK_CRITICAL = 1 << 30  # 1 GiB
+_CHECK_DISK_WARN = 5 << 30      # 5 GiB
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-friendly byte count (binary units)."""
+    f = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if f < 1024 or unit == "TiB":
+            return f"{f:.1f} {unit}" if unit != "B" else f"{int(f)} B"
+        f /= 1024
+    return f"{f:.1f} TiB"
+
+
+def _writable_probe(path: Path) -> tuple[bool, str]:
+    """Return (True, "") if a real write succeeds in ``path``'s directory."""
+    try:
+        target = Path(path).expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / f".kestrel-write-probe-{os.getpid()}"
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        probe.unlink()
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def _doctor_checks(
+    backend,
+    cli_caps,
+    cli_error: str | None,
+    server_caps=None,
+    server_error: str | None = None,
+) -> list[dict]:
+    """Extra `doctor` sanity checks shared by the human and JSON rendering.
+
+    Each entry is ``{"name", "status" (ok|warn|fail), "message"}``. The
+    llama.cpp compatibility probe falls back to ``llama-server`` when the
+    ``llama-cli`` binary is unavailable.
+    """
+    from .model_store import default_models_dir
+    from .util import available_disk_bytes
+
+    models_dir = (
+        Path(USER_CONFIG.models_dir).expanduser()
+        if USER_CONFIG.models_dir
+        else default_models_dir()
+    )
+    engine_dir = Path(backend.llama_cpp_dir)
+    checks: list[dict] = []
+
+    for label, path in (("models dir", models_dir), ("llama.cpp dir", engine_dir)):
+        free = available_disk_bytes(path)
+        name = f"disk free ({label})"
+        if free is None:
+            checks.append(
+                {
+                    "name": name,
+                    "status": "warn",
+                    "message": f"could not determine free space for {path}",
+                }
+            )
+        elif free < _CHECK_DISK_CRITICAL:
+            checks.append(
+                {
+                    "name": name,
+                    "status": "fail",
+                    "message": f"only {_fmt_bytes(free)} free under {path}",
+                }
+            )
+        elif free < _CHECK_DISK_WARN:
+            checks.append(
+                {
+                    "name": name,
+                    "status": "warn",
+                    "message": f"{_fmt_bytes(free)} free under {path}",
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "name": name,
+                    "status": "ok",
+                    "message": f"{_fmt_bytes(free)} free under {path}",
+                }
+            )
+
+    for label, path in (("config path", config_path().parent), ("models dir", models_dir)):
+        ok, err = _writable_probe(path)
+        checks.append(
+            {
+                "name": f"writable ({label})",
+                "status": "ok" if ok else "fail",
+                "message": f"{path} is writable" if ok else f"{path} not writable: {err}",
+            }
+        )
+
+    if cli_caps is None and server_caps is None:
+        checks.append(
+            {
+                "name": "llama.cpp compatibility",
+                "status": "fail",
+                "message": (
+                    f"llama-cli/llama-server unavailable: "
+                    f"{cli_error or server_error}"
+                ),
+            }
+        )
+    else:
+        caps = cli_caps if cli_caps is not None else server_caps
+        body = caps.help_text
+        fallback = "" if cli_caps is not None else " (via llama-server)"
+        checks.append(
+            {
+                "name": "llama.cpp compatibility",
+                "status": "ok",
+                "message": (
+                    f"version {caps.version}{fallback}, "
+                    f"nvfp4={'yes' if ('nvfp4' in body or 'nv-fp4' in body) else 'no'}, "
+                    f"q1_0={'yes' if ('q1_0' in body or 'q1-moe' in body) else 'no'}"
+                ),
+            }
+        )
+
+    default = USER_CONFIG.default_model
+    if not default:
+        checks.append(
+            {
+                "name": "model cache integrity",
+                "status": "warn",
+                "message": "no default model configured",
+            }
+        )
+    else:
+        info = detect_model(default)
+        path = (info or {}).get("path")
+        if not path or not os.path.isfile(path):
+            checks.append(
+                {
+                    "name": "model cache integrity",
+                    "status": "warn",
+                    "message": f"configured model {default} not found on disk",
+                }
+            )
+        else:
+            gguf = Path(path)
+            try:
+                size = gguf.stat().st_size
+                if size <= 0:
+                    checks.append(
+                        {
+                            "name": "model cache integrity",
+                            "status": "fail",
+                            "message": f"{gguf} reports zero size",
+                        }
+                    )
+                else:
+                    with gguf.open("rb") as handle:
+                        magic = handle.read(4)
+                    if magic == b"GGUF":
+                        checks.append(
+                            {
+                                "name": "model cache integrity",
+                                "status": "ok",
+                                "message": (
+                                    f"{gguf.name} {_fmt_bytes(size)}, GGUF header verified"
+                                ),
+                            }
+                        )
+                    else:
+                        checks.append(
+                            {
+                                "name": "model cache integrity",
+                                "status": "fail",
+                                "message": (
+                                    f"{gguf.name} header magic {magic!r} != GGUF"
+                                ),
+                            }
+                        )
+            except OSError as exc:
+                checks.append(
+                    {
+                        "name": "model cache integrity",
+                        "status": "fail",
+                        "message": f"{gguf} unreadable: {exc}",
+                    }
+                )
+    return checks
+
+
+def _checks_status(checks: list[dict]) -> str:
+    """Aggregate per-check statuses into one overall ok/warn/fail."""
+    if any(c.get("status") == "fail" for c in checks):
+        return "fail"
+    if any(c.get("status") == "warn" for c in checks):
+        return "warn"
+    return "ok"
+
+
+def cmd_doctor(args):
     gpu = detect_gpu()
     memory = _memory_snapshot()
     power = _cpu_power_policy()
+    backend = LlamaCppBackend("", llama_cpp_dir=LLAMA_CPP_DIR)
+    cli_caps = None
+    cli_error = None
+    try:
+        cli_caps = backend.capabilities()
+    except (RuntimeError, subprocess.SubprocessError) as exc:
+        cli_error = str(exc)
+    server_caps = None
+    server_error = None
+    try:
+        server_caps = backend.server_capabilities()
+    except (RuntimeError, subprocess.SubprocessError) as exc:
+        server_error = str(exc)
+
+    checks = _doctor_checks(
+        backend, cli_caps, cli_error, server_caps, server_error
+    )
+    overall_status = _checks_status(checks)
+    checks_failed = overall_status == "fail"
+
+    if getattr(args, "json", False):
+        payload = {
+            "status": overall_status,
+            "checks": checks,
+            "host": {
+                "python": sys.version.split()[0],
+                "gpu": gpu,
+                "memory": memory,
+                "available_ram_mib": _available_ram_mib(),
+                "cpu_power_policy": power,
+            },
+            "llama_cli": {
+                "available": cli_caps is not None,
+                "dir": backend.llama_cpp_dir,
+                "binary": backend.binary if cli_caps is not None else None,
+                "native": (
+                    bool(cli_caps is not None and str(Path(backend.binary)).startswith(
+                        str(Path(backend.llama_cpp_dir)) + os.sep
+                    ))
+                ),
+                "version": cli_caps.version if cli_caps is not None else None,
+                "fit": cli_caps.supports("--fit") if cli_caps is not None else None,
+                "cpu_moe": cli_caps.supports("--cpu-moe") if cli_caps is not None else None,
+                "mmap": cli_caps.supports("--mmap") if cli_caps is not None else None,
+                "direct_io": cli_caps.supports("--direct-io") if cli_caps is not None else None,
+                "quantized_kv": (
+                    cli_caps.supports("--cache-type-k") if cli_caps is not None else None
+                ),
+                "mtp": "draft-mtp" in cli_caps.spec_types if cli_caps is not None else None,
+                "error": cli_error,
+            },
+            "llama_server": {
+                "available": server_caps is not None,
+                "dir": backend.llama_cpp_dir,
+                "binary": backend.server_binary if server_caps is not None else None,
+                "native": (
+                    bool(server_caps is not None and str(Path(backend.server_binary)).startswith(
+                        str(Path(backend.llama_cpp_dir)) + os.sep
+                    ))
+                ),
+                "version": server_caps.version if server_caps is not None else None,
+                "moe_cache": (
+                    server_caps.supports("--moe-cache") if server_caps is not None else None
+                ),
+                "spec_types": sorted(server_caps.spec_types) if server_caps is not None else [],
+                "error": server_error,
+            },
+        }
+        print(json.dumps(payload, indent=2))
+        if not (cli_caps is not None or server_caps is not None):
+            raise SystemExit(1)
+        if checks_failed:
+            raise SystemExit(1)
+        return
 
     def mark(ok: bool) -> str:
         return ui.pass_mark() if ok else ui.fail_mark()
@@ -877,34 +2003,31 @@ def cmd_doctor(_args):
         )
     print(ui.box("Host", "\n".join(host_lines)))
 
-    backend = LlamaCppBackend("", llama_cpp_dir=LLAMA_CPP_DIR)
     cli_lines = [ui.kv("llama.cpp dir", backend.llama_cpp_dir)]
-    cli_available = True
-    try:
-        caps = backend.capabilities()
+    cli_available = cli_caps is not None
+    if cli_caps is not None:
         cli_native = str(Path(backend.binary)).startswith(
             str(Path(backend.llama_cpp_dir)) + os.sep
         )
         cli_label = "" if cli_native else " (fallback from another build)"
         cli_lines.append(ui.kv("llama-cli", f"{backend.binary}{cli_label}", value_color=ui.bold))
-        cli_lines.append(ui.kv("version", caps.version))
-        cli_lines.append(f"  {mark(caps.supports('--fit'))} automatic fitting")
-        cli_lines.append(f"  {mark(caps.supports('--cpu-moe'))} CPU MoE")
-        cli_lines.append(f"  {mark(caps.supports('--mmap'))} mmap")
-        cli_lines.append(f"  {mark(caps.supports('--cache-type-k'))} quantized KV cache")
-        cli_lines.append(f"  {mark('draft-mtp' in caps.spec_types)} MTP")
-    except (RuntimeError, subprocess.SubprocessError) as exc:
-        cli_available = False
-        cli_lines.append(f"  {ui.fail_mark()} llama-cli: unavailable ({exc})")
+        cli_lines.append(ui.kv("version", cli_caps.version))
+        cli_lines.append(f"  {mark(cli_caps.supports('--fit'))} automatic fitting")
+        cli_lines.append(f"  {mark(cli_caps.supports('--cpu-moe'))} CPU MoE")
+        cli_lines.append(f"  {mark(cli_caps.supports('--mmap'))} mmap")
+        cli_lines.append(f"  {mark(cli_caps.supports('--direct-io'))} direct I/O load")
+        cli_lines.append(f"  {mark(cli_caps.supports('--cache-type-k'))} quantized KV cache")
+        cli_lines.append(f"  {mark('draft-mtp' in cli_caps.spec_types)} MTP")
+    else:
+        cli_lines.append(f"  {ui.fail_mark()} llama-cli: unavailable ({cli_error})")
     print(ui.box(
         "llama-cli",
         "\n".join(cli_lines),
         title_color=ui.green if cli_available else ui.yellow,
     ))
 
-    server_available = True
-    try:
-        server_caps = backend.server_capabilities()
+    server_available = server_caps is not None
+    if server_caps is not None:
         server_native = str(Path(backend.server_binary)).startswith(
             str(Path(backend.llama_cpp_dir)) + os.sep
         )
@@ -915,14 +2038,35 @@ def cmd_doctor(_args):
             f"  {mark(server_caps.supports('--moe-cache'))} MoE cache",
             f"  {mark(bool(server_caps.spec_types))} server spec types: {sorted(server_caps.spec_types) or 'none'}",
         ]
-    except (RuntimeError, subprocess.SubprocessError) as exc:
-        server_available = False
-        server_lines = [f"  {ui.fail_mark()} llama-server: unavailable ({exc})"]
+    else:
+        server_lines = [f"  {ui.fail_mark()} llama-server: unavailable ({server_error})"]
     print(ui.box(
         "llama-server",
         "\n".join(server_lines),
         title_color=ui.green if server_available else ui.yellow,
     ))
+
+    check_marks = {
+        "ok": ui.pass_mark(),
+        "warn": ui.warn_mark(),
+        "fail": ui.fail_mark(),
+    }
+    check_lines = [
+        f"  {check_marks.get(check['status'], ui.info_mark())} "
+        f"{check['name']}: {check['message']}"
+        for check in checks
+    ]
+    print(ui.box(
+        f"Checks ({overall_status})",
+        "\n".join(check_lines),
+        title_color=(
+            ui.green
+            if overall_status == "ok"
+            else (ui.yellow if overall_status == "warn" else ui.red)
+        ),
+    ))
+    if checks_failed:
+        raise SystemExit(1)
     if not (cli_available or server_available):
         raise SystemExit(1)
 
@@ -1093,267 +2237,312 @@ def _save_default_model(model: str | Path) -> None:
     )
 
 
-def cmd_models(args):
+def _models_search(args):
+    from .model_store import search_huggingface
+
+    rows = search_huggingface(args.query, limit=args.limit)
+    if args.json:
+        print(json.dumps({"models": rows}, indent=2))
+        return
+    print(ui.box(
+        f"Model market: {args.query}",
+        "\n".join(
+            f"  {ui.bold(item['id'])}\n"
+            f"  {ui.dim('{} downloads, {} likes, {}'.format(item['downloads'], item['likes'], item['license'] or 'unspecified license'))}"
+            for item in rows
+        ) or ui.dim("  no results"),
+    ))
+    print(ui.dim("Inspect model cards and choose a file before downloading; popularity is not a quality score."))
+
+
+def _models_files(args):
+    from .model_store import list_huggingface_ggufs
+
+    rows = list_huggingface_ggufs(args.source)
+    if args.json:
+        print(json.dumps({"repository": args.source, "files": rows}, indent=2))
+        return
+    print(ui.box(
+        f"GGUF files: {args.source.removeprefix('hf://')}",
+        "\n".join(
+            f"  {ui.bold(item['path'])}\n"
+            f"  {ui.dim('{:.2f} GiB'.format(item['size_bytes'] / 1024**3))}  "
+            f"Hub scan: {ui.yellow(item['security_status'])}"
+            for item in rows
+        )
+        if rows
+        else ui.dim("  none"),
+    ))
+    print(ui.dim("Hub scan status is metadata from Hugging Face, not a Kestrel security guarantee."))
+
+
+def _models_list(args, root):
+    from .model_store import (
+        complete_gguf_models,
+        discover_local_models,
+        list_ollama_models,
+        model_total_size,
+    )
+
+    local = complete_gguf_models(discover_local_models(root))
+    ollama = list_ollama_models(resolve_paths=args.resolve)
+    payload = {
+        "kestrel": [{"path": str(path), "size_bytes": model_total_size(path)} for path in local],
+        "ollama": [
+            {
+                "name": item.name,
+                "id": item.model_id,
+                "size": item.size,
+                "modified": item.modified,
+                "local_path": str(item.local_path) if item.local_path else None,
+            }
+            for item in ollama
+        ],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    kestrel_body = "\n".join(
+        f"  {ui.bold(item['path'])}  {ui.dim('{:.2f} GiB'.format(item['size_bytes'] / 1024**3))}"
+        for item in payload["kestrel"]
+    ) or ui.dim("  none")
+    print(ui.box(f"Kestrel models ({root})", kestrel_body))
+    ollama_rows = [
+        [
+            item.name,
+            item.size,
+            str(item.local_path) if item.local_path else "cloud or unresolved",
+        ]
+        for item in ollama
+    ]
+    if args.resolve:
+        ollama_headers = ["name", "size", "location"]
+    else:
+        ollama_headers = ["name", "size"]
+        ollama_rows = [row[:2] for row in ollama_rows]
+    print(ui.box(
+        "Ollama models",
+        ui.table(ollama_headers, ollama_rows) if ollama_rows else ui.dim("  none"),
+    ))
+
+
+def _models_import(args):
+    from .model_store import ModelStoreError, resolve_ollama_blob
+
+    source = args.source
+    default_value: str | Path
+    if source.startswith("ollama://"):
+        name = source.removeprefix("ollama://")
+        path = resolve_ollama_blob(name)
+        if path is None:
+            print(f"Imported {name} through the Ollama provider (no local GGUF blob).")
+            if args.set_default:
+                _save_default_model(source)
+                print("Set as the default Kestrel model.")
+            return
+        default_value = source
+    else:
+        path = Path(source).expanduser().resolve()
+        default_value = path
+    detected = detect_model(str(path))
+    if not detected or detected["type"] != "gguf":
+        raise ModelStoreError(f"source is not a readable GGUF model: {path}")
+    print(f"Imported {path}")
+    if args.set_default:
+        _save_default_model(default_value)
+        print("Set as the default Kestrel model.")
+
+
+def _models_pull(args):
     from .model_store import (
         ModelStoreError,
         choose_default_gguf,
-        default_models_dir,
         discover_local_models,
-        list_huggingface_ggufs,
-        list_ollama_models,
         pull_huggingface,
         pull_ollama,
-        resolve_ollama_blob,
-        search_huggingface,
+    )
+
+    source = args.source
+    if source.startswith("ollama://"):
+        name = source.removeprefix("ollama://")
+        if args.dry_run:
+            print(f"Would run: ollama pull {shlex.quote(name)}")
+            return
+        item = pull_ollama(name)
+        print(f"Pulled Ollama model {item.name} ({item.size})")
+        if item.local_path:
+            print(f"Ollama-managed local blob: {item.local_path}")
+            print("Kestrel will use Ollama's compatible engine for this model.")
+            if args.set_default:
+                _save_default_model(f"ollama://{item.name}")
+                print("Set as the default Kestrel model.")
+        else:
+            print("This model is served remotely by Ollama and has no local GGUF blob.")
+        return
+    result = pull_huggingface(
+        source,
+        filename=args.file,
+        include=args.include,
+        revision=args.revision,
+        destination=Path(args.destination).expanduser() if args.destination else None,
+        dry_run=args.dry_run,
+    )
+    print(result.stdout.strip())
+    if args.set_default:
+        if args.dry_run:
+            raise ModelStoreError("cannot set a default model during a dry-run")
+        try:
+            selected = choose_default_gguf(discover_local_models(result.directory))
+        except ModelStoreError as exc:
+            raise ModelStoreError(
+                f"{exc}. Choose one with "
+                "`kestrel models import PATH --set-default`."
+            ) from exc
+        metadata = read_gguf_config(str(selected))
+        if metadata["architecture"] == "unknown" or not metadata["n_layer"]:
+            raise ModelStoreError(
+                f"downloaded GGUF has unusable planner metadata: {selected}"
+            )
+        _save_default_model(selected)
+        print(f"Set {selected} as the default Kestrel model.")
+
+
+def _models_info(args):
+    from .model_store import ModelStoreError, resolve_ollama_blob
+
+    source = args.source
+    if source.startswith("ollama://"):
+        path = resolve_ollama_blob(source.removeprefix("ollama://"))
+        if path is None:
+            raise ModelStoreError("Ollama model has no reusable local GGUF blob")
+    else:
+        path = Path(source).expanduser()
+    detected = detect_model(str(path))
+    if not detected:
+        raise ModelStoreError(f"could not resolve model: {source}")
+    if detected["type"] == "safetensors" and detected["path"]:
+        info = _safetensors_info(detected["path"])
+        print(json.dumps(info, indent=2))
+        return
+    if detected["type"] != "gguf":
+        raise ModelStoreError("model info currently requires a local GGUF or safetensors directory")
+    cfg = read_gguf_config(detected["path"])
+    cfg.update(
+        path=detected["path"],
+        size_bytes=Path(detected["path"]).stat().st_size,
+    )
+    source_manifest = Path(detected["path"]).parent / ".kestrel-source.json"
+    if source_manifest.is_file():
+        try:
+            cfg["source"] = json.loads(source_manifest.read_text())
+        except (OSError, json.JSONDecodeError):
+            cfg["source"] = {"error": "unreadable source manifest"}
+    print(json.dumps(cfg, indent=2))
+
+
+def _models_recommend(args, root):
+    from .model_store import (
+        complete_gguf_models,
+        discover_local_models,
+        list_ollama_models,
+        model_total_size,
+    )
+
+    gpu = detect_gpu()
+    vram = (gpu or {}).get("vram_total_mb", 0) * 1024**2
+    ram = _available_ram_mib() * 1024**2
+    candidates: dict[str, Path] = {
+        str(path): path for path in complete_gguf_models(discover_local_models(root))
+    }
+    for item in list_ollama_models(resolve_paths=True):
+        if item.local_path:
+            candidates[f"ollama://{item.name}"] = item.local_path
+    ranked = []
+    for label, path in candidates.items():
+        size = model_total_size(path)
+        if vram and size <= vram * 0.82:
+            fit, detail, rank = "excellent", "fits in safe GPU weight budget", 0
+        elif size <= ram + vram * 0.65:
+            fit, detail, rank = "viable", "requires CPU/RAM offload", 1
+        else:
+            fit, detail, rank = "paging", "exceeds working memory; expect storage stalls", 2
+        try:
+            cfg = read_gguf_config(str(path))
+            architecture = cfg["architecture"]
+            layers = cfg["n_layer"]
+        except (OSError, struct.error, ValueError, KeyError):
+            architecture, layers = "unreadable", 0
+            fit, detail, rank = "unsupported", "GGUF metadata could not be read", 3
+        ranked.append(
+            {
+                "source": label,
+                "engine": "ollama" if label.startswith("ollama://") else "llama.cpp",
+                "path": str(path),
+                "size_gib": round(size / 1024**3, 2),
+                "architecture": architecture,
+                "layers": layers,
+                "fit": fit,
+                "reason": detail,
+                "_rank": rank,
+            }
+        )
+    ranked.sort(key=lambda item: (item["_rank"], item["size_gib"]))
+    for item in ranked:
+        item.pop("_rank")
+    if args.json:
+        print(json.dumps({"hardware": {"gpu": gpu, "available_ram_mib": ram // 1024**2}, "models": ranked}, indent=2))
+    else:
+        fit_color = {
+            "excellent": ui.green,
+            "viable": ui.cyan,
+            "paging": ui.yellow,
+            "unsupported": ui.red,
+        }
+        rows = []
+        for item in ranked:
+            colorize = fit_color.get(item["fit"], ui.dim)
+            rows.append(
+                f"  {colorize('[{}:9]'.format(item['fit'].upper()))} {ui.bold(item['source'])}"
+            )
+            rows.append(
+                f"  {ui.dim('{:.2f} GiB'.format(item['size_gib']))}  {ui.dim(item['architecture'])}  "
+                f"{ui.dim(item['reason'])}"
+            )
+        print(ui.box(
+            f"Recommendations for {(gpu or {}).get('name', 'CPU-only host')}",
+            "\n".join(rows),
+        ))
+        print(ui.dim("Fit is a memory classification, not a speed or quality guarantee; run `kestrel benchmark`."))
+
+
+def cmd_models(args):
+    from .model_store import (
+        ModelStoreError,
+        default_models_dir,
     )
 
     root = Path(USER_CONFIG.models_dir).expanduser() if USER_CONFIG.models_dir else default_models_dir()
     try:
         if args.models_command == "search":
-            rows = search_huggingface(args.query, limit=args.limit)
-            if args.json:
-                print(json.dumps({"models": rows}, indent=2))
-                return
-            print(ui.box(
-                f"Model market: {args.query}",
-                "\n".join(
-                    f"  {ui.bold(item['id'])}\n"
-                    f"  {ui.dim('{} downloads, {} likes, {}'.format(item['downloads'], item['likes'], item['license'] or 'unspecified license'))}"
-                    for item in rows
-                ) or ui.dim("  no results"),
-            ))
-            print(ui.dim("Inspect model cards and choose a file before downloading; popularity is not a quality score."))
-            return
-
-        if args.models_command == "files":
-            rows = list_huggingface_ggufs(args.source)
-            if args.json:
-                print(json.dumps({"repository": args.source, "files": rows}, indent=2))
-                return
-            print(ui.box(
-                f"GGUF files: {args.source.removeprefix('hf://')}",
-                "\n".join(
-                    f"  {ui.bold(item['path'])}\n"
-                    f"  {ui.dim('{:.2f} GiB'.format(item['size_bytes'] / 1024**3))}  "
-                    f"Hub scan: {ui.yellow(item['security_status'])}"
-                    for item in rows
-                )
-                if rows
-                else ui.dim("  none"),
-            ))
-            print(ui.dim("Hub scan status is metadata from Hugging Face, not a Kestrel security guarantee."))
-            return
-
-        if args.models_command == "list":
-            local = discover_local_models(root)
-            ollama = list_ollama_models(resolve_paths=args.resolve)
-            payload = {
-                "kestrel": [{"path": str(path), "size_bytes": path.stat().st_size} for path in local],
-                "ollama": [
-                    {
-                        "name": item.name,
-                        "id": item.model_id,
-                        "size": item.size,
-                        "modified": item.modified,
-                        "local_path": str(item.local_path) if item.local_path else None,
-                    }
-                    for item in ollama
-                ],
-            }
-            if args.json:
-                print(json.dumps(payload, indent=2))
-                return
-            kestrel_body = "\n".join(
-                f"  {ui.bold(item['path'])}  {ui.dim('{:.2f} GiB'.format(item['size_bytes'] / 1024**3))}"
-                for item in payload["kestrel"]
-            ) or ui.dim("  none")
-            print(ui.box(f"Kestrel models ({root})", kestrel_body))
-            ollama_rows = [
-                [
-                    item.name,
-                    item.size,
-                    str(item.local_path) if item.local_path else "cloud or unresolved",
-                ]
-                for item in ollama
-            ]
-            if args.resolve:
-                ollama_headers = ["name", "size", "location"]
-            else:
-                ollama_headers = ["name", "size"]
-                ollama_rows = [row[:2] for row in ollama_rows]
-            print(ui.box(
-                "Ollama models",
-                ui.table(ollama_headers, ollama_rows) if ollama_rows else ui.dim("  none"),
-            ))
-            return
-
-        if args.models_command == "import":
-            source = args.source
-            default_value: str | Path
-            if source.startswith("ollama://"):
-                name = source.removeprefix("ollama://")
-                path = resolve_ollama_blob(name)
-                if path is None:
-                    print(f"Imported {name} through the Ollama provider (no local GGUF blob).")
-                    if args.set_default:
-                        _save_default_model(source)
-                        print("Set as the default Kestrel model.")
-                    return
-                default_value = source
-            else:
-                path = Path(source).expanduser().resolve()
-                default_value = path
-            detected = detect_model(str(path))
-            if not detected or detected["type"] != "gguf":
-                raise ModelStoreError(f"source is not a readable GGUF model: {path}")
-            print(f"Imported {path}")
-            if args.set_default:
-                _save_default_model(default_value)
-                print("Set as the default Kestrel model.")
-            return
-
-        if args.models_command == "pull":
-            source = args.source
-            if source.startswith("ollama://"):
-                name = source.removeprefix("ollama://")
-                if args.dry_run:
-                    print(f"Would run: ollama pull {shlex.quote(name)}")
-                    return
-                item = pull_ollama(name)
-                print(f"Pulled Ollama model {item.name} ({item.size})")
-                if item.local_path:
-                    print(f"Ollama-managed local blob: {item.local_path}")
-                    print("Kestrel will use Ollama's compatible engine for this model.")
-                    if args.set_default:
-                        _save_default_model(f"ollama://{item.name}")
-                        print("Set as the default Kestrel model.")
-                else:
-                    print("This model is served remotely by Ollama and has no local GGUF blob.")
-                return
-            result = pull_huggingface(
-                source,
-                filename=args.file,
-                include=args.include,
-                revision=args.revision,
-                destination=Path(args.destination).expanduser() if args.destination else None,
-                dry_run=args.dry_run,
+            _models_search(args)
+        elif args.models_command == "files":
+            _models_files(args)
+        elif args.models_command == "list":
+            _models_list(args, root)
+        elif args.models_command == "import":
+            _models_import(args)
+        elif args.models_command == "pull":
+            _models_pull(args)
+        elif args.models_command == "info":
+            _models_info(args)
+        elif args.models_command == "recommend":
+            _models_recommend(args, root)
+        else:
+            raise SystemExit(
+                "Choose a models command: search, files, list, recommend, info, pull, or import"
             )
-            print(result.stdout.strip())
-            if args.set_default:
-                if args.dry_run:
-                    raise ModelStoreError("cannot set a default model during a dry-run")
-                try:
-                    selected = choose_default_gguf(discover_local_models(result.directory))
-                except ModelStoreError as exc:
-                    raise ModelStoreError(
-                        f"{exc}. Choose one with "
-                        "`kestrel models import PATH --set-default`."
-                    ) from exc
-                metadata = read_gguf_config(str(selected))
-                if metadata["architecture"] == "unknown" or not metadata["n_layer"]:
-                    raise ModelStoreError(
-                        f"downloaded GGUF has unusable planner metadata: {selected}"
-                    )
-                _save_default_model(selected)
-                print(f"Set {selected} as the default Kestrel model.")
-            return
-
-        if args.models_command == "info":
-            source = args.source
-            if source.startswith("ollama://"):
-                path = resolve_ollama_blob(source.removeprefix("ollama://"))
-                if path is None:
-                    raise ModelStoreError("Ollama model has no reusable local GGUF blob")
-            else:
-                path = Path(source).expanduser()
-            detected = detect_model(str(path))
-            if not detected or detected["type"] != "gguf":
-                raise ModelStoreError("model info currently requires a local GGUF")
-            cfg = read_gguf_config(detected["path"])
-            cfg.update(
-                path=detected["path"],
-                size_bytes=Path(detected["path"]).stat().st_size,
-            )
-            source_manifest = Path(detected["path"]).parent / ".kestrel-source.json"
-            if source_manifest.is_file():
-                try:
-                    cfg["source"] = json.loads(source_manifest.read_text())
-                except (OSError, json.JSONDecodeError):
-                    cfg["source"] = {"error": "unreadable source manifest"}
-            print(json.dumps(cfg, indent=2))
-            return
-
-        if args.models_command == "recommend":
-            gpu = detect_gpu()
-            vram = (gpu or {}).get("vram_total_mb", 0) * 1024**2
-            ram = _available_ram_mib() * 1024**2
-            candidates: dict[str, Path] = {
-                str(path): path for path in discover_local_models(root)
-            }
-            for item in list_ollama_models(resolve_paths=True):
-                if item.local_path:
-                    candidates[f"ollama://{item.name}"] = item.local_path
-            ranked = []
-            for label, path in candidates.items():
-                size = path.stat().st_size
-                if vram and size <= vram * 0.82:
-                    fit, detail, rank = "excellent", "fits in safe GPU weight budget", 0
-                elif size <= ram + vram * 0.65:
-                    fit, detail, rank = "viable", "requires CPU/RAM offload", 1
-                else:
-                    fit, detail, rank = "paging", "exceeds working memory; expect storage stalls", 2
-                try:
-                    cfg = read_gguf_config(str(path))
-                    architecture = cfg["architecture"]
-                    layers = cfg["n_layer"]
-                except (OSError, struct.error, ValueError, KeyError):
-                    architecture, layers = "unreadable", 0
-                    fit, detail, rank = "unsupported", "GGUF metadata could not be read", 3
-                ranked.append(
-                    {
-                        "source": label,
-                        "engine": "ollama" if label.startswith("ollama://") else "llama.cpp",
-                        "path": str(path),
-                        "size_gib": round(size / 1024**3, 2),
-                        "architecture": architecture,
-                        "layers": layers,
-                        "fit": fit,
-                        "reason": detail,
-                        "_rank": rank,
-                    }
-                )
-            ranked.sort(key=lambda item: (item["_rank"], item["size_gib"]))
-            for item in ranked:
-                item.pop("_rank")
-            if args.json:
-                print(json.dumps({"hardware": {"gpu": gpu, "available_ram_mib": ram // 1024**2}, "models": ranked}, indent=2))
-            else:
-                fit_color = {
-                    "excellent": ui.green,
-                    "viable": ui.cyan,
-                    "paging": ui.yellow,
-                    "unsupported": ui.red,
-                }
-                rows = []
-                for item in ranked:
-                    colorize = fit_color.get(item["fit"], ui.dim)
-                    rows.append(
-                        f"  {colorize('[{}:9]'.format(item['fit'].upper()))} {ui.bold(item['source'])}"
-                    )
-                    rows.append(
-                        f"  {ui.dim('{:.2f} GiB'.format(item['size_gib']))}  {ui.dim(item['architecture'])}  "
-                        f"{ui.dim(item['reason'])}"
-                    )
-                print(ui.box(
-                    f"Recommendations for {(gpu or {}).get('name', 'CPU-only host')}",
-                    "\n".join(rows),
-                ))
-                print(ui.dim("Fit is a memory classification, not a speed or quality guarantee; run `kestrel benchmark`."))
-            return
     except ModelStoreError as exc:
         raise SystemExit(f"Model error: {exc}") from exc
-
-    raise SystemExit("Choose a models command: search, files, list, recommend, info, pull, or import")
 
 
 def _menu_status_compact() -> str:
@@ -1380,7 +2569,10 @@ def cmd_menu(_args=None):
 
     def launch(*arguments: str) -> None:
         try:
-            subprocess.run([sys.executable, "-m", "kestrel.cli", *arguments], check=False)
+            _parser = build_parser()
+            _run_dispatched(_parser, _parser.parse_args(arguments))
+        except SystemExit:
+            pass
         except KeyboardInterrupt:
             print()
         ui.pause()
@@ -1615,27 +2807,14 @@ def cmd_menu(_args=None):
                 launch("setup", "--models-dir", models_dir)
 
 
-def cmd_optimize(args):
-    """Create an explainable hardware/model plan and optionally measure it."""
-
-    model_arg = args.model or os.environ.get("KESTREL_MODEL") or USER_CONFIG.default_model
-    gpu = detect_gpu()
-    cpu = platform.processor()
-    if not cpu or cpu.lower() in {"x86_64", "amd64", "aarch64"}:
-        try:
-            cpu = next(
-                line.split(":", 1)[1].strip()
-                for line in Path("/proc/cpuinfo").read_text().splitlines()
-                if line.startswith("model name")
-            )
-        except (OSError, StopIteration, IndexError):
-            cpu = "unknown"
-    storage_path = Path(args.storage_path or ".").expanduser().resolve()
+def _build_optimize_profile(args, model_arg, gpu, storage_path) -> dict:
+    """Resolve the local model (if any) and build the hardware/model/plan
+    document for the ``optimize`` command."""
     profile = {
         "schema_version": 1,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "hardware": {
-            "cpu": cpu,
+            "cpu": platform.processor(),
             "logical_cpu_count": os.cpu_count() or 0,
             "available_ram_mib": _available_ram_mib(),
             "memory": _memory_snapshot(),
@@ -1652,62 +2831,132 @@ def cmd_optimize(args):
         "model": None,
         "plan": None,
     }
-    if model_arg:
-        engine = "llama.cpp"
-        resolved_model_arg = model_arg
-        if model_arg.startswith("ollama://"):
-            from .model_store import ModelStoreError, resolve_ollama_blob
+    cpu = profile["hardware"]["cpu"]
+    if not cpu or cpu.lower() in {"x86_64", "amd64", "aarch64"}:
+        try:
+            cpu = next(
+                line.split(":", 1)[1].strip()
+                for line in Path("/proc/cpuinfo").read_text().splitlines()
+                if line.startswith("model name")
+            )
+        except (OSError, StopIteration, IndexError):
+            cpu = "unknown"
+        profile["hardware"]["cpu"] = cpu
+    if not model_arg:
+        return profile
+    engine = "llama.cpp"
+    resolved_model_arg = model_arg
+    if model_arg.startswith("ollama://"):
+        from .model_store import ModelStoreError, resolve_ollama_blob
 
-            engine = "ollama"
-            try:
-                blob = resolve_ollama_blob(model_arg.removeprefix("ollama://"))
-            except ModelStoreError as exc:
-                raise SystemExit(f"Error: {exc}") from exc
-            if blob is None:
-                raise SystemExit(
-                    "Error: cloud-only Ollama models do not expose local metadata for optimization"
-                )
-            resolved_model_arg = str(blob)
-        model_info = detect_model(resolved_model_arg)
-        if not model_info or model_info["type"] != "gguf" or not model_info["path"]:
-            raise SystemExit("Error: optimize currently requires a local GGUF model")
-        size = Path(model_info["path"]).stat().st_size
-        if not args.storage_path:
-            storage_path = Path(model_info["path"]).parent.resolve()
-            profile["hardware"]["storage"] = {
-                "path": str(storage_path),
-                "free_gib": round(shutil.disk_usage(storage_path).free / 1024**3, 2),
-            }
-        if args.context:
-            context = args.context
-            context_reason = "explicit user setting"
-        else:
-            context, context_reason = _select_context_size(model_info, gpu)
-        plan_args = argparse.Namespace(
-            gpu_layers="auto",
-            ctx_size=context,
-            cpu_moe="auto",
-            moe_cache="off",
-            moe_cold_model=None,
-            target=args.quality,
-        )
-        plan = estimate_config(model_info, gpu, plan_args)
-        plan["context_reason"] = context_reason
-        plan["quality_profile"] = args.quality
-        plan["kv_cache_type"] = {
-            "speed": "q4_0",
-            "balanced": "q8_0",
-            "quality": "f16",
-        }[args.quality]
-        profile["model"] = {
-            "source": model_arg,
-            "engine": engine,
-            "path": model_info["path"],
-            "size_gib": round(size / 1024**3, 2),
-            **read_gguf_config(model_info["path"]),
+        engine = "ollama"
+        try:
+            blob = resolve_ollama_blob(model_arg.removeprefix("ollama://"))
+        except ModelStoreError as exc:
+            raise SystemExit(f"Error: {exc}") from exc
+        if blob is None:
+            raise SystemExit(
+                "Error: cloud-only Ollama models do not expose local metadata for optimization"
+            )
+        resolved_model_arg = str(blob)
+    model_info = detect_model(resolved_model_arg)
+    if not model_info or model_info["type"] != "gguf" or not model_info["path"]:
+        raise SystemExit("Error: optimize currently requires a local GGUF model")
+    size = Path(model_info["path"]).stat().st_size
+    if not args.storage_path:
+        storage_path = Path(model_info["path"]).parent.resolve()
+        profile["hardware"]["storage"] = {
+            "path": str(storage_path),
+            "free_gib": round(shutil.disk_usage(storage_path).free / 1024**3, 2),
         }
-        profile["plan"] = plan
+    if args.context:
+        context = args.context
+        context_reason = "explicit user setting"
+    else:
+        context, context_reason = _select_context_size(model_info, gpu)
+    plan_args = argparse.Namespace(
+        gpu_layers="auto",
+        ctx_size=context,
+        cpu_moe="auto",
+        moe_cache="off",
+        moe_cold_model=None,
+        target=args.quality,
+    )
+    plan = estimate_config(model_info, gpu, plan_args)
+    plan["context_reason"] = context_reason
+    plan["quality_profile"] = args.quality
+    plan["kv_cache_type"] = {
+        "speed": "q4_0",
+        "balanced": "q8_0",
+        "quality": "f16",
+    }[args.quality]
+    profile["model"] = {
+        "source": model_arg,
+        "engine": engine,
+        "path": model_info["path"],
+        "size_gib": round(size / 1024**3, 2),
+        **read_gguf_config(model_info["path"]),
+    }
+    profile["plan"] = plan
+    return profile
 
+
+def _run_optimize_benchmark(profile, model_arg, target, args) -> None:
+    """Run the measurement sweep for ``optimize`` and fold the results into
+    ``profile``, raising ``SystemExit`` when the run fails (the caller then
+    re-raises after persisting the failure state)."""
+    if not model_arg:
+        raise SystemExit("Error: --benchmark requires a model")
+    benchmark_path = target.with_name("hardware-benchmark.json")
+    try:
+        report = cmd_benchmark(
+            argparse.Namespace(
+                model=model_arg,
+                prompt_tokens=128,
+                generate_tokens=64,
+                repetitions=3,
+                ctx_size=profile["plan"]["context_size"],
+                gpu_layers="auto",
+                cpu_moe="auto",
+                threads=(
+                    _cpu_moe_thread_sweep(os.cpu_count() or 1)
+                    if profile["plan"]["cpu_moe"]
+                    else None
+                ),
+                batch_size=profile["plan"]["batch_size"],
+                ubatch_size=profile["plan"]["ubatch_size"],
+                kv_cache_type=profile["plan"]["kv_cache_type"],
+                output=str(benchmark_path),
+                quiet=True,
+            )
+        )
+        profile["benchmark"] = {
+            "status": "measured",
+            "report": str(benchmark_path),
+            "prompt_tokens_per_second": report["prompt_tokens_per_second"],
+            "decode_tokens_per_second": report["decode_tokens_per_second"],
+            "release_speed_floor_passed": report["release_speed_floor_passed"],
+            "quality_gate": report.get("quality_gate", "not_run"),
+            "selected_placement": report.get("placement"),
+        }
+        if report.get("placement", {}).get("threads") is not None:
+            profile["plan"]["threads"] = report["placement"]["threads"]
+    except SystemExit as exc:
+        profile["benchmark"] = {"status": "failed", "error": str(exc)}
+        if not args.no_save:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(profile, indent=2) + "\n")
+            print(f"Wrote failed benchmark state to {target}", file=sys.stderr)
+        print(json.dumps(profile, indent=2))
+        raise
+
+
+def cmd_optimize(args):
+    """Create an explainable hardware/model plan and optionally measure it."""
+    model_arg = args.model or os.environ.get("KESTREL_MODEL") or USER_CONFIG.default_model
+    gpu = detect_gpu()
+    storage_path = Path(args.storage_path or ".").expanduser().resolve()
+    profile = _build_optimize_profile(args, model_arg, gpu, storage_path)
     target = (
         Path(args.output).expanduser()
         if args.output
@@ -1715,51 +2964,7 @@ def cmd_optimize(args):
     )
     profile["benchmark"] = {"status": "not_run"}
     if args.benchmark:
-        if not model_arg:
-            raise SystemExit("Error: --benchmark requires a model")
-        benchmark_path = target.with_name("hardware-benchmark.json")
-        try:
-            report = cmd_benchmark(
-                argparse.Namespace(
-                    model=model_arg,
-                    prompt_tokens=128,
-                    generate_tokens=64,
-                    repetitions=3,
-                    ctx_size=profile["plan"]["context_size"],
-                    gpu_layers="auto",
-                    cpu_moe="auto",
-                    threads=(
-                        _cpu_moe_thread_sweep(os.cpu_count() or 1)
-                        if profile["plan"]["cpu_moe"]
-                        else None
-                    ),
-                    batch_size=profile["plan"]["batch_size"],
-                    ubatch_size=profile["plan"]["ubatch_size"],
-                    kv_cache_type=profile["plan"]["kv_cache_type"],
-                    output=str(benchmark_path),
-                    quiet=True,
-                )
-            )
-            profile["benchmark"] = {
-                "status": "measured",
-                "report": str(benchmark_path),
-                "prompt_tokens_per_second": report["prompt_tokens_per_second"],
-                "decode_tokens_per_second": report["decode_tokens_per_second"],
-                "release_speed_floor_passed": report["release_speed_floor_passed"],
-                "quality_gate": report.get("quality_gate", "not_run"),
-                "selected_placement": report.get("placement"),
-            }
-            if report.get("placement", {}).get("threads") is not None:
-                profile["plan"]["threads"] = report["placement"]["threads"]
-        except SystemExit as exc:
-            profile["benchmark"] = {"status": "failed", "error": str(exc)}
-            if not args.no_save:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(json.dumps(profile, indent=2) + "\n")
-                print(f"Wrote failed benchmark state to {target}", file=sys.stderr)
-            print(json.dumps(profile, indent=2))
-            raise
-
+        _run_optimize_benchmark(profile, model_arg, target, args)
     if not args.no_save:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(profile, indent=2) + "\n")
@@ -1828,11 +3033,10 @@ def _print_benchmark_summary(report: dict) -> None:
 
 
 def cmd_benchmark(args):
-    model_arg = args.model or os.environ.get("KESTREL_MODEL") or USER_CONFIG.default_model
-    if not model_arg and _resolve_model_alias("qwen3.5:122b-10a"):
-        model_arg = "qwen3.5:122b-10a"
-    if not model_arg:
-        raise SystemExit("Error: no benchmark model selected; run `kestrel setup --model ...`")
+    model_arg = _default_model(
+        args,
+        error="Error: no benchmark model selected; run `kestrel setup --model ...`",
+    )
     if model_arg.startswith("ollama://"):
         from .providers.ollama import OllamaClient, OllamaError
 
@@ -1982,6 +3186,29 @@ def cmd_benchmark(args):
     return report
 
 
+def _add_json_flag(parser):
+    parser.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="emit a single machine-readable JSON object on stdout; "
+        "all human-readable output moves to stderr",
+    )
+
+
+def _default_model(args, *, error: str) -> str:
+    model = (
+        args.model
+        or os.environ.get("KESTREL_MODEL")
+        or USER_CONFIG.default_model
+    )
+    if not model and _resolve_model_alias("qwen3.5:122b-10a"):
+        model = "qwen3.5:122b-10a"
+    if not model:
+        raise SystemExit(error)
+    return model
+
+
 def _add_local_run_options(parser, *, model_optional: bool = False):
     parser.add_argument(
         "model",
@@ -1990,6 +3217,18 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
     )
     parser.add_argument("--no-convert", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Print the validated command")
+    _add_json_flag(parser)
+    parser.add_argument(
+        "--prompt",
+        help="run a one-shot, non-interactive generation with this prompt "
+        "(otherwise launches the interactive CLI)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=256,
+        help="token budget for --prompt one-shot generation (default: 256)",
+    )
     parser.add_argument(
         "--ctx-size",
         type=_context_size_arg,
@@ -2035,6 +3274,35 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
         help="immutable Q1 experts-only sidecar for a canonical Q4 model",
     )
     parser.add_argument("--no-mmap", action="store_true")
+    parser.add_argument(
+        "--mlock",
+        action="store_true",
+        help="lock model weights in RAM so CPU-offloaded/experts stay resident "
+        "(removes page-in latency jitter; implies a memory footprint)",
+    )
+    parser.add_argument(
+        "--tensor-split",
+        help=(
+            "comma-separated VRAM ratios for multi-GPU tensor splitting, "
+            "e.g. '60,40' (default: auto-derived from detected device VRAM)"
+        ),
+    )
+    parser.add_argument(
+        "--extra",
+        action="append",
+        metavar="ARGS",
+        help="space-separated passthrough args for the llama.cpp binary (repeatable); "
+        "e.g. --extra '--temp 0.4 --top-p 0.9'",
+    )
+    parser.add_argument(
+        "--direct-io",
+        action="store_true",
+        help=(
+            "load weights with uncached direct I/O (bypasses the page cache) "
+            "for faster cold loads from NVMe; ignore the page cache warning "
+            "and prefer a warm mmap reload otherwise; disables --warm-cache"
+        ),
+    )
     parser.add_argument(
         "--warm-cache",
         action="store_true",
@@ -2120,23 +3388,44 @@ def _kestrel_version() -> str:
     return "unknown"
 
 
-def main():
-    __version__ = _kestrel_version()
-
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Kestrel - hardware-aware local model orchestration and management"
     )
-    parser.add_argument("--version", action="version", version=f"kestrel {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"kestrel {_kestrel_version()}"
+    )
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("menu", help="Open the interactive Kestrel menu")
     status = sub.add_parser("status", help="Show active model, hardware plan, and benchmark state")
-    status.add_argument("--json", action="store_true")
+    _add_json_flag(status)
 
     run = sub.add_parser("run", help="Plan and run a local model")
     _add_local_run_options(run)
     chat = sub.add_parser("chat", help="Chat with the configured local model")
     _add_local_run_options(chat, model_optional=True)
+    serve = sub.add_parser(
+        "serve",
+        help="Serve a GGUF model through an OpenAI-compatible llama-server endpoint",
+    )
+    _add_local_run_options(serve, model_optional=True)
+    serve.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8080, help="listen port (default: 8080)")
+    serve.add_argument("--alias", help="model alias reported by /v1/models")
+    serve.add_argument(
+        "--embeddings",
+        action="store_true",
+        help="enable the /v1/embeddings endpoint for RAG workloads "
+        "(llama-server --embeddings)",
+    )
+    serve.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        help="after launch, poll /health until the server reports ready "
+        "(seconds to wait before giving up; defaults to 30s when unset)",
+    )
 
 
     setup = sub.add_parser("setup", help="Save safe local defaults (never API keys)")
@@ -2185,19 +3474,19 @@ def main():
     )
     models_search.add_argument("query")
     models_search.add_argument("--limit", type=int, default=10)
-    models_search.add_argument("--json", action="store_true")
+    _add_json_flag(models_search)
     models_files = models_sub.add_parser(
         "files", help="list GGUF variants and sizes in a Hugging Face repository"
     )
     models_files.add_argument("source", help="hf://OWNER/REPO or OWNER/REPO")
-    models_files.add_argument("--json", action="store_true")
+    _add_json_flag(models_files)
     models_list = models_sub.add_parser("list", help="list Kestrel and Ollama models")
     models_list.add_argument("--resolve", action="store_true", help="resolve Ollama model blobs")
-    models_list.add_argument("--json", action="store_true")
+    _add_json_flag(models_list)
     models_recommend = models_sub.add_parser(
         "recommend", help="rank installed models by measured host memory fit"
     )
-    models_recommend.add_argument("--json", action="store_true")
+    _add_json_flag(models_recommend)
     models_info = models_sub.add_parser("info", help="inspect a local or Ollama GGUF")
     models_info.add_argument("source", help="local path or ollama://NAME")
     models_pull = models_sub.add_parser("pull", help="download from Hugging Face or Ollama")
@@ -2215,9 +3504,64 @@ def main():
     models_import.add_argument("--set-default", action="store_true")
 
     sub.add_parser("build", help="Build llama.cpp with CUDA")
+
+    engine_group = sub.add_parser(
+        "engine",
+        help="Manage the llama.cpp engine: provenance, upstream updates, self-rebuilds",
+    )
+    engine_sub = engine_group.add_subparsers(dest="engine_command")
+    es_status = engine_sub.add_parser("status", help="Show provenance and staleness")
+    es_status.add_argument("--dir", help="engine checkout (default: configured llama_cpp_dir)")
+    _add_json_flag(es_status)
+    es_update = engine_sub.add_parser(
+        "update", help="Fetch upstream and fast-forward + rebuild if a newer revision exists"
+    )
+    es_update.add_argument("--dir", help="engine checkout (default: configured)"
+    )
+    es_update.add_argument("--remote", help="override the tracked remote URL")
+    es_update.add_argument("--dry-run", action="store_true")
+    es_update.add_argument(
+        "--force",
+        action="store_true",
+        help="hard-reset the checkout, discarding local commits/edits",
+    )
+    _add_json_flag(es_update)
+    es_rebuild = engine_sub.add_parser(
+        "rebuild", help="Rebuild the engine from its checked-out source"
+    )
+    es_rebuild.add_argument("--dir", help="engine directory")
+    es_rebuild.add_argument("--dry-run", action="store_true")
+    _add_json_flag(es_rebuild)
+    es_set = engine_sub.add_parser("set", help="Adopt a checkout as a managed engine")
+    es_set.add_argument("--dir", required=True)
+    es_set.add_argument("--remote", help="remote URL (default: the checkout's origin)")
+    _add_json_flag(es_set)
+
+    self_update = sub.add_parser(
+        "self-update", help="Update the Kestrel package from a repo or a wheel"
+    )
+    self_update.add_argument("--repo", help="repo path or git URL (default: the package's source tree)")
+    self_update.add_argument("--wheel", help="path or URL to a kestrel wheel to install")
+    self_update.add_argument(
+        "--sha256",
+        help="expected SHA256 of --wheel (verified before install; trusted distribution)",
+    )
+    self_update.add_argument("--dry-run", action="store_true")
+    self_update.add_argument("--yes", action="store_true")
+    _add_json_flag(self_update)
     convert = sub.add_parser("convert", help="Convert supported NVFP4 safetensors")
     convert.add_argument("model")
     convert.add_argument("--output", "-o")
+    convert.add_argument(
+        "--generic",
+        action="store_true",
+        help="use llama.cpp's convert_hf_to_gguf.py for arbitrary HF safetensors models",
+    )
+    convert.add_argument(
+        "--outtype",
+        default="bf16",
+        help="GGUF output type for --generic (default: bf16)",
+    )
     convert.add_argument(
         "--include-mtp",
         action="store_true",
@@ -2292,44 +3636,55 @@ def main():
         "--source",
         help="source Hugging Face model directory for cross-checks",
     )
-    audit.add_argument("--json", action="store_true", help="emit machine-readable output")
+    _add_json_flag(audit)
     audit.add_argument(
         "--cold-sidecar",
         action="store_true",
         help="validate an intentionally experts-only Q1 cold-sidecar GGUF",
     )
-    sub.add_parser("doctor", help="Check hardware and llama.cpp capabilities")
+    doctor = sub.add_parser("doctor", help="Check hardware and llama.cpp capabilities")
+    _add_json_flag(doctor)
 
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    parser = build_parser()
+    _run_dispatched(parser, parser.parse_args())
+
+
+_COMMAND_HANDLERS = {
+    "menu": cmd_menu,
+    "status": cmd_status,
+    "run": cmd_run,
+    "chat": cmd_run,
+    "serve": cmd_serve,
+    "setup": cmd_setup,
+    "benchmark": cmd_benchmark,
+    "optimize": cmd_optimize,
+    "models": cmd_models,
+    "build": cmd_build,
+    "engine": cmd_engine,
+    "self-update": cmd_self_update,
+    "convert": cmd_convert,
+    "audit": cmd_audit,
+    "doctor": cmd_doctor,
+}
+
+
+def _run_dispatched(parser, args) -> None:
     if CONFIG_ERROR and not (args.command == "setup" and args.reset):
         parser.error(f"{CONFIG_ERROR}; run `kestrel setup --reset` to repair it")
-    if args.command == "menu":
+    handler = _COMMAND_HANDLERS.get(args.command)
+    if handler is not None:
+        try:
+            handler(args)
+        except KestrelError as exc:
+            raise SystemExit(_print_failure(exc, json_output=bool(getattr(args, "json", False)))) from None
+    elif sys.stdin.isatty() and sys.stdout.isatty():
         cmd_menu(args)
-    elif args.command == "status":
-        cmd_status(args)
-    elif args.command in ("run", "chat"):
-        cmd_run(args)
-    elif args.command == "setup":
-        cmd_setup(args)
-    elif args.command == "benchmark":
-        cmd_benchmark(args)
-    elif args.command == "optimize":
-        cmd_optimize(args)
-    elif args.command == "models":
-        cmd_models(args)
-    elif args.command == "build":
-        cmd_build(args)
-    elif args.command == "convert":
-        cmd_convert(args)
-    elif args.command == "audit":
-        cmd_audit(args)
-    elif args.command == "doctor":
-        cmd_doctor(args)
     else:
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            cmd_menu(args)
-        else:
-            parser.print_help()
+        parser.print_help()
 
 
 if __name__ == "__main__":

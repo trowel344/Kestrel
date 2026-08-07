@@ -4,15 +4,20 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from .errors import CorruptModelError, KestrelError, MissingModelError
 
-class ModelStoreError(RuntimeError):
+
+class ModelStoreError(KestrelError):
     """A model source could not be queried, acquired, or resolved safely."""
+
+    code = "model_store_error"
 
 
 @dataclass(frozen=True)
@@ -92,8 +97,54 @@ def _is_ollama_blob(path: Path) -> bool:
 
 
 def resolve_ollama_blob(name: str) -> Path | None:
-    """Resolve an Ollama model to its immutable local GGUF/blob, if it has one."""
+    """Resolve an Ollama model to its immutable local GGUF/blob, if it has one.
 
+    Reads the model's manifest JSON straight off disk (no Ollama daemon round
+    trip). Falls back to ``ollama show --modelfile`` if the manifest layout is
+    unusual or a model referenced a non-manifest source. Results are TTL-cached
+    so listing many models never re-parses the same file.
+    """
+    cached = _ollama_blob_cached(name)
+    if cached is not _UNSET:
+        return cached
+    blob = _resolve_blob_from_manifest(name) or _resolve_ollama_blob_shell(name)
+    return _ollama_blob_cache_set(name, blob)
+
+
+def _ollama_manifest_paths(name: str) -> list[tuple[Path, Path]]:
+    """Candidate ``(models_root, manifest_file)`` pairs for ``name``."""
+    base, _, tag = name.partition(":")
+    tag = tag or "latest"
+    if "/" in base and not base.startswith("registry.ollama.ai"):
+        scope = base
+    else:
+        scope = f"library/{base}"
+    relative = Path("manifests") / "registry.ollama.ai" / scope / f"{tag}.json"
+    return [
+        (Path(root).expanduser(), Path(root).expanduser() / relative)
+        for root in _ollama_model_roots()
+        if Path(root).expanduser().is_dir()
+    ]
+
+
+def _resolve_blob_from_manifest(name: str) -> Path | None:
+    """Map an Ollama model to its GGUF blob from its disk manifest, if possible."""
+    for root, manifest_path in _ollama_manifest_paths(name):
+        try:
+            payload = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            continue
+        for layer in payload.get("layers", []):
+            media_type = layer.get("mediaType", "")
+            if "gguf" not in media_type and "model" not in media_type:
+                continue
+            blob = root / "blobs" / (layer.get("digest", "") or "").replace(":", "-")
+            if blob.is_file() and _is_ollama_blob(blob):
+                return blob.resolve()
+    return None
+
+
+def _resolve_ollama_blob_shell(name: str) -> Path | None:
     result = _run(["ollama", "show", name, "--modelfile"])
     for line in result.stdout.splitlines():
         if not line.startswith("FROM "):
@@ -105,6 +156,22 @@ def resolve_ollama_blob(name: str) -> Path | None:
         # Cloud models and model-name parents have no directly reusable blob.
         return None
     return None
+
+
+_UNSET = object()
+_ollama_blob_cache: dict[str, tuple[float, Path | None]] = {}
+
+
+def _ollama_blob_cached(name: str) -> Path | None:
+    entry = _ollama_blob_cache.get(name)
+    if entry is None or time.monotonic() - entry[0] > _ollama_list_ttl:
+        return _UNSET
+    return entry[1]
+
+
+def _ollama_blob_cache_set(name: str, value: Path | None) -> Path | None:
+    _ollama_blob_cache[name] = (time.monotonic(), value)
+    return value
 
 
 def list_ollama_models(*, resolve_paths: bool = False) -> list[OllamaModel]:
@@ -310,33 +377,164 @@ def list_huggingface_ggufs(repo_id: str) -> list[dict]:
     return sorted(files, key=lambda item: item["path"].lower())
 
 
+_SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
+
+
+def split_shard(path: Path) -> tuple[str, int, int] | None:
+    """Return ``(prefix, part, total)`` when ``path`` is a llama.cpp split shard.
+
+    Split GGUFs follow the ``{prefix}-00001-of-00005.gguf`` convention produced
+    by ``gguf-split`` and ``convert_hf_to_gguf.py --split-*``.
+    """
+    match = _SPLIT_RE.match(path.name)
+    if not match:
+        return None
+    prefix, part, total = match.groups()
+    return prefix, int(part), int(total)
+
+
+def complete_gguf_models(paths: list[Path]) -> list[Path]:
+    """Return one representative path per complete GGUF model.
+
+    Standalone files are returned as-is. Shards of a split model are grouped by
+    their shared prefix and total count; a complete set contributes its first
+    shard (llama.cpp resolves sibling shards from it automatically), while
+    incomplete sets are dropped so a half-downloaded split is not offered as a
+    broken model. ``mmproj`` vision projections are treated as standalone files.
+    """
+    groups: dict[tuple[str, int], dict[int, Path]] = {}
+    standalone: list[Path] = []
+    for path in paths:
+        shard = split_shard(path)
+        if shard is None:
+            standalone.append(path)
+            continue
+        prefix, part, total = shard
+        groups.setdefault((prefix, total), {})[part] = path
+    complete = []
+    for (_prefix, total), shards in groups.items():
+        if set(shards) == set(range(1, total + 1)):
+            complete.append(min(shards.items())[1])
+    return sorted(standalone + complete)
+
+
+def _stat_model(path: Path) -> os.stat_result:
+    """Stat a model path, surfacing low-level failures as typed errors.
+
+    Missing files raise :class:`MissingModelError`; permission and other OS
+    failures raise :class:`ModelStoreError` with an actionable hint. A real but
+    unusable target (a directory or a zero-byte/truncated file) raises
+    :class:`CorruptModelError` instead of leaking a raw ``OSError``.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError as exc:
+        raise MissingModelError(
+            f"model not found on disk: {path}",
+            hint="Re-download the model or check that the file still exists.",
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise ModelStoreError(
+            f"cannot stat model: {path}",
+            hint=f"grant the process read permission on this file: {exc}",
+        ) from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise CorruptModelError(
+            f"model path is not a regular file: {path}",
+            hint="The path resolves to a directory or special file, not a GGUF model.",
+        )
+    if st.st_size <= 0:
+        raise CorruptModelError(
+            f"model file is empty or truncated: {path}",
+            hint="Re-download the model; the file on disk has no usable bytes.",
+        )
+    return st
+
+
+def model_total_size(path: Path) -> int:
+    """On-disk bytes for a GGUF model, summing sibling shards of a split set.
+
+    A standalone file is stat'd defensively; a missing or unreadable sibling of
+    a split set is skipped so a graceful partial total is returned instead of a
+    raw ``OSError``.
+    """
+    shard = split_shard(path)
+    if shard is None:
+        return _stat_model(path).st_size
+    prefix, _part, total = shard
+    total_bytes = 0
+    for part in range(1, total + 1):
+        sibling = path.with_name(f"{prefix}-{part:05d}-of-{total:05d}.gguf")
+        try:
+            total_bytes += sibling.stat().st_size
+        except (OSError, ValueError):
+            continue
+    return total_bytes
+
+
+def _walk_ggufs(root: Path) -> list[Path]:
+    """Yield real, non-empty ``.gguf`` files under ``root``.
+
+    Gracefully downgrades unusable entries instead of failing the whole walk:
+    zero-byte downloads, files behind dangling symlinks, directory-like ``.gguf``
+    names, and paths that recurse into permission-denied subtrees are skipped.
+    Real (resolved) paths are deduplicated so file symlinks pointing at the same
+    blob are reported once. Never follows directory symlinks, so cycles are
+    impossible even on deeply nested stores.
+    """
+    found: set[Path] = set()
+    try:
+        for _dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                if not name.lower().endswith(".gguf"):
+                    continue
+                try:
+                    resolved = (Path(_dirpath) / name).resolve()
+                except (OSError, ValueError):
+                    continue
+                try:
+                    if not resolved.is_file() or resolved.stat().st_size <= 0:
+                        continue
+                except (OSError, ValueError):
+                    continue
+                found.add(resolved)
+    except (OSError, ValueError):
+        # A store that becomes unreachable mid-walk must not abort the whole
+        # discovery; report whatever usable entries were already collected.
+        return sorted(found)
+    return sorted(found)
+
+
 def discover_local_models(root: Path | None = None) -> list[Path]:
     target = root or default_models_dir()
-    if not target.is_dir():
+    if not target.exists():
+        # A missing store is only fatal when the caller asked for a specific
+        # non-default root; the default store simply has nothing to list yet.
+        if root is not None and target != default_models_dir():
+            raise MissingModelError(
+                f"model store directory does not exist: {target}",
+                hint=(
+                    "Create the directory, run a pull/download first, or point "
+                    "KESTREL_MODELS_DIR at an existing store."
+                ),
+            )
         return []
-    return sorted(path.resolve() for path in target.rglob("*.gguf") if path.is_file())
+    try:
+        with os.scandir(target) as it:
+            next(it, None)
+    except OSError as exc:
+        raise ModelStoreError(
+            f"cannot read model store: {target}",
+            hint=f"grant the process read permission on the directory: {exc}",
+        ) from exc
+    return _walk_ggufs(target)
 
 
 def choose_default_gguf(paths: list[Path]) -> Path:
     """Select one model or the first shard of one complete split model."""
 
     candidates = [path for path in paths if not path.name.lower().startswith("mmproj")]
-    split_pattern = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
-    groups: dict[tuple[str, int], list[tuple[int, Path]]] = {}
-    unsplit = []
-    for path in candidates:
-        match = split_pattern.match(path.name)
-        if not match:
-            unsplit.append(path)
-            continue
-        prefix, part, total = match.groups()
-        groups.setdefault((prefix, int(total)), []).append((int(part), path))
-    complete = []
-    for (_prefix, total), shards in groups.items():
-        parts = {part for part, _path in shards}
-        if parts == set(range(1, total + 1)):
-            complete.append(min(shards)[1])
-    choices = unsplit + complete
+    choices = complete_gguf_models(candidates)
     if len(choices) != 1:
         raise ModelStoreError(
             "download does not contain exactly one unambiguous complete GGUF model"

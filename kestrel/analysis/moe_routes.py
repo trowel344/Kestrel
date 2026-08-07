@@ -62,24 +62,66 @@ def allocate_pool_slots(
     return result
 
 
-def simulate(
+def _cache_simulate(
     routes: list[Route],
-    capacities: dict[tuple[int, str], int],
-    policy: str,
+    capacities: dict[tuple[int, str], int] | dict[tuple[tuple[int, str], int], int],
+    *,
+    group_key,
+    cache_key,
+    eviction: str,
 ) -> tuple[int, int]:
-    if policy == "lfu":
-        return _simulate_lfu(routes, capacities)
-    caches: dict[tuple[int, str], OrderedDict[tuple[int, int], int]] = {
-        pool: OrderedDict() for pool in capacities
-    }
+    """Generic expert-cache hit simulation.
+
+    ``group_key(route)`` selects the sub-cache a route's experts occupy,
+    ``cache_key(route, expert)`` the key of an expert inside that sub-cache,
+    and ``eviction`` the replacement order (``"lfu"`` or a FIFO/LRU ordering).
+
+    LFU heap entries are ``(frequency, last_access, key)``; updates re-push the
+    entry and stale copies are discarded lazily during eviction, matching the
+    runtime policy without an O(cache-size) scan on every miss.
+    """
     hits = 0
     accesses = 0
+    if eviction == "lfu":
+        states: dict[tuple[int, str], dict] = {group: {} for group in capacities}
+        heaps: dict[tuple[int, str], list] = {group: [] for group in capacities}
+        clock = 0
+        for route in routes:
+            group = group_key(route)
+            state = states.setdefault(group, {})
+            heap = heaps.setdefault(group, [])
+            capacity = capacities.get(group, 0)
+            for expert in route.experts:
+                accesses += 1
+                clock += 1
+                key = cache_key(route, expert)
+                current = state.get(key)
+                if current is not None:
+                    hits += 1
+                    updated = (current[0] + 1, clock)
+                    state[key] = updated
+                    heapq.heappush(heap, (updated[0], updated[1], key))
+                    continue
+                if capacity <= 0:
+                    continue
+                if len(state) >= capacity:
+                    while heap:
+                        frequency, last_access, victim = heapq.heappop(heap)
+                        if state.get(victim) == (frequency, last_access):
+                            del state[victim]
+                            break
+                state[key] = (1, clock)
+                heapq.heappush(heap, (1, clock, key))
+        return hits, accesses
+
+    caches: dict = {group: OrderedDict() for group in capacities}
     for route in routes:
-        cache = caches.setdefault(route.pool, OrderedDict())
-        capacity = capacities.get(route.pool, 0)
+        group = group_key(route)
+        cache = caches.setdefault(group, OrderedDict())
+        capacity = capacities.get(group, 0)
         for expert in route.experts:
             accesses += 1
-            key = (route.tensor, expert)
+            key = cache_key(route, expert)
             if key in cache:
                 hits += 1
                 cache[key] += 1
@@ -91,6 +133,20 @@ def simulate(
                 cache.popitem(last=False)
             cache[key] = 1
     return hits, accesses
+
+
+def simulate(
+    routes: list[Route],
+    capacities: dict[tuple[int, str], int],
+    policy: str,
+) -> tuple[int, int]:
+    return _cache_simulate(
+        routes,
+        capacities,
+        group_key=lambda route: route.pool,
+        cache_key=lambda route, expert: (route.tensor, expert),
+        eviction="lfu" if policy == "lfu" else "lru",
+    )
 
 
 def simulate_partitioned(
@@ -106,72 +162,13 @@ def simulate_partitioned(
         base, remainder = divmod(total, max(1, len(tensors)))
         for index, tensor in enumerate(tensors):
             tensor_capacities[(pool, tensor)] = base + (index < remainder)
-
-    caches: dict[
-        tuple[tuple[int, str], int], OrderedDict[int, None]
-    ] = defaultdict(OrderedDict)
-    hits = 0
-    accesses = 0
-    for route in routes:
-        cache_key = (route.pool, route.tensor)
-        cache = caches[cache_key]
-        capacity = tensor_capacities.get(cache_key, 0)
-        for expert in route.experts:
-            accesses += 1
-            if expert in cache:
-                hits += 1
-                cache.move_to_end(expert)
-                continue
-            if capacity <= 0:
-                continue
-            if len(cache) >= capacity:
-                cache.popitem(last=False)
-            cache[expert] = None
-    return hits, accesses
-
-
-def _simulate_lfu(
-    routes: list[Route], capacities: dict[tuple[int, str], int]
-) -> tuple[int, int]:
-    # Heap entries are (frequency, last_access, key). Updates append a new
-    # entry; stale entries are discarded lazily during eviction. This matches
-    # the runtime policy's LFU choice with LRU as the tie-break without an
-    # O(cache-size) scan on every miss.
-    states: dict[tuple[int, str], dict[tuple[int, int], tuple[int, int]]] = {
-        pool: {} for pool in capacities
-    }
-    heaps: dict[
-        tuple[int, str], list[tuple[int, int, tuple[int, int]]]
-    ] = {pool: [] for pool in capacities}
-    hits = 0
-    accesses = 0
-    clock = 0
-    for route in routes:
-        state = states.setdefault(route.pool, {})
-        heap = heaps.setdefault(route.pool, [])
-        capacity = capacities.get(route.pool, 0)
-        for expert in route.experts:
-            accesses += 1
-            clock += 1
-            key = (route.tensor, expert)
-            current = state.get(key)
-            if current is not None:
-                hits += 1
-                updated = (current[0] + 1, clock)
-                state[key] = updated
-                heapq.heappush(heap, (updated[0], updated[1], key))
-                continue
-            if capacity <= 0:
-                continue
-            if len(state) >= capacity:
-                while heap:
-                    frequency, last_access, victim = heapq.heappop(heap)
-                    if state.get(victim) == (frequency, last_access):
-                        del state[victim]
-                        break
-            state[key] = (1, clock)
-            heapq.heappush(heap, (1, clock, key))
-    return hits, accesses
+    return _cache_simulate(
+        routes,
+        tensor_capacities,
+        group_key=lambda route: (route.pool, route.tensor),
+        cache_key=lambda route, expert: expert,
+        eviction="lru",
+    )
 
 
 def analyze_temporal_reuse(
