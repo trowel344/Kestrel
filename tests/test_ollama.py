@@ -55,9 +55,7 @@ def test_generate_parses_rates():
 
 def test_http_error_wrapped():
     def opener(request, timeout):
-        raise urllib.error.HTTPError(
-            "url", 500, "boom", {}, io_error_reader_factory()
-        )
+        raise urllib.error.HTTPError("url", 500, "boom", {}, io_error_reader_factory())
 
     client = OllamaClient(base_url="http://localhost:11434", opener=opener)
     with pytest.raises(OllamaError):
@@ -109,9 +107,14 @@ def test_base_url_normalization():
 
 def test_zero_durations_no_rates():
     payload = {
-        "model": "m", "response": "x", "thinking": "",
-        "prompt_eval_count": 0, "prompt_eval_duration": 0,
-        "eval_count": 0, "eval_duration": 0, "total_duration": 0,
+        "model": "m",
+        "response": "x",
+        "thinking": "",
+        "prompt_eval_count": 0,
+        "prompt_eval_duration": 0,
+        "eval_count": 0,
+        "eval_duration": 0,
+        "total_duration": 0,
     }
     client = OllamaClient(base_url="http://localhost:11434", opener=_success_opener(payload))
     result = client.generate("m", "p")

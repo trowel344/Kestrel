@@ -18,7 +18,7 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from kestrel.gguf.converter import (
+from kestrel.gguf.quants import (
     _quantize_q1_0_buffer,
     _quantize_q4_0_buffer,
     quantize_q1_0,
@@ -45,13 +45,7 @@ def _wide_random_rows(rng: random.Random, n_rows: int, n_cols: int) -> np.ndarra
     """Rows spanning ~1e-38..1e30 so rounding is stressed across every exponent."""
     rows = []
     for _ in range(n_rows):
-        rows.append(
-            [
-                (-1.0 if rng.random() < 0.5 else 1.0)
-                * (10.0 ** rng.uniform(-38.0, 30.0))
-                for _ in range(n_cols)
-            ]
-        )
+        rows.append([(-1.0 if rng.random() < 0.5 else 1.0) * (10.0 ** rng.uniform(-38.0, 30.0)) for _ in range(n_cols)])
     return np.array(rows, dtype=np.float32)
 
 
@@ -67,13 +61,14 @@ def _q4_regimes():
     yield "all_zeros", np.zeros((2, 64), dtype=np.float32)
     yield "same_value", np.full((3, 32), 2.5, dtype=np.float32)
     yield "negative_heavy", np.full((2, 32), -3.0, dtype=np.float32)
-    yield "denormals", np.tile(
-        np.array([_subnormal(), -_subnormal()], dtype=np.float32), (2, 16)
-    )
+    yield "denormals", np.tile(np.array([_subnormal(), -_subnormal()], dtype=np.float32), (2, 16))
     yield "max_magnitude", np.full((1, 32), np.float32(3.4e38), dtype=np.float32)
-    yield "mixed_signs", np.tile(
-        np.array([1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0], dtype=np.float32),
-        (2, 4),
+    yield (
+        "mixed_signs",
+        np.tile(
+            np.array([1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0], dtype=np.float32),
+            (2, 4),
+        ),
     )
 
 
@@ -85,33 +80,23 @@ def _q1_regimes():
     yield "all_zeros", np.zeros((2, 128), dtype=np.float32)
     yield "same_value", np.full((1, 128), 3.0, dtype=np.float32)
     yield "negative_heavy", np.full((2, 128), -4.0, dtype=np.float32)
-    yield "denormals", np.tile(
-        np.array([_subnormal(), -_subnormal()], dtype=np.float32), (2, 64)
-    )
+    yield "denormals", np.tile(np.array([_subnormal(), -_subnormal()], dtype=np.float32), (2, 64))
     yield "max_magnitude", np.full((1, 128), np.float32(3.4e38), dtype=np.float32)
-    yield "mixed_signs", np.tile(
-        np.array([1.0, -1.0, 2.0, -0.0], dtype=np.float32), (2, 32)
-    )
+    yield "mixed_signs", np.tile(np.array([1.0, -1.0, 2.0, -0.0], dtype=np.float32), (2, 32))
 
 
 def _assert_q4_byte_exact(mat: np.ndarray) -> None:
     mat = np.asarray(mat, dtype=np.float32)
     ref = quantize_q4_0(mat)
     buf = _quantize_q4_0_buffer(np.array(mat, dtype=np.float32, copy=True))
-    assert buf == ref, (
-        "Q4_0 buffer quantizer diverged from quantize_q4_0 on vector "
-        + _fmt_vector(mat)
-    )
+    assert buf == ref, "Q4_0 buffer quantizer diverged from quantize_q4_0 on vector " + _fmt_vector(mat)
 
 
 def _assert_q1_byte_exact(mat: np.ndarray) -> None:
     mat = np.asarray(mat, dtype=np.float32)
     ref = quantize_q1_0(mat)
     buf = _quantize_q1_0_buffer(np.array(mat, dtype=np.float32, copy=True))
-    assert buf == ref, (
-        "Q1_0 buffer quantizer diverged from quantize_q1_0 on vector "
-        + _fmt_vector(mat)
-    )
+    assert buf == ref, "Q1_0 buffer quantizer diverged from quantize_q1_0 on vector " + _fmt_vector(mat)
 
 
 def _assert_q4_blocks(mat: np.ndarray) -> None:
@@ -141,9 +126,8 @@ def _assert_q1_signs(mat: np.ndarray) -> None:
     raw = np.frombuffer(quantize_q1_0(mat), dtype=np.uint8).reshape(-1, 18)
     got = np.unpackbits(raw[:, 2:], axis=1, bitorder="little").reshape(-1, 128)
     expected = (mat.reshape(-1, 128) >= 0).astype(np.uint8)
-    assert np.array_equal(got, expected), (
-        "Q1_0 sign bits do not match the input sign pattern on vector "
-        + _fmt_vector(mat)
+    assert np.array_equal(got, expected), "Q1_0 sign bits do not match the input sign pattern on vector " + _fmt_vector(
+        mat
     )
 
 

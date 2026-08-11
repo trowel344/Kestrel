@@ -46,6 +46,19 @@ class ConfigError(KestrelError):
     exit_code = 2
 
 
+class InputError(KestrelError):
+    """A command argument combination is invalid or incomplete."""
+
+    code = "invalid_input"
+    exit_code = 2
+
+
+class ConversionError(KestrelError):
+    """A model conversion could not be completed safely."""
+
+    code = "conversion_error"
+
+
 class ModelError(KestrelError):
     """A model could not be located, parsed, or produced."""
 
@@ -64,26 +77,18 @@ class CorruptModelError(ModelError):
     code = "model_corrupt"
 
 
-class DownloadError(KestrelError):
-    """A remote artifact could not be fetched or verified."""
-
-    code = "download_error"
-
-
 class IntegrityError(KestrelError):
     """A checksum/verification step failed; the artifact must not be used."""
 
     code = "integrity_error"
 
 
-class ConversionError(KestrelError):
-    """A safetensors-to-GGUF conversion failed."""
+class BackendError(KestrelError, RuntimeError):
+    """The llama.cpp backend could not be located or launched.
 
-    code = "conversion_error"
-
-
-class BackendError(KestrelError):
-    """The llama.cpp backend could not be located or launched."""
+    Also a :class:`RuntimeError` so existing ``except RuntimeError`` callers
+    keep working while new code can catch the structured subtype.
+    """
 
     code = "backend_error"
 
@@ -100,23 +105,16 @@ class ServiceError(KestrelError):
     code = "service_error"
 
 
-class SystemError_(KestrelError):
-    """An OS-level precondition (disk, permissions, memory) is not met."""
-
-    code = "system_error"
-
-
 __all__ = [
     "KestrelError",
     "ConfigError",
+    "InputError",
+    "ConversionError",
     "ModelError",
     "MissingModelError",
     "CorruptModelError",
-    "DownloadError",
     "IntegrityError",
-    "ConversionError",
     "BackendError",
     "EngineError",
     "ServiceError",
-    "SystemError_",
 ]

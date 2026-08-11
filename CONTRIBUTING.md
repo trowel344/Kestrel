@@ -44,9 +44,10 @@ pip install -e '.[convert]'   # add conversion extras if you need torch
 Run the linter and test suite before submitting changes:
 
 ```bash
-pip install -e '.[dev,convert]'   # pytest + ruff + conversion extras
+pip install -e '.[dev,convert]'   # pytest + ruff + pytest-cov + conversion extras
 ruff check kestrel/ tests/
 python -m pytest                   # hermetic; runs fully offline
+python -m pytest --cov=kestrel --cov-report=term   # coverage gate (rising floor, currently 55%)
 ```
 
 ## Submitting changes

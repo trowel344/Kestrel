@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import stat
 from pathlib import Path
@@ -5,14 +7,18 @@ from pathlib import Path
 import pytest
 
 from kestrel.backends.llama_cpp import (
+    NATIVE_LLAMA_CPP_DIRS,
     LlamaCppBackend,
     LlamaCppCapabilities,
     RunMetrics,
     _candidate_dirs,
+    _capability_cache_read,
     _find_binary,
+    _load_capabilities,
     default_llama_cpp_dir,
     resolve_llama_binary,
 )
+from kestrel.errors import BackendError
 
 
 def _make_bin(directory: str, name: str) -> str:
@@ -73,6 +79,10 @@ def test_candidate_dirs_no_duplicates():
         os.environ.pop("KESTREL_LLAMA_CPP_DIR", None)
 
 
+def test_world_writable_tmp_engine_is_not_implicitly_trusted():
+    assert not any(Path(directory).is_relative_to("/tmp") for directory in NATIVE_LLAMA_CPP_DIRS)
+
+
 def test_default_dir_wins_over_fallback():
     dirs = (_make_dir(), _make_dir(), _make_dir())
     _make_bin(os.path.join(dirs[1], "build", "bin"), "llama-server")
@@ -113,6 +123,35 @@ def test_capabilities_no_spec_type_key():
     assert caps.spec_types == set()
     assert caps.supports("--fit on")
     assert not caps.supports("--cpu-moe")
+
+
+def test_capability_probe_spawn_failure_is_typed(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel.backends.llama_cpp.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("not executable")),
+    )
+
+    with pytest.raises(BackendError, match="could not probe"):
+        _load_capabilities("/fake/llama-cli", refresh=True)
+
+
+def test_capability_cache_rejects_wrong_value_types(monkeypatch, tmp_path):
+    binary = tmp_path / "llama-cli"
+    binary.write_bytes(b"bin")
+    stat_result = binary.stat()
+    cache = tmp_path / "capabilities.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "key": f"{binary}\0{stat_result.st_mtime_ns}\0{stat_result.st_size}",
+                "help": ["not", "text"],
+                "version": "1",
+            }
+        )
+    )
+    monkeypatch.setattr("kestrel.backends.llama_cpp._capability_cache_path", lambda: str(cache))
+
+    assert _capability_cache_read(str(binary)) is None
 
 
 def test_resolved_spec_type_none_maps_to_none():
@@ -160,6 +199,50 @@ def test_parse_metrics_no_match_defaults():
     assert metrics.returncode == 1
 
 
+def test_generate_spawn_failure_is_typed(monkeypatch, tmp_path):
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    monkeypatch.setattr(
+        "kestrel.backends.llama_cpp.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("not executable")),
+    )
+
+    with pytest.raises(BackendError, match="could not start llama.cpp generation"):
+        backend.generate("hello")
+
+
+def test_closing_stream_terminates_and_reaps_child(monkeypatch, tmp_path):
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+
+    class Process:
+        def __init__(self):
+            self.stdout = io.StringIO("first\nsecond\n")
+            self.returncode = None
+            self.terminated = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode if self.returncode is not None else 0
+
+    process = Process()
+    monkeypatch.setattr("kestrel.backends.llama_cpp.subprocess.Popen", lambda *args, **kwargs: process)
+
+    stream = backend.generate_stream("hello")
+    assert next(stream) == "first\n"
+    stream.close()
+
+    assert process.terminated is True
+    assert backend._proc is None
+
+
 def test_run_metrics_as_dict():
     metrics = RunMetrics(elapsed_seconds=2.5, prompt_tokens=10)
     data = metrics.as_dict()
@@ -183,9 +266,7 @@ def _backend_with_caps(caps: LlamaCppCapabilities, tmp_path: Path) -> LlamaCppBa
 
 
 def test_base_cmd_direct_io_overrides_mmap(tmp_path):
-    backend = _backend_with_caps(
-        LlamaCppCapabilities(help_text="--direct-io\n--no-mmap\n--mmap\n"), tmp_path
-    )
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text="--direct-io\n--no-mmap\n--mmap\n"), tmp_path)
     backend.direct_io = True
     cmd = backend._base_cmd()
     assert "--direct-io" in cmd
@@ -194,9 +275,7 @@ def test_base_cmd_direct_io_overrides_mmap(tmp_path):
 
 
 def test_base_cmd_mmap_default_without_direct_io(tmp_path):
-    backend = _backend_with_caps(
-        LlamaCppCapabilities(help_text="--direct-io\n--no-mmap\n--mmap\n"), tmp_path
-    )
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text="--direct-io\n--no-mmap\n--mmap\n"), tmp_path)
     assert not backend.direct_io
     cmd = backend._base_cmd()
     assert "--mmap" in cmd
@@ -204,9 +283,7 @@ def test_base_cmd_mmap_default_without_direct_io(tmp_path):
 
 
 def test_base_cmd_direct_io_unsupported_falls_back_to_mmap(tmp_path):
-    backend = _backend_with_caps(
-        LlamaCppCapabilities(help_text="--no-mmap\n--mmap\n"), tmp_path
-    )
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text="--no-mmap\n--mmap\n"), tmp_path)
     backend.direct_io = True
     cmd = backend._base_cmd()
     assert "--mmap" in cmd
@@ -236,9 +313,7 @@ _ENGINE_HELP = (
 
 
 def test_build_server_cmd_emits_fit_and_engine_flags(tmp_path):
-    backend = _backend_with_engine_bins(
-        LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path
-    )
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
     backend.fit = True
     backend.fit_target_mib = 1024
     backend.use_mlock = True
@@ -247,10 +322,22 @@ def test_build_server_cmd_emits_fit_and_engine_flags(tmp_path):
     backend.extra_args = ["--temp", "0.4"]
     cmd = backend.build_server_cmd(host="0.0.0.0", port=9000, alias="m", embeddings=True)
     for flag in (
-        "--fit", "on", "--fit-target", "1024", "--mlock",
-        "--tensor-split", "25,75", "--embeddings",
-        "--host", "0.0.0.0", "--port", "9000", "--alias", "m",
-        "--temp", "0.4",
+        "--fit",
+        "on",
+        "--fit-target",
+        "1024",
+        "--mlock",
+        "--tensor-split",
+        "25,75",
+        "--embeddings",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "9000",
+        "--alias",
+        "m",
+        "--temp",
+        "0.4",
     ):
         assert flag in cmd
 
@@ -265,9 +352,7 @@ def test_build_server_cmd_embeddings_capability_gated(tmp_path):
 def test_server_and_interactive_share_engine_flags(tmp_path):
     """The server path must emit the same engine block as interactive runs
     (regression: --fit was previously dropped, letting serve OOM)."""
-    backend = _backend_with_engine_bins(
-        LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path
-    )
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
     backend.fit = True
     backend.fit_target_mib = 1024
     backend.use_mlock = True
@@ -276,17 +361,22 @@ def test_server_and_interactive_share_engine_flags(tmp_path):
     base = backend._base_cmd()
     server = backend.build_server_cmd()
     for flag in (
-        "--fit", "on", "--fit-target", "1024", "--mlock",
-        "--tensor-split", "25,75", "--flash-attn", "auto",
+        "--fit",
+        "on",
+        "--fit-target",
+        "1024",
+        "--mlock",
+        "--tensor-split",
+        "25,75",
+        "--flash-attn",
+        "auto",
     ):
         assert flag in base
         assert flag in server
 
 
 def test_build_server_cmd_uses_server_binary_and_address(tmp_path):
-    backend = _backend_with_engine_bins(
-        LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path
-    )
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
     cmd = backend.build_server_cmd(host="0.0.0.0", port=9999)
     assert os.path.basename(cmd[0]) == "llama-server"
     assert cmd[1:3] == ["-m", backend.model_path]

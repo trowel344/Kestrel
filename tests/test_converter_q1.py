@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from kestrel.gguf.converter import quantize_q1_0
+from kestrel.gguf.quants import quantize_q1_0
 
 _F16_1_0 = np.frombuffer(np.float16(1.0).tobytes(), dtype=np.uint8).tobytes()
 _F16_0_0 = np.frombuffer(np.float16(0.0).tobytes(), dtype=np.uint8).tobytes()

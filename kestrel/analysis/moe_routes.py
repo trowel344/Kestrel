@@ -40,16 +40,12 @@ def parse_routes(text: str) -> list[Route]:
     return routes
 
 
-def allocate_pool_slots(
-    routes: list[Route], budget_mib: int, experts_per_tensor: int
-) -> dict[tuple[int, str], int]:
+def allocate_pool_slots(routes: list[Route], budget_mib: int, experts_per_tensor: int) -> dict[tuple[int, str], int]:
     tensors_by_pool: dict[tuple[int, str], set[int]] = defaultdict(set)
     for route in routes:
         tensors_by_pool[route.pool].add(route.tensor)
     weights = {
-        pool: expert_bytes * len(tensors)
-        for pool, tensors in tensors_by_pool.items()
-        for expert_bytes in (pool[0],)
+        pool: expert_bytes * len(tensors) for pool, tensors in tensors_by_pool.items() for expert_bytes in (pool[0],)
     }
     total_weight = sum(weights.values())
     budget = budget_mib * 1024 * 1024
@@ -149,9 +145,7 @@ def simulate(
     )
 
 
-def simulate_partitioned(
-    routes: list[Route], capacities: dict[tuple[int, str], int]
-) -> tuple[int, int]:
+def simulate_partitioned(routes: list[Route], capacities: dict[tuple[int, str], int]) -> tuple[int, int]:
     tensors_by_pool: dict[tuple[int, str], list[int]] = defaultdict(list)
     for route in routes:
         if route.tensor not in tensors_by_pool[route.pool]:
@@ -171,9 +165,7 @@ def simulate_partitioned(
     )
 
 
-def analyze_temporal_reuse(
-    routes: list[Route], windows: list[int]
-) -> list[dict[str, int | float]]:
+def analyze_temporal_reuse(routes: list[Route], windows: list[int]) -> list[dict[str, int | float]]:
     """Measure the Q4 working set needed to reuse recent per-tensor routes.
 
     A window of N retains the union of the last N routed expert sets for every
@@ -186,9 +178,7 @@ def analyze_temporal_reuse(
     for window in windows:
         if window <= 0:
             raise ValueError(f"temporal window must be positive, got {window}")
-        histories: dict[int, deque[set[int]]] = defaultdict(
-            lambda window=window: deque(maxlen=window)
-        )
+        histories: dict[int, deque[set[int]]] = defaultdict(lambda window=window: deque(maxlen=window))
         tensor_bytes: dict[int, int] = {}
         resident_bytes = 0
         peak_bytes = 0
@@ -246,9 +236,7 @@ def analyze(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Simulate Q4 expert-cache sizes from a Kestrel MoE route trace"
-    )
+    parser = argparse.ArgumentParser(description="Simulate Q4 expert-cache sizes from a Kestrel MoE route trace")
     parser.add_argument("log", type=Path)
     parser.add_argument("--budgets", default="1024,2048,3072,4096")
     parser.add_argument(
@@ -274,8 +262,8 @@ def main() -> None:
     for row in analyze_temporal_reuse(routes, windows):
         print(
             f"{row['window']:6d} {row['hits']:8d} {row['accesses']:8d} "
-            f"{row['hit_rate']:8.2f}% {row['peak_bytes']/2**30:8.2f} "
-            f"{row['final_bytes']/2**30:9.2f}"
+            f"{row['hit_rate']:8.2f}% {row['peak_bytes'] / 2**30:8.2f} "
+            f"{row['final_bytes'] / 2**30:9.2f}"
         )
 
 

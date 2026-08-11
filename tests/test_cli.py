@@ -22,9 +22,9 @@ def _sized_gguf(tmp_path, name, gib, **kwargs):
 
 
 def _no_swap(monkeypatch):
-    monkeypatch.setattr(cli, "_available_ram_mib", lambda: 64 * 1024)
+    monkeypatch.setattr(cli.probes, "_available_ram_mib", lambda: 64 * 1024)
     monkeypatch.setattr(
-        cli,
+        cli.probes,
         "_memory_snapshot",
         lambda: {"swap_total_mib": 0, "swap_used_mib": 0},
     )
@@ -110,9 +110,7 @@ def test_select_context_gpu_resident_accounts_for_kv_cache(tmp_path, monkeypatch
         n_kv_heads=8,
         head_dim=128,
     )
-    ctx, reason, overcommitted = cli._select_context_size(
-        {"type": "gguf", "path": str(p)}, {"vram_free_mb": 22000}
-    )
+    ctx, reason, overcommitted = cli._select_context_size({"type": "gguf", "path": str(p)}, {"vram_free_mb": 22000})
     assert not overcommitted
     assert ctx < 32768
     kv_per_token = cli._kv_cache_bytes_per_token({"type": "gguf", "path": str(p)})
@@ -137,9 +135,7 @@ def test_select_context_big_gpu_allows_large_context(tmp_path, monkeypatch):
         n_kv_heads=8,
         head_dim=128,
     )
-    ctx, reason, overcommitted = cli._select_context_size(
-        {"type": "gguf", "path": str(p)}, {"vram_free_mb": 22000}
-    )
+    ctx, reason, overcommitted = cli._select_context_size({"type": "gguf", "path": str(p)}, {"vram_free_mb": 22000})
     assert not overcommitted
     assert ctx >= 16384
 
@@ -161,16 +157,14 @@ def test_select_context_oversized_model_is_overcommit(tmp_path, monkeypatch):
         n_kv_heads=8,
         head_dim=128,
     )
-    ctx, reason, overcommitted = cli._select_context_size(
-        {"type": "gguf", "path": str(p)}, {"vram_free_mb": 6000}
-    )
+    ctx, reason, overcommitted = cli._select_context_size({"type": "gguf", "path": str(p)}, {"vram_free_mb": 6000})
     assert overcommitted
     assert ctx == 512
 
 
 def test_configure_backend_maps_config_and_args(monkeypatch, tmp_path):
     model = write_gguf(tmp_path / "m.gguf", n_layer=48)
-    monkeypatch.setattr(cli, "detect_gpu", lambda: None)
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
     args = SimpleNamespace(
         batch_size=None,
         ubatch_size=None,
@@ -201,9 +195,7 @@ def test_configure_backend_maps_config_and_args(monkeypatch, tmp_path):
         "moe_cache": "on",
         "moe_cache_budget_mib": 2048,
     }
-    backend = cli._configure_backend(
-        {"path": str(model)}, config, args
-    )
+    backend = cli._configure_backend({"path": str(model)}, config, args)
     assert backend.n_gpu_layers == "auto"
     assert backend.n_ctx == 4096
     assert backend.spec_type == "mtp"
@@ -237,7 +229,7 @@ class _StubBackend:
 
 def test_build_server_cmd_passes_serve_args(monkeypatch, tmp_path):
     stub = _StubBackend()
-    monkeypatch.setattr(cli, "_configure_backend", lambda *a, **k: stub)
+    monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: stub)
     args = SimpleNamespace(host="0.0.0.0", port=9000, alias="m", embeddings=True)
     cmd = cli._build_server_cmd({}, {}, args)
     assert cmd == ["llama-server", "--sentinel"]
@@ -251,7 +243,7 @@ def test_build_server_cmd_passes_serve_args(monkeypatch, tmp_path):
 
 def test_build_server_cmd_default_serving_defaults(monkeypatch, tmp_path):
     stub = _StubBackend()
-    monkeypatch.setattr(cli, "_configure_backend", lambda *a, **k: stub)
+    monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: stub)
     cli._build_server_cmd({}, {}, None)
     assert stub.server_kwargs["host"] == "127.0.0.1"
     assert stub.server_kwargs["port"] == 8080
@@ -306,9 +298,7 @@ class _GenStub:
 
 def test_oneshot_run_json_emits_structured_result(capsys):
     stub = _GenStub()
-    args = SimpleNamespace(
-        json=True, model="m.gguf", prompt="hi", max_tokens=64, dry_run=False
-    )
+    args = SimpleNamespace(json=True, model="m.gguf", prompt="hi", max_tokens=64, dry_run=False)
     rc = cli._oneshot_run(stub, ["llama-cli"], args)
     assert stub.prompt == "hi"
     assert stub.max_tokens == 64
@@ -328,9 +318,7 @@ def test_oneshot_run_json_emits_structured_result(capsys):
 
 def test_oneshot_run_plain_shows_output_on_stdout(capsys):
     stub = _GenStub()
-    args = SimpleNamespace(
-        json=False, model="m.gguf", prompt="hi", max_tokens=8, dry_run=False
-    )
+    args = SimpleNamespace(json=False, model="m.gguf", prompt="hi", max_tokens=8, dry_run=False)
     rc = cli._oneshot_run(stub, ["llama-cli"], args)
     assert rc == 0
     out = capsys.readouterr()
@@ -340,9 +328,7 @@ def test_oneshot_run_plain_shows_output_on_stdout(capsys):
 
 def test_oneshot_run_generation_error_emits_error_json(capsys):
     stub = _GenStub(error="llama.cpp failed with exit 1:\nboom")
-    args = SimpleNamespace(
-        json=True, model="m.gguf", prompt="hi", max_tokens=8, dry_run=False
-    )
+    args = SimpleNamespace(json=True, model="m.gguf", prompt="hi", max_tokens=8, dry_run=False)
     rc = cli._oneshot_run(stub, ["llama-cli"], args)
     assert rc == 1
     payload = json.loads(capsys.readouterr().out)
@@ -405,6 +391,34 @@ def test_wait_ready_times_out_when_not_ready():
             thread.join()
 
 
+@pytest.mark.parametrize(
+    ("bind_host", "expected"),
+    [("0.0.0.0", "http://127.0.0.1:8080/health"), ("::", "http://[::1]:8080/health")],
+)
+def test_wait_ready_probes_connectable_wildcard_address(monkeypatch, bind_host, expected):
+    import urllib.request
+
+    seen = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def open_url(url, **kwargs):
+        seen.append(url)
+        return Response()
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_url)
+
+    assert cli._wait_ready(bind_host, 8080, timeout=1) is True
+    assert seen == [expected]
+
+
 def _run_args(model, **overrides):
     base = dict(
         model=model,
@@ -451,13 +465,13 @@ def test_cmd_run_dry_run_json_keeps_stdout_clean(capsys, monkeypatch, tmp_path):
         "has_mtp": False,
         "use_mtp": False,
     }
-    monkeypatch.setattr(cli, "detect_gpu", lambda: None)
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
     monkeypatch.setattr(
-        cli,
+        cli.planning,
         "estimate_config",
         lambda model_info, gpu_info, args: dict(config),
     )
-    monkeypatch.setattr(cli, "_configure_backend", lambda *a, **k: _StubBackend())
+    monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: _StubBackend())
     args = _run_args(str(model), json=True)
     rc = cli.cmd_run(args)
     assert rc == 0
@@ -475,16 +489,12 @@ def test_resolve_ollama_native_returns_local_blob(monkeypatch):
     from pathlib import Path
 
     blob = Path("/home/u/.ollama/models/blobs/sha256-abc")
-    monkeypatch.setattr(
-        "kestrel.model_store.resolve_ollama_blob", lambda name: blob
-    )
+    monkeypatch.setattr("kestrel.model_store.resolve_ollama_blob", lambda name: blob)
     assert cli._resolve_ollama_native("qwen3.6:35b") == str(blob)
 
 
 def test_resolve_ollama_native_none_for_cloud_model(monkeypatch):
-    monkeypatch.setattr(
-        "kestrel.model_store.resolve_ollama_blob", lambda name: None
-    )
+    monkeypatch.setattr("kestrel.model_store.resolve_ollama_blob", lambda name: None)
     assert cli._resolve_ollama_native("qwen3-cloud") is None
 
 
@@ -500,7 +510,7 @@ def test_cmd_run_ollama_resolves_blob_into_native_plan(capsys, monkeypatch, tmp_
     """ollama:// models with a local blob run through the Kestrel runtime
     (fit/context guardrails), not the Ollama passthrough."""
     blob = write_gguf(tmp_path / "blob", n_layer=48)  # no .gguf suffix
-    monkeypatch.setattr(cli, "_resolve_ollama_native", lambda name: str(blob))
+    monkeypatch.setattr(cli.runtime, "_resolve_ollama_native", lambda name: str(blob))
     config = {
         "model_size_gib": 3.0,
         "gpu_layers": "all",
@@ -519,11 +529,9 @@ def test_cmd_run_ollama_resolves_blob_into_native_plan(capsys, monkeypatch, tmp_
         "has_mtp": False,
         "use_mtp": False,
     }
-    monkeypatch.setattr(cli, "detect_gpu", lambda: None)
-    monkeypatch.setattr(
-        cli, "estimate_config", lambda model_info, gpu_info, args: dict(config)
-    )
-    monkeypatch.setattr(cli, "_configure_backend", lambda *a, **k: _StubBackend())
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
+    monkeypatch.setattr(cli.planning, "estimate_config", lambda model_info, gpu_info, args: dict(config))
+    monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: _StubBackend())
     args = _run_args("ollama://qwen3.6:35b", json=True)
     rc = cli.cmd_run(args)
     assert rc == 0
@@ -535,7 +543,7 @@ def test_cmd_run_ollama_resolves_blob_into_native_plan(capsys, monkeypatch, tmp_
 
 def test_cmd_run_ollama_cloud_model_keeps_passthrough(monkeypatch, capsys, tmp_path):
     """No local blob (cloud model) keeps the `ollama run` passthrough."""
-    monkeypatch.setattr(cli, "_resolve_ollama_native", lambda name: None)
+    monkeypatch.setattr(cli.runtime, "_resolve_ollama_native", lambda name: None)
     calls = []
 
     def fake_run(cmd):
@@ -556,25 +564,27 @@ def test_self_update_wheel_sha256_mismatch(monkeypatch, tmp_path):
 
     wheel = tmp_path / "kestrel-1.5.0-py3-none-any.whl"
     wheel.write_bytes(b"not-the-real-wheel")
-    args = SimpleNamespace(
-        repo=None, wheel=str(wheel), sha256="0" * 64, dry_run=True, json=False, yes=False
-    )
+    args = SimpleNamespace(repo=None, wheel=str(wheel), sha256="0" * 64, dry_run=True, json=False, yes=False)
     with pytest.raises(IntegrityError) as exc:
         cli.cmd_self_update(args)
     assert exc.value.code == "integrity_error"
 
 
 def test_self_update_wheel_sha256_ok_then_dry_run(monkeypatch, tmp_path, capsys):
+    import zipfile
     from hashlib import sha256
 
     import kestrel.cli as cli
 
     wheel = tmp_path / "kestrel-1.5.0-py3-none-any.whl"
-    wheel.write_bytes(b"wheel")
-    digest = sha256(b"wheel").hexdigest()
-    args = SimpleNamespace(
-        repo=None, wheel=str(wheel), sha256=digest, dry_run=True, json=False, yes=False
-    )
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(
+            "kestrel-1.5.0.dist-info/METADATA",
+            "Metadata-Version: 2.1\nName: kestrel\nVersion: 1.5.0\n",
+        )
+        archive.writestr("kestrel-1.5.0.dist-info/WHEEL", "Wheel-Version: 1.0\n")
+    digest = sha256(wheel.read_bytes()).hexdigest()
+    args = SimpleNamespace(repo=None, wheel=str(wheel), sha256=digest, dry_run=True, json=False, yes=False)
     cli.cmd_self_update(args)
     out = capsys.readouterr().out
     assert "Would install Kestrel" in out
@@ -590,9 +600,9 @@ def test_self_update_rolls_back_on_failed_post_check(monkeypatch, tmp_path, caps
         "run",
         lambda cmd, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
-    monkeypatch.setattr(cli, "_post_install_check", lambda: (False, "1.0.0"))
-    monkeypatch.setattr(cli, "_snapshot_installed", lambda: {"from": None, "to": None})
-    monkeypatch.setattr(cli, "_restore_install", lambda snap: calls.update(restore=True))
+    monkeypatch.setattr(cli.updater, "_post_install_check", lambda: (False, "1.0.0"))
+    monkeypatch.setattr(cli.updater, "_snapshot_installed", lambda: {"from": None, "to": None})
+    monkeypatch.setattr(cli.updater, "_restore_install", lambda snap: calls.update(restore=True))
     args = SimpleNamespace(
         repo=str(Path(__file__).resolve().parents[1]),
         wheel=None,
@@ -609,8 +619,6 @@ def test_self_update_rolls_back_on_failed_post_check(monkeypatch, tmp_path, caps
 
 
 def test_self_update_rolls_back_json_result(monkeypatch, tmp_path, capsys):
-    import json as _json
-
     import kestrel.cli as cli
 
     monkeypatch.setattr(
@@ -623,13 +631,13 @@ def test_self_update_rolls_back_json_result(monkeypatch, tmp_path, capsys):
 
     def post_check():
         if state["ok"]:
-            return True, "1.5.0"
+            return True, cli.__version__
         state["ok"] = True
         return False, ""
 
-    monkeypatch.setattr(cli, "_post_install_check", post_check)
-    monkeypatch.setattr(cli, "_snapshot_installed", lambda: {"from": None, "to": None})
-    monkeypatch.setattr(cli, "_restore_install", lambda snap: None)
+    monkeypatch.setattr(cli.updater, "_post_install_check", post_check)
+    monkeypatch.setattr(cli.updater, "_snapshot_installed", lambda: {"from": None, "to": None})
+    monkeypatch.setattr(cli.updater, "_restore_install", lambda snap: None)
     args = SimpleNamespace(
         repo=str(Path(__file__).resolve().parents[1]),
         wheel=None,
@@ -638,8 +646,187 @@ def test_self_update_rolls_back_json_result(monkeypatch, tmp_path, capsys):
         json=True,
         yes=False,
     )
-    cli.cmd_self_update(args)
-    payload = _json.loads(capsys.readouterr().out)
-    assert payload["status"] == "rolled_back"
-    assert payload["rolled_back"] is True
-    assert payload["to_version"] == "1.5.0"
+    from kestrel.errors import IntegrityError
+
+    with pytest.raises(IntegrityError, match="succeeded rollback"):
+        cli.cmd_self_update(args)
+
+
+# --- parser -> dispatch behavioural contract ----------------------------------
+# The parser + _run_dispatched are the real entry surface; dry-run/--json must
+# round-trip through them so the JSON document stays the single stdout line.
+
+
+def _dispatch(argv: list[str]) -> int:
+    parser = cli.build_parser()
+    return cli._run_dispatched(parser, parser.parse_args(argv))
+
+
+def test_dispatch_run_dry_run_json_parses(capsys, monkeypatch, tmp_path):
+    model = write_gguf(tmp_path / "m.gguf", n_layer=48)
+    config = {
+        "model_size_gib": 3.0,
+        "gpu_layers": "all",
+        "fit_target_mib": 512,
+        "cpu_moe": False,
+        "moe_cache": "off",
+        "moe_cache_budget_mib": 0,
+        "threads": 8,
+        "context_size": 4096,
+        "context_reason": "test",
+        "batch_size": 128,
+        "ubatch_size": 64,
+        "predicted_decode_tps": 0,
+        "prediction_confidence": "low",
+        "memory_overcommit": False,
+        "has_mtp": False,
+        "use_mtp": False,
+    }
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
+    monkeypatch.setattr(
+        cli.planning,
+        "estimate_config",
+        lambda model_info, gpu_info, args: dict(config),
+    )
+    monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: _StubBackend())
+    rc = _dispatch(["run", str(model), "--dry-run", "--json"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Model:" in captured.err  # the parser's run handler prints the human plan to stderr
+    payload = json.loads(captured.out.strip())
+    assert payload["dry_run"] is True
+    assert payload["model"] == str(model)
+    assert captured.out.count("\n") == 1
+
+
+def test_dispatch_doctor_json_is_structurally_sound(capsys, monkeypatch):
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
+    monkeypatch.setattr(cli.probes, "_memory_snapshot", lambda: {"swap_total_mib": 0, "swap_used_mib": 0})
+    monkeypatch.setattr(cli.state, "LLAMA_CPP_DIR", "/nonexistent")
+    rc = _dispatch(["doctor", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["status"] in ("ok", "warn", "fail")
+    assert isinstance(payload["checks"], list)
+    assert "llama_cli" in payload and "llama_server" in payload
+
+
+def test_dispatch_serve_dry_run_json_is_single_line(capsys, monkeypatch, tmp_path):
+    model = write_gguf(tmp_path / "m.gguf", n_layer=48)
+    config = {
+        "use_mtp": False,
+        "gpu_layers": "all",
+        "context_size": 4096,
+        "context_reason": "test",
+        "batch_size": 128,
+        "ubatch_size": 64,
+        "cpu_moe": False,
+        "fit": False,
+        "fit_target_mib": 0,
+        "threads": 8,
+        "moe_cache": "off",
+        "moe_cache_budget_mib": 0,
+    }
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
+    monkeypatch.setattr(cli.planning, "estimate_config", lambda *a, **k: dict(config))
+    monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: _StubBackend())
+    rc = _dispatch(["serve", str(model), "--dry-run", "--json", "--port", "9999"])
+    assert rc == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out.strip())
+    assert payload["dry_run"] is True
+    assert payload["url"] == "http://127.0.0.1:9999"
+    assert payload["command"]
+    assert captured.out.count("\n") == 1
+
+
+def test_dispatch_missing_model_json_uses_stable_error_document(capsys, monkeypatch):
+    monkeypatch.setattr(cli.state, "CONFIG_ERROR", None)
+
+    rc = _dispatch(["run", "not-a-model", "--dry-run", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == {
+        "error": {
+            "code": "model_not_found",
+            "message": "could not resolve model or GGUF path: not-a-model",
+            "hint": "check the model name and run `kestrel models list`",
+        }
+    }
+
+
+def test_dispatch_config_error_json_uses_stable_error_document(capsys, monkeypatch):
+    monkeypatch.setattr(cli.state, "CONFIG_ERROR", "configuration file is malformed")
+
+    rc = _dispatch(["status", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == {
+        "error": {
+            "code": "config_error",
+            "message": "configuration file is malformed",
+            "hint": "run `kestrel setup --reset` to repair it",
+        }
+    }
+
+
+def test_dispatch_models_store_error_json_uses_stable_error_document(capsys, monkeypatch):
+    from kestrel.model_store import ModelStoreError
+
+    monkeypatch.setattr(cli.state, "CONFIG_ERROR", None)
+    monkeypatch.setattr(
+        "kestrel.model_store.search_huggingface",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ModelStoreError("Hub unavailable")),
+    )
+
+    rc = _dispatch(["models", "search", "qwen", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == {"error": {"code": "model_error", "message": "Hub unavailable", "hint": None}}
+
+
+def test_dispatch_audit_failure_json_returns_one_report(capsys, monkeypatch, tmp_path):
+    report = {
+        "valid": False,
+        "errors": 1,
+        "warnings": 0,
+        "model": str(tmp_path / "bad.gguf"),
+        "tensor_count": 0,
+        "findings": [{"severity": "error", "code": "GGUF_UNPARSEABLE", "message": "bad model"}],
+    }
+    monkeypatch.setattr("kestrel.gguf.audit.audit_gguf", lambda *args, **kwargs: report)
+
+    rc = _dispatch(["audit", str(tmp_path / "bad.gguf"), "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == report
+
+
+def test_dispatch_cloud_ollama_dry_run_json_keeps_stdout_machine_readable(capsys, monkeypatch):
+    monkeypatch.setattr(cli.state, "CONFIG_ERROR", None)
+    monkeypatch.setattr(cli.runtime, "_resolve_ollama_native", lambda name: None)
+
+    rc = _dispatch(["run", "ollama://cloud-model", "--dry-run", "--json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Runtime: Ollama adapter" in captured.err
+    assert captured.out.count("\n") == 1
+    assert json.loads(captured.out) == {
+        "model": "ollama://cloud-model",
+        "dry_run": True,
+        "engine": "ollama",
+        "command": ["ollama", "run", "cloud-model"],
+    }

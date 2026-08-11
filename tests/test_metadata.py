@@ -1,3 +1,4 @@
+import json
 import struct
 import sys
 from pathlib import Path
@@ -13,8 +14,13 @@ from kestrel.gguf.metadata import GGUFMetadataError, read_planner_metadata  # no
 
 def test_read_moe_metadata(tmp_path):
     p = write_gguf(
-        tmp_path / "m.gguf", n_layer=48, n_exp=256, n_used=8,
-        hidden=3072, n_ff=1024, mtp_layers=2,
+        tmp_path / "m.gguf",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+        mtp_layers=2,
     )
     m = read_planner_metadata(p)
     assert m["architecture"] == "qwen35moe"
@@ -29,8 +35,13 @@ def test_read_moe_metadata(tmp_path):
 
 def test_read_dense_metadata(tmp_path):
     p = write_gguf(
-        tmp_path / "d.gguf", architecture="llama", n_layer=32,
-        n_exp=0, n_used=0, hidden=4096, n_ff=11008,
+        tmp_path / "d.gguf",
+        architecture="llama",
+        n_layer=32,
+        n_exp=0,
+        n_used=0,
+        hidden=4096,
+        n_ff=11008,
     )
     m = read_planner_metadata(p)
     assert m["architecture"] == "llama"
@@ -40,8 +51,13 @@ def test_read_dense_metadata(tmp_path):
 
 def test_metadata_without_tokenizer_keys(tmp_path):
     p = write_gguf(
-        tmp_path / "t.gguf", n_layer=48, n_exp=256, n_used=8,
-        hidden=3072, n_ff=1024, tokenizer_keys=False,
+        tmp_path / "t.gguf",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+        tokenizer_keys=False,
     )
     m = read_planner_metadata(p)
     assert m["n_layer"] == 48
@@ -105,8 +121,14 @@ def test_present_scalar_array_parses(tmp_path):
 
 def test_planner_unknown_arch_defaults(tmp_path):
     p = write_gguf(
-        tmp_path / "u.gguf", architecture="mystery", n_layer=0, n_exp=0,
-        n_used=0, hidden=0, n_ff=0, tokenizer_keys=False,
+        tmp_path / "u.gguf",
+        architecture="mystery",
+        n_layer=0,
+        n_exp=0,
+        n_used=0,
+        hidden=0,
+        n_ff=0,
+        tokenizer_keys=False,
     )
     m = read_planner_metadata(p)
     assert m["n_layer"] == 0
@@ -115,8 +137,13 @@ def test_planner_unknown_arch_defaults(tmp_path):
 def test_arch_suffix_mismatch_ignored(tmp_path):
     """Keys whose architecture does not match general.architecture are ignored."""
     p = write_gguf(
-        tmp_path / "s.gguf", architecture="llama", n_layer=32,
-        n_exp=0, n_used=0, hidden=4096, n_ff=11008,
+        tmp_path / "s.gguf",
+        architecture="llama",
+        n_layer=32,
+        n_exp=0,
+        n_used=0,
+        hidden=4096,
+        n_ff=11008,
     )
     m = read_planner_metadata(p)
     # n_exp stays 0 because no llama.expert_count was emitted
@@ -125,9 +152,16 @@ def test_arch_suffix_mismatch_ignored(tmp_path):
 
 def test_attention_dims_parsed(tmp_path):
     p = write_gguf(
-        tmp_path / "attn.gguf", architecture="qwen35moe", n_layer=48,
-        n_exp=128, n_used=8, hidden=2048, n_ff=1024,
-        n_heads=16, n_kv_heads=8, head_dim=128,
+        tmp_path / "attn.gguf",
+        architecture="qwen35moe",
+        n_layer=48,
+        n_exp=128,
+        n_used=8,
+        hidden=2048,
+        n_ff=1024,
+        n_heads=16,
+        n_kv_heads=8,
+        head_dim=128,
     )
     m = read_planner_metadata(p)
     assert m["n_heads"] == 16
@@ -137,9 +171,26 @@ def test_attention_dims_parsed(tmp_path):
 
 def test_attention_dims_missing_default_to_zero(tmp_path):
     p = write_gguf(
-        tmp_path / "noattn.gguf", architecture="llama", n_layer=32,
-        n_exp=0, n_used=0, hidden=4096, n_ff=11008,
+        tmp_path / "noattn.gguf",
+        architecture="llama",
+        n_layer=32,
+        n_exp=0,
+        n_used=0,
+        hidden=4096,
+        n_ff=11008,
     )
     m = read_planner_metadata(p)
     assert m["n_kv_heads"] == 0
     assert m["head_dim"] == 0
+
+
+def test_planner_disk_cache_rejects_non_object_metadata(tmp_path, monkeypatch):
+    import kestrel.gguf.metadata as metadata
+
+    monkeypatch.setenv("KESTREL_CACHE_DIR", str(tmp_path / "cache"))
+    model = tmp_path / "model.gguf"
+    cache = metadata._planner_cache_path(model)
+    cache.parent.mkdir(parents=True)
+    cache.write_text(json.dumps({"file_size": 12, "file_mtime_ns": 34, "metadata": ["bad"]}))
+
+    assert metadata._planner_cache_read(model, 12, 34) is None

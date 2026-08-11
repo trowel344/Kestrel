@@ -20,13 +20,8 @@ def _fake_gpu_smi(stdout: str) -> types.SimpleNamespace:
 
 
 def test_detect_gpus_parses_multiple_rows(monkeypatch):
-    rows = (
-        "NVIDIA RTX 4090, 24564, 20000\n"
-        "NVIDIA A100, 81920, 60000\n"
-    )
-    monkeypatch.setattr(
-        cli.subprocess, "run", lambda *a, **k: _fake_gpu_smi(rows)
-    )
+    rows = "NVIDIA RTX 4090, 24564, 20000\nNVIDIA A100, 81920, 60000\n"
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_gpu_smi(rows))
     devices = cli.detect_gpus()
     assert len(devices) == 2
     assert devices[0]["vram_total_mb"] == 24564
@@ -48,9 +43,7 @@ def test_detect_gpu_aggregates_multi_gpu():
 
 
 def test_detect_gpu_aggregate_single_device_keeps_shape():
-    gpu = cli._aggregate_gpu(
-        [{"name": "NVIDIA RTX 4090", "vram_total_mb": 24576, "vram_free_mb": 20000}]
-    )
+    gpu = cli._aggregate_gpu([{"name": "NVIDIA RTX 4090", "vram_total_mb": 24576, "vram_free_mb": 20000}])
     assert gpu["count"] == 1
     assert gpu["devices"][0]["name"] == "NVIDIA RTX 4090"
     assert gpu["name"] == "NVIDIA RTX 4090"
@@ -62,8 +55,18 @@ def test_detect_gpu_aggregate_empty_is_none():
 
 def test_detect_gpus_error_returns_empty(monkeypatch):
     monkeypatch.setattr(
-        cli.subprocess, "run",
+        cli.subprocess,
+        "run",
         lambda *a, **k: _fake_gpu_smi(""),
+    )
+    assert cli.detect_gpus() == []
+
+
+def test_detect_gpus_permission_error_returns_empty(monkeypatch):
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("denied")),
     )
     assert cli.detect_gpus() == []
 
@@ -100,7 +103,10 @@ def test_tensor_split_arg_single_gpu_none():
 
 def test_flatten_extra_splits_shell_words():
     assert cli._flatten_extra(["--temp 0.4 --top-p 0.9"]) == [
-        "--temp", "0.4", "--top-p", "0.9",
+        "--temp",
+        "0.4",
+        "--top-p",
+        "0.9",
     ]
     assert cli._flatten_extra(["--a 1", "--b 2"]) == ["--a", "1", "--b", "2"]
     assert cli._flatten_extra([]) == []
@@ -120,9 +126,7 @@ def _backend_with_caps(caps: LlamaCppCapabilities, tmp_path: Path) -> LlamaCppBa
 
 
 def test_base_cmd_mlock_and_extra_and_split(tmp_path):
-    caps = LlamaCppCapabilities(
-        help_text="--mlock\n--tensor-split\n--mmap\n--no-mmap\n"
-    )
+    caps = LlamaCppCapabilities(help_text="--mlock\n--tensor-split\n--mmap\n--no-mmap\n")
     backend = _backend_with_caps(caps, tmp_path)
     backend.use_mmap = True
     backend.use_mlock = True
@@ -152,9 +156,7 @@ def test_find_convert_script_build_root(tmp_path):
     build = tmp_path / "llama.cpp" / "build"
     build.mkdir(parents=True)
     (tmp_path / "llama.cpp" / "convert_hf_to_gguf.py").write_text("#!/usr/bin/env python\n")
-    assert find_convert_script(str(build)) == str(
-        tmp_path / "llama.cpp" / "convert_hf_to_gguf.py"
-    )
+    assert find_convert_script(str(build)) == str(tmp_path / "llama.cpp" / "convert_hf_to_gguf.py")
 
 
 def test_find_convert_script_direct_dir(tmp_path, monkeypatch):
@@ -204,11 +206,24 @@ def test_generic_convert_hf_to_gguf_propagates_failure(tmp_path, monkeypatch):
     (tmp_path / "convert_hf_to_gguf.py").write_text("x")
     monkeypatch.setattr(
         "kestrel.gguf.converter.subprocess.run",
-        lambda *a, **k: types.SimpleNamespace(
-            returncode=1, stdout="", stderr="boom"
-        ),
+        lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr="boom"),
     )
     with pytest.raises(RuntimeError, match="boom"):
+        generic_convert_hf_to_gguf(str(tmp_path / "src"), "/out/m.gguf", llama_cpp_dir=str(tmp_path))
+
+
+def test_generic_convert_timeout_is_typed(tmp_path, monkeypatch):
+    import subprocess
+
+    from kestrel.gguf.converter import generic_convert_hf_to_gguf
+
+    (tmp_path / "convert_hf_to_gguf.py").write_text("x")
+    monkeypatch.setattr(
+        "kestrel.gguf.converter.subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(args[0], 1)),
+    )
+
+    with pytest.raises(RuntimeError, match="24-hour"):
         generic_convert_hf_to_gguf(str(tmp_path / "src"), "/out/m.gguf", llama_cpp_dir=str(tmp_path))
 
 
@@ -224,22 +239,19 @@ def test_generic_convert_missing_script_raises(tmp_path, monkeypatch):
 
 
 def test_cmd_convert_generic_branch(monkeypatch, tmp_path, capsys):
-    args = types.SimpleNamespace(
-        model="owner/repo", output="/out/m.gguf", generic=True, outtype="q8_0"
-    )
+    args = types.SimpleNamespace(model="owner/repo", output="/out/m.gguf", generic=True, outtype="q8_0")
     # detect_model says it is a downloaded safetensors input at a fake path.
-    monkeypatch.setattr(cli, "detect_model",
-                        lambda m: {"type": "safetensors", "path": "/fake/hf", "gguf_name": None})
+    monkeypatch.setattr(
+        cli.model_source, "detect_model", lambda m: {"type": "safetensors", "path": "/fake/hf", "gguf_name": None}
+    )
     seen = {}
 
     def fake_converter(src, out, *, outtype, llama_cpp_dir):
         seen.update(src=src, out=out, outtype=outtype)
         return "cmd", 0
 
-    monkeypatch.setattr(
-        "kestrel.gguf.converter.generic_convert_hf_to_gguf", fake_converter
-    )
-    monkeypatch.setattr(cli, "LLAMA_CPP_DIR", "/nonexistent")
+    monkeypatch.setattr("kestrel.gguf.converter.generic_convert_hf_to_gguf", fake_converter)
+    monkeypatch.setattr(cli.state, "LLAMA_CPP_DIR", "/nonexistent")
     cli.cmd_convert(args)
     assert seen["src"] == "/fake/hf"
     assert seen["out"] == "/out/m.gguf"

@@ -1,24 +1,43 @@
----
 name: Feature request
-about: Suggest an idea for Kestrel
-title: "[feature] "
-labels: enhancement
-assignees: ""
----
-
-## Problem
-
-What problem are you trying to solve? What are you trying to do that Kestrel
-doesn't support today?
-
-## Proposed solution
-
-Describe the behavior or command you'd like to see.
-
-## Alternatives
-
-Anything you've already tried or considered?
-
-## Additional context
-
-Model, hardware, use case, or links that help explain the request.
+description: Propose a focused improvement to Kestrel
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Strong proposals explain the hardware or model constraint first, then
+        the desired behavior. Measurements and concrete examples are welcome.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What cannot you do today, and who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the CLI, configuration, or runtime behavior you want.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What have you tried, and why was it insufficient?
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Hardware and model evidence
+      description: Relevant hardware, model, quantization, benchmarks, or links.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and discussions for this request.
+          required: true
+        - label: This request is about Kestrel rather than an upstream llama.cpp bug.
+          required: true

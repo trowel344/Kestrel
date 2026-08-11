@@ -44,8 +44,12 @@ if (( MAJOR < 3 )) || (( MAJOR == 3 && MINOR < 11 )); then
   exit 1
 fi
 
-echo "==> Creating virtual environment: $INSTALL_DIR"
-python3 -m venv "$INSTALL_DIR"
+if [[ -x "$INSTALL_DIR/bin/python" ]]; then
+  echo "==> Reusing existing virtual environment: $INSTALL_DIR"
+else
+  echo "==> Creating virtual environment: $INSTALL_DIR"
+  python3 -m venv "$INSTALL_DIR"
+fi
 
 PIP="$INSTALL_DIR/bin/pip"
 KESTREL="$INSTALL_DIR/bin/kestrel"
@@ -61,7 +65,7 @@ fi
 
 echo "==> Verifying installed kestrel launcher"
 VERSION_OUT="$("$KESTREL" --version 2>&1)" || true
-if ! printf '%s\n' "$VERSION_OUT" | grep -E '^kestrel [0-9]+\.[0-9]+\.[0-9]+' >/dev/null 2>&1; then
+if ! printf '%s\n' "$VERSION_OUT" | grep -E '^kestrel [0-9]+\.[0-9]+\.[0-9]+([-.+a-zA-Z][0-9A-Za-z.+-]*)?$' >/dev/null 2>&1; then
   echo "error: 'kestrel --version' did not report a 'kestrel <semver>' line; got:" >&2
   printf '%s\n' "$VERSION_OUT" >&2
   echo "The pip install may have failed. Check the pip output above." >&2

@@ -64,8 +64,7 @@ def _audit_blocks(
             if missing:
                 error(
                     "TARGET_BLOCKS_MISSING",
-                    f"Missing target block IDs: {missing[:8]}"
-                    + ("..." if len(missing) > 8 else ""),
+                    f"Missing target block IDs: {missing[:8]}" + ("..." if len(missing) > 8 else ""),
                 )
             replaced = [index for index in nextn_blocks if index < target_layers]
             if replaced:
@@ -103,21 +102,15 @@ def _audit_tokenizer(fields: dict[str, Any], error) -> None:
             "tokenizer.ggml.pre is absent, so llama.cpp cannot select the source tokenizer behavior reliably.",
         )
 
-    empty_ids = [
-        index
-        for index, token in enumerate(tokens)
-        if token == "" or token == b""
-    ]
+    empty_ids = [index for index, token in enumerate(tokens) if token == "" or token == b""]
     if empty_ids:
         unsafe = token_types is None or any(
-            index >= len(token_types) or _integer(token_types[index], -1) != 5
-            for index in empty_ids
+            index >= len(token_types) or _integer(token_types[index], -1) != 5 for index in empty_ids
         )
         if unsafe:
             error(
                 "EMPTY_NORMAL_TOKENS",
-                f"{len(empty_ids)} empty vocabulary entries are not explicitly UNUSED "
-                f"(first IDs: {empty_ids[:5]}).",
+                f"{len(empty_ids)} empty vocabulary entries are not explicitly UNUSED (first IDs: {empty_ids[:5]}).",
             )
 
 
@@ -136,8 +129,7 @@ def _audit_vocab_source_config(
     if source_tokenizer_config.get("bos_token") is None and "tokenizer.ggml.bos_token_id" in fields:
         error(
             "FABRICATED_BOS",
-            f"GGUF declares BOS ID {fields['tokenizer.ggml.bos_token_id']} "
-            "but the source tokenizer has no BOS token.",
+            f"GGUF declares BOS ID {fields['tokenizer.ggml.bos_token_id']} but the source tokenizer has no BOS token.",
         )
     if source_tokenizer_config.get("pad_token") and "tokenizer.ggml.padding_token_id" not in fields:
         error(
@@ -154,6 +146,34 @@ def _audit_f32(tensors: list[tuple[str, int]], warning) -> None:
             f"{f32_count} of {len(tensors)} tensors are F32. Elementwise vectors "
             "need F32 for llama.cpp CPU kernels, but a majority-F32 artifact likely "
             "expanded supported BF16 matrices and increases memory and I/O.",
+        )
+
+
+def _audit_primary_experts(fields: dict[str, Any], names: list[str], error) -> None:
+    """Require the canonical expert tensors consumed by llama.cpp.
+
+    Compact cold sidecars intentionally use ``*_exps_lp`` and are audited by
+    :func:`audit_cold_sidecar_snapshot`.  A normal Qwen MoE model, however,
+    must expose the canonical names regardless of the tensors' quantization
+    type.  Without this check a structurally complete GGUF can pass the audit
+    and still fail immediately in llama.cpp's model loader.
+    """
+    arch = str(fields.get("general.architecture", "unknown"))
+    if arch != "qwen35moe" or _integer(fields.get(f"{arch}.expert_count")) <= 0:
+        return
+    block_count = _integer(fields.get(f"{arch}.block_count"))
+    available = set(names)
+    missing = []
+    for layer in range(block_count):
+        for stem in ("ffn_gate_up_exps", "ffn_down_exps"):
+            name = f"blk.{layer}.{stem}.weight"
+            if name not in available:
+                missing.append(name)
+    if missing:
+        error(
+            "PRIMARY_EXPERTS_MISSING",
+            f"Missing canonical routed-expert tensors required by llama.cpp: {missing[:4]}"
+            + ("..." if len(missing) > 4 else ""),
         )
 
 
@@ -178,6 +198,7 @@ def audit_snapshot(
     _audit_tokenizer(fields, error)
     _audit_vocab_source_config(fields, source_tokenizer_config, error)
     _audit_f32(tensors, warning)
+    _audit_primary_experts(fields, names, error)
 
     return findings
 
@@ -293,19 +314,11 @@ def _compare_last_target_norm(
                 # GGUFReader exposes BF16 payloads as raw bytes. Compare the
                 # exact source BF16 representation rather than round-tripping
                 # through float32.
-                return (
-                    value.to(torch.bfloat16)
-                    .contiguous()
-                    .view(torch.uint8)
-                    .numpy()
-                    .reshape(-1)
-                )
+                return value.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().reshape(-1)
             dtype = torch.float16 if tensor_type == 1 else torch.float32
             return value.to(dtype).numpy().reshape(-1)
 
-    target = source_tensor(
-        f"model.language_model.layers.{block}.input_layernorm.weight"
-    )
+    target = source_tensor(f"model.language_model.layers.{block}.input_layernorm.weight")
     mtp = source_tensor("mtp.layers.0.input_layernorm.weight")
     if target is None or mtp is None:
         return []
@@ -315,8 +328,7 @@ def _compare_last_target_norm(
             AuditFinding(
                 "error",
                 "MTP_WEIGHTS_IN_TARGET_BLOCK",
-                f"{gguf_name} is byte-for-byte equal to source MTP layer 0, "
-                f"not source target layer {block}.",
+                f"{gguf_name} is byte-for-byte equal to source MTP layer 0, not source target layer {block}.",
             )
         ]
     return []
@@ -359,6 +371,7 @@ def audit_gguf(
     keys = {
         "general.architecture",
         f"{arch}.block_count",
+        f"{arch}.expert_count",
         f"{arch}.nextn_predict_layers",
         "tokenizer.ggml.tokens",
         "tokenizer.ggml.token_type",
@@ -367,11 +380,7 @@ def audit_gguf(
         "tokenizer.ggml.bos_token_id",
         "tokenizer.ggml.padding_token_id",
     }
-    fields = {
-        key: value
-        for key in keys
-        if (value := _field_contents(reader, key)) is not None
-    }
+    fields = {key: value for key in keys if (value := _field_contents(reader, key)) is not None}
     tensors = [(item.name, _integer(item.tensor_type, -1)) for item in reader.tensors]
 
     source_config = None

@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import BinaryIO
 
 from kestrel.errors import CorruptModelError
+from kestrel.util import write_atomic
+
+from .quants import GGUF_SCALAR_FORMATS
 
 
 class GGUFMetadataError(CorruptModelError):
@@ -21,28 +24,12 @@ class GGUFMetadataError(CorruptModelError):
     """
 
 
-_SCALAR_FORMATS = {
-    0: "B",   # uint8
-    1: "b",   # int8
-    2: "H",   # uint16
-    3: "h",   # int16
-    4: "I",   # uint32
-    5: "i",   # int32
-    6: "f",   # float32
-    7: "?",   # bool
-    10: "Q",  # uint64
-    11: "q",  # int64
-    12: "d",  # float64
-}
-
-
 def _unpack(handle: BinaryIO, endian: str, fmt: str):
     size = struct.calcsize(fmt)
     payload = handle.read(size)
     if len(payload) != size:
         raise GGUFMetadataError(
-            f"truncated GGUF metadata: needed {size} bytes for {fmt}, "
-            f"got {len(payload)} (file ends early)",
+            f"truncated GGUF metadata: needed {size} bytes for {fmt}, got {len(payload)} (file ends early)",
             hint="the model file is truncated or corrupt; redownload it",
         )
     try:
@@ -64,19 +51,15 @@ def _string(handle: BinaryIO, endian: str) -> str:
     payload = handle.read(length)
     if len(payload) != length:
         raise GGUFMetadataError(
-            f"truncated GGUF string: key/value needs {length} bytes but "
-            f"only {len(payload)} remain",
+            f"truncated GGUF string: key/value needs {length} bytes but only {len(payload)} remain",
             hint="the model file is truncated or corrupt; redownload it",
         )
     return payload.decode("utf-8", errors="replace")
 
 
 def _value(handle: BinaryIO, endian: str, value_type: int):
-    if value_type in _SCALAR_FORMATS:
-        try:
-            return _unpack(handle, endian, _SCALAR_FORMATS[value_type])
-        except GGUFMetadataError:
-            raise
+    if value_type in GGUF_SCALAR_FORMATS:
+        return _unpack(handle, endian, GGUF_SCALAR_FORMATS[value_type])
     if value_type == 8:
         return _string(handle, endian)
     if value_type == 9:
@@ -87,8 +70,8 @@ def _value(handle: BinaryIO, endian: str, value_type: int):
                 f"unreasonable GGUF array length {count}",
                 hint="the model header declared an implausibly large array",
             )
-        if element_type in _SCALAR_FORMATS:
-            skip = struct.calcsize(_SCALAR_FORMATS[element_type]) * count
+        if element_type in GGUF_SCALAR_FORMATS:
+            skip = struct.calcsize(GGUF_SCALAR_FORMATS[element_type]) * count
             _seek_checked(handle, skip)
             return None
         if element_type == 8:
@@ -112,8 +95,7 @@ def _seek_checked(handle: BinaryIO, offset: int) -> None:
     end = handle.tell()
     if current + offset > end:
         raise GGUFMetadataError(
-            f"truncated GGUF metadata: array needs {offset} bytes past offset "
-            f"{current} but file ends at {end}",
+            f"truncated GGUF metadata: array needs {offset} bytes past offset {current} but file ends at {end}",
             hint="the model file is truncated or corrupt; redownload it",
         )
     handle.seek(current + offset)
@@ -130,9 +112,7 @@ def _planner_cache_dir() -> Path:
     override = os.environ.get("KESTREL_CACHE_DIR")
     if override:
         return Path(override)
-    base = Path(
-        os.environ.get("XDG_CACHE_HOME") or os.path.join(Path.home(), ".cache")
-    )
+    base = Path(os.environ.get("XDG_CACHE_HOME") or os.path.join(Path.home(), ".cache"))
     return base / "kestrel"
 
 
@@ -146,7 +126,8 @@ def _planner_cache_read(path: Path, size: int, mtime_ns: int) -> dict | None:
         cache_file = _planner_cache_path(path)
         data = json.loads(cache_file.read_text())
         if data.get("file_size") == size and data.get("file_mtime_ns") == mtime_ns:
-            return data.get("metadata")
+            metadata = data.get("metadata")
+            return metadata if isinstance(metadata, dict) else None
     except (OSError, ValueError, TypeError):
         pass
     return None
@@ -156,14 +137,16 @@ def _planner_cache_write(path: Path, size: int, mtime_ns: int, metadata: dict) -
     try:
         directory = _planner_cache_dir()
         directory.mkdir(parents=True, exist_ok=True)
-        _planner_cache_path(path).write_text(
+        write_atomic(
+            _planner_cache_path(path),
             json.dumps(
                 {
                     "file_size": size,
                     "file_mtime_ns": mtime_ns,
                     "metadata": metadata,
                 }
-            )
+            ),
+            backup=False,
         )
     except OSError:
         pass

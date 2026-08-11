@@ -22,10 +22,12 @@ def test_parse_routes_line():
 
 
 def test_parse_routes_multiple():
-    text = "\n".join([
-        "[moe-route] tensor=1 expert-bytes=100 type=q4_0 ids=1",
-        "[moe-route] tensor=2 expert-bytes=200 type=q1_0 ids=4,5",
-    ])
+    text = "\n".join(
+        [
+            "[moe-route] tensor=1 expert-bytes=100 type=q4_0 ids=1",
+            "[moe-route] tensor=2 expert-bytes=200 type=q1_0 ids=4,5",
+        ]
+    )
     routes = parse_routes(text)
     assert len(routes) == 2
     assert routes[1].pool == (200, "q1_0")

@@ -39,25 +39,30 @@ def _uses_utf8() -> bool:
 
 USE_UTF8 = _uses_utf8()
 
-_BOX = {
-    "tl": "┌",
-    "tr": "┐",
-    "bl": "└",
-    "br": "┘",
-    "h": "─",
-    "v": "│",
-    "lt": "├",
-    "rt": "┤",
-} if USE_UTF8 else {
-    "tl": "+",
-    "tr": "+",
-    "bl": "+",
-    "br": "+",
-    "h": "-",
-    "v": "|",
-    "lt": "+",
-    "rt": "+",
-}
+_BOX = (
+    {
+        "tl": "┌",
+        "tr": "┐",
+        "bl": "└",
+        "br": "┘",
+        "h": "─",
+        "v": "│",
+        "lt": "├",
+        "rt": "┤",
+    }
+    if USE_UTF8
+    else {
+        "tl": "+",
+        "tr": "+",
+        "bl": "+",
+        "br": "+",
+        "h": "-",
+        "v": "|",
+        "lt": "+",
+        "rt": "+",
+    }
+)
+
 
 def color(code: int, text: str) -> str:
     if not USE_ANSI:
@@ -83,14 +88,6 @@ def green(text: str) -> str:
 
 def yellow(text: str) -> str:
     return color(33, text)
-
-
-def blue(text: str) -> str:
-    return color(34, text)
-
-
-def magenta(text: str) -> str:
-    return color(35, text)
 
 
 def cyan(text: str) -> str:
@@ -180,13 +177,11 @@ def _frame(title: str | None, body: str, *, title_color=None) -> str:
     for line in body_lines:
         indent_match = re.match(r"^[ \t]*", line)
         indent = indent_match.group(0) if indent_match else ""
-        content = line[len(indent):]
+        content = line[len(indent) :]
         wrapped = _wrap(content, inner - len(indent))
         for index, part in enumerate(wrapped):
             text = indent if index > 0 else ""
-            lines.append(
-                f"{_BOX['v']}{text}{part}{' ' * max(0, inner - len(text) - visible_length(part))}{_BOX['v']}"
-            )
+            lines.append(f"{_BOX['v']}{text}{part}{' ' * max(0, inner - len(text) - visible_length(part))}{_BOX['v']}")
     footer = f"{_BOX['bl']}{h * max(0, terminal - 2)}{_BOX['br']}"
     return "\n".join([header, *lines, footer])
 
@@ -253,6 +248,7 @@ def table(
             limit = max_widths[index] if index < len(max_widths) else None
             rendered = _truncate(cell, limit) if limit else cell
             widths[index] = max(widths[index], visible_length(rendered))
+
     def render_row(row: list[str]) -> str:
         cells = []
         for index, cell in enumerate(row):
@@ -263,9 +259,8 @@ def table(
             else:
                 cells.append(pad(rendered, widths[index]))
         return "  " + "  ".join(cells)
-    h = "  " + "  ".join(
-        pad(bold(cell), widths[index]) for index, cell in enumerate(headers)
-    )
+
+    h = "  " + "  ".join(pad(bold(cell), widths[index]) for index, cell in enumerate(headers))
     rule = "  " + "-" * sum(widths) + "-" * (2 * (len(widths) - 1))
     body = "\n".join(render_row(row) for row in rows)
     return "\n".join([h, rule, body])
