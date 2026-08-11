@@ -1,8 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 224 224" role="img" aria-labelledby="title desc">
   <title id="title">Kestrel pixel K</title>
   <desc id="desc">A centered layered off-white block-pixel letter K on a deep navy tile.</desc>
-  <rect width="224" height="224" rx="32" fill="#07121f"/>
-  <rect x="8" y="8" width="208" height="208" rx="26" fill="#0b1b2b"/>
+  <rect width="224" height="224" rx="32" fill="#0b1b2b"/>
 
   <defs>
     <!-- A literal 14 px grid keeps the mark crisp from favicon to banner. -->
