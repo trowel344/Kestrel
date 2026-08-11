@@ -349,25 +349,20 @@ def _read_key(fd: int) -> str:
 
 def key_hint() -> str:
     if USE_UTF8:
-        return "Use ↑/↓ to move, Enter to select, q to quit"
-    return "Use up/down to move, Enter to select, q to quit"
+        return "↑↓ move  ·  Enter select  ·  q back"
+    return "up/down move  ·  Enter select  ·  q back"
 
 
 def _menu_item(label: str, description: str, *, selected: bool, limit: int | None = None) -> str:
-    marker = "▸" if USE_UTF8 else ">"
-    rail = "│" if USE_UTF8 else "|"
+    marker = "›" if USE_UTF8 else ">"
     segments: list[tuple] = []
     if selected:
-        if USE_ANSI:
-            segments.append((cyan, marker))
-            segments.append((None, f" {rail} "))
-        else:
-            segments.append((None, f"{marker} {rail} "))
+        segments.append((cyan if USE_ANSI else None, f"{marker} "))
     else:
-        segments.append((None, f"  {rail} "))
+        segments.append((None, "  "))
     segments.append((bold if (selected and USE_ANSI) else None, label))
     if description:
-        segments.append((dim if USE_ANSI else None, f"  {description}"))
+        segments.append((dim if USE_ANSI else None, f"   {description}"))
     return _truncate_segments(segments, limit if limit is not None else width())
 
 
@@ -423,7 +418,11 @@ def select(
         if header:
             chrome += 1 + len(header.splitlines())
         chrome += 1  # blank line before the options
-        return rows() - chrome - 1  # one-row bottom margin
+        if hint:
+            chrome += 2  # blank line plus the compact key hint
+        # Very short terminals cannot fit all chrome, but must still expose at
+        # least one choice plus a scroll indicator.
+        return max(2, rows() - chrome - 1)
 
     def render(first: int) -> list[str]:
         end = _menu_window_end(first, available(), len(options))
@@ -461,10 +460,9 @@ def select(
             sys.stdout.write("\x1b[2J\x1b[H")
         else:
             sys.stdout.write(f"\x1b[{printed}A\x1b[J")
-        output: list[str] = []
+        output = render(first)
         if hint:
-            output.append(dim(hint))
-        output.extend(render(first))
+            output.extend(["", dim(hint)])
         for line in output:
             sys.stdout.write(line + "\r\n")
         printed = len(output)

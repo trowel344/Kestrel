@@ -23,6 +23,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The interactive front door is reduced to Start chat, Models, Tools, and Exit.
+  Chat launches with automatic settings; model onboarding groups local GGUF,
+  Ollama, and Hugging Face sources under one plain-language path. Selection
+  styling and key hints are quieter and hardware memory is shown in readable
+  GiB units.
 - llama.cpp capability discovery now retains a bounded, binary-identity keyed
   cache for CLI, server, and alternate builds. Repeated doctor/startup checks
   avoid redundant engine processes while atomic binary replacements invalidate

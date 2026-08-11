@@ -62,14 +62,16 @@ decisions visible through human and machine-readable CLI output.
 ```bash
 # one-command install (isolated virtual environment)
 ./install.sh
-.venv/bin/kestrel doctor              # GPU, RAM, and llama.cpp capabilities
-.venv/bin/kestrel setup --model /path/to/model.gguf
-.venv/bin/kestrel chat                # chat with the configured default model
+.venv/bin/kestrel                     # open the simple interactive menu
 ```
 
-Or install with pip: `pip install '.[convert]'`. Skip setup by passing a model
-directly: `kestrel chat /path/to/model.gguf`. `kestrel` (or `kestrel menu`)
-opens the interactive menu.
+Choose **Models → Add a model** the first time, then **Start chat**. Kestrel
+uses automatic hardware and memory settings so technical placement questions
+do not block the first conversation.
+
+Or install with pip: `pip install '.[convert]'`. For a scriptable setup, run
+`kestrel setup --model /path/to/model.gguf`, followed by `kestrel chat`.
+You can also skip setup with `kestrel chat /path/to/model.gguf`.
 
 > No llama.cpp binary yet? `kestrel build` builds the CUDA-enabled MoE-native
 > build, or set `KESTREL_LLAMA_CPP_DIR` to an existing llama.cpp checkout.

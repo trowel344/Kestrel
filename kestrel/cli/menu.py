@@ -6,9 +6,9 @@ loop in the same process, so it reloads the config snapshot through
 
 The menu deliberately keeps its interaction layer separate from the command
 entry point.  ``_MenuSession`` owns the small amount of menu state and turns
-each selection into an ordinary CLI argument vector.  That makes the menu
-navigation testable without a real terminal or model runtime while preserving
-the same visible prompts and dispatch behavior.
+each selection into an ordinary CLI argument vector. The first screen exposes
+only chat, models, and tools; technical placement controls remain available in
+the scriptable CLI instead of blocking a first conversation.
 """
 
 from __future__ import annotations
@@ -22,20 +22,31 @@ from ..config import load_config
 from . import probes
 
 
+def _memory_label(mib: int | float) -> str:
+    return f"{mib / 1024:.1f} GiB" if mib >= 1024 else f"{int(mib)} MiB"
+
+
+def _model_label(model: str | None) -> str:
+    if not model:
+        return "not set"
+    if model.startswith("ollama://"):
+        return model.removeprefix("ollama://")
+    return Path(model).name or model
+
+
 def _menu_status_compact() -> str:
     gpu = probes.detect_gpu()
-    parts = []
+    parts: list[str] = []
     if gpu:
-        parts.append(f"gpu: {gpu['name']} ({gpu['vram_free_mb']}/{gpu['vram_total_mb']} MiB free)")
+        parts.append(str(gpu["name"]))
+        parts.append(f"{_memory_label(gpu['vram_free_mb'])} VRAM free")
     else:
-        parts.append("gpu: not detected")
-    parts.append(f"ram: {probes._available_ram_mib()} MiB")
-    text = "   " + "   ·   ".join(parts)
-    return ui.dim(ui._truncate(text, ui.width()))
+        parts.append("CPU mode")
+    parts.append(f"{_memory_label(probes._available_ram_mib())} RAM free")
+    return ui.dim(ui._truncate("  ·  ".join(parts), ui.width()))
 
 
 _BACK = ("Go back", "")
-_TARGETS = ("auto", "balanced", "quality", "speed")
 
 
 class _MenuSession:
@@ -55,10 +66,8 @@ class _MenuSession:
 
         actions = (
             self._chat,
-            self._select_model,
-            self._import_models,
-            self._manage_models,
-            self._configure,
+            self._models,
+            self._tools,
         )
         while True:
             chosen = self._main_selection(_kestrel_version())
@@ -68,19 +77,19 @@ class _MenuSession:
 
     def _main_selection(self, version: str) -> int:
         default_model = load_config().default_model
+        default_display = ui._truncate(_model_label(default_model), max(12, ui.width() - 9))
         header = "\n".join(
             [
-                ui.bold("Kestrel") + (ui.dim(f"   v{version}") if ui.USE_ANSI else f"   v{version}"),
+                ui.bold("Kestrel") + (ui.dim(f"  v{version}") if ui.USE_ANSI else f"  v{version}"),
+                ui.dim(f"Default  {default_display}"),
                 _menu_status_compact(),
             ]
         )
         return ui.select(
             [
-                ("Chat with Model", default_model or "no model set"),
-                ("Select Model(s)", ""),
-                ("Import Models", ""),
-                ("Manage Models", ""),
-                ("Configure Kestrel", ""),
+                ("Start chat", "automatic settings" if default_model else "choose a model first"),
+                ("Models", "choose, add, or organize models"),
+                ("Tools", "system check, benchmark, and conversion"),
                 ("Exit", ""),
             ],
             header=header,
@@ -116,32 +125,35 @@ class _MenuSession:
 
         config = load_config()
         options: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def add(value: str, description: str) -> None:
+            if value not in seen:
+                seen.add(value)
+                options.append((value, description))
+
         if config.default_model:
-            options.append((config.default_model, "configured default"))
+            add(config.default_model, "configured default")
         root = Path(config.models_dir).expanduser() if config.models_dir else default_models_dir()
         for path in discover_local_models(root):
-            options.append((str(path), f"{path.stat().st_size / 1024**3:.2f} GiB local GGUF"))
+            add(str(path), f"{path.stat().st_size / 1024**3:.2f} GiB local GGUF")
         try:
             for item in list_ollama_models():
-                options.append((f"ollama://{item.name}", f"{item.size} via Ollama"))
+                add(f"ollama://{item.name}", f"{item.size} via Ollama")
         except ModelStoreError:
             pass
         return options
 
-    def _pick_model(self, title: str, *, keep_current: bool = False) -> str | None:
+    def _pick_model(self, title: str) -> str | None:
         options = self._model_options()
-        if keep_current:
-            options.insert(0, ("<keep current>", "leave the default model unchanged"))
         if not options:
-            print(f"  {ui.warn_mark()} No models found; download one from the market first.")
+            print(f"  {ui.warn_mark()} No models found. Add a model first.")
             return None
         options.append(("<type a path>", "enter a model path, name, or alias manually"))
         chosen = ui.select(options, title=title, hint=ui.key_hint())
         if chosen < 0:
             return None
         label = options[chosen][0]
-        if label == "<keep current>":
-            return "<keep current>"
         if label == "<type a path>":
             return self._prompt_required("Model path, name, or alias")
         return label
@@ -174,44 +186,11 @@ class _MenuSession:
 
     def _chat(self) -> None:
         default_model = load_config().default_model
-        model = default_model or self._pick_model("Chat with which model?")
-        if model is None:
+        if not default_model:
+            print(f"  {ui.info_mark()} Choose a model before starting a chat.")
+            self._import_models()
             return
-        context = ui.ask(
-            "Context tokens",
-            default="auto",
-            validate=lambda value: (
-                None
-                if value == "auto" or (value.isdigit() and int(value) >= 512)
-                else "Context must be 'auto' or an integer of at least 512"
-            ),
-        )
-        target = self._placement_target()
-        if target is None:
-            return
-        launch_args = ["chat", model, "--ctx-size", context, "--target", target]
-        if ui.confirm("Prime the page cache for a faster load", default=False):
-            launch_args.append("--warm-cache")
-        self._launch(*launch_args)
-
-    @staticmethod
-    def _placement_target() -> str | None:
-        target = "auto"
-        if not ui.confirm("Choose the placement target explicitly", default=False):
-            return target
-        index = ui.select(
-            [
-                ("auto", "adaptive: pick from available free memory"),
-                ("balanced", "memory-aware default"),
-                ("quality", "most stable, slower"),
-                ("speed", "experimental throughput bias"),
-            ],
-            title="Placement target",
-            hint=ui.key_hint(),
-        )
-        if index < 0:
-            return None
-        return _TARGETS[index]
+        self._launch("chat", default_model)
 
     def _select_model(self) -> None:
         model = self._pick_model("Select a model")
@@ -220,13 +199,25 @@ class _MenuSession:
 
     def _import_models(self) -> None:
         index = self._pick(
-            [("Import an Ollama model", ""), ("Pull from Hugging Face", ""), _BACK],
-            "Import Models",
+            [
+                ("Use a local GGUF", "choose a file already on this computer"),
+                ("Import from Ollama", "reuse an installed Ollama model"),
+                ("Download from Hugging Face", "pull a model repository or file"),
+                _BACK,
+            ],
+            "Add a model",
         )
         if index == 0:
-            self._import_ollama()
+            self._use_local_model()
         elif index == 1:
+            self._import_ollama()
+        elif index == 2:
             self._pull_hugging_face()
+
+    def _use_local_model(self) -> None:
+        model = self._prompt_required("Local GGUF path")
+        if model:
+            self._launch("setup", "--model", model)
 
     def _import_ollama(self) -> None:
         name = self._pick_ollama_model()
@@ -248,27 +239,44 @@ class _MenuSession:
         if ui.confirm("Proceed with the download", default=False):
             self._launch(*command)
 
-    def _manage_models(self) -> None:
+    def _models(self) -> None:
         index = self._pick(
             [
-                ("Installed models", ""),
-                ("Search model market", ""),
-                ("Hardware diagnostics", ""),
-                ("Benchmark", ""),
-                ("Convert / prune a model", ""),
+                ("Choose default model", "used when chat starts"),
+                ("Installed models", "show local and provider models"),
+                ("Add a model", "local GGUF, Ollama, or Hugging Face"),
+                ("Find models online", "search the GGUF model market"),
+                ("Model storage", "change the managed models folder"),
                 _BACK,
             ],
-            "Manage Models",
+            "Models",
         )
         if index == 0:
-            self._launch("models", "list", "--resolve")
+            self._select_model()
         elif index == 1:
-            self._search_models()
+            self._launch("models", "list", "--resolve")
         elif index == 2:
-            self._launch("doctor")
+            self._import_models()
         elif index == 3:
-            self._launch("benchmark")
+            self._search_models()
         elif index == 4:
+            self._configure_models_dir()
+
+    def _tools(self) -> None:
+        index = self._pick(
+            [
+                ("Check system", "hardware, engine, storage, and model health"),
+                ("Benchmark", "measure prompt and generation speed"),
+                ("Convert or prune", "advanced GGUF conversion tools"),
+                _BACK,
+            ],
+            "Tools",
+        )
+        if index == 0:
+            self._launch("doctor")
+        elif index == 1:
+            self._launch("benchmark")
+        elif index == 2:
             self._convert_model()
 
     def _search_models(self) -> None:
@@ -312,22 +320,6 @@ class _MenuSession:
             return None
         importance = self._prompt_required("Path to expert-importance JSON")
         return importance if importance is not None else False
-
-    def _configure(self) -> None:
-        index = self._pick([("Default model", ""), ("Models directory", ""), _BACK], "Configure Kestrel")
-        if index == 0:
-            self._configure_default()
-        elif index == 1:
-            self._configure_models_dir()
-
-    def _configure_default(self) -> None:
-        model = self._pick_model("Set the default model", keep_current=True)
-        if model is None:
-            return
-        command = ["setup"]
-        if model != "<keep current>":
-            command.extend(["--model", model])
-        self._launch(*command)
 
     def _configure_models_dir(self) -> None:
         models_dir = self._prompt_required("Managed models directory (Enter to leave unchanged)")

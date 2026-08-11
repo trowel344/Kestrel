@@ -93,6 +93,7 @@ def test_menu_item_selected():
     item = ui._menu_item("Run", "desc", selected=True)
     assert "Run" in item
     assert "desc" in item
+    assert "│" not in item
 
 
 def test_menu_window_end_respects_available():
