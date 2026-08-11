@@ -9,9 +9,8 @@ llama.cpp—without requiring a cloud account or hiding the real memory plan.
 
 [![Tests](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/test.yml?branch=main&label=tests&logo=github)](https://github.com/trowel344/Kestrel/actions/workflows/test.yml)
 [![Lint](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/lint.yml?branch=main&label=lint&logo=ruff)](https://github.com/trowel344/Kestrel/actions/workflows/lint.yml)
-[![Distribution](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/distribution.yml?branch=main&label=wheel&logo=pypi)](https://github.com/trowel344/Kestrel/actions/workflows/distribution.yml)
-[![PyPI](https://img.shields.io/pypi/v/kestrel?logo=pypi)](https://pypi.org/project/kestrel/)
-[![Python](https://img.shields.io/pypi/pyversions/kestrel?logo=python)](https://pypi.org/project/kestrel/)
+[![Distribution](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/distribution.yml?branch=main&label=wheel&logo=github)](https://github.com/trowel344/Kestrel/actions/workflows/distribution.yml)
+[![Python](https://img.shields.io/badge/python-3.11--3.13-3776ab?logo=python&logoColor=white)](pyproject.toml)
 [![License](https://img.shields.io/github/license/trowel344/Kestrel)](LICENSE)
 [![Status](https://img.shields.io/badge/status-beta-2f81f7)](CHANGELOG.md)
 
@@ -31,6 +30,12 @@ decisions visible through human and machine-readable CLI output.
 > runnable and measurable; it does not promise that every model will be fast
 > or capable on every machine. Use `kestrel benchmark` and `kestrel evaluate`
 > to record what a specific artifact can actually do on your hardware.
+
+> [!IMPORTANT]
+> This project is not affiliated with the unrelated `kestrel` distribution on
+> PyPI. Until Kestrel has a distinct distribution name, install it from this
+> repository or from an attached GitHub Release artifact—not with
+> `pip install kestrel`.
 
 ## Why Kestrel
 

@@ -26,10 +26,12 @@ release artifacts that are tested before publication.
   3.11/3.12/3.13, plus a no-torch `import kestrel` smoke job and a dedicated
   coverage-gate job (`pytest --cov=kestrel --cov-report=term`; rising floor,
   currently 55%).
-- `publish` workflow: pushing a version-matched `v*` tag runs the complete
+- `release` workflow: pushing a version-matched `v*` tag runs the complete
   test/coverage/lint/format gate, builds and smoke-tests an sdist + wheel,
-  creates an idempotent GitHub Release, and publishes the exact artifacts to
-  PyPI via trusted publishing (`id-token`).
+  then creates an idempotent GitHub Release containing the exact artifacts.
+- PyPI publication is intentionally disabled because the `kestrel`
+  distribution name belongs to an unrelated project. Source and GitHub Release
+  installation remain available while a distinct distribution name is chosen.
 - Dependabot configuration for pip and GitHub Actions (weekly).
 - `[tool.coverage]` configuration (branch coverage, rising fail floor).
 
