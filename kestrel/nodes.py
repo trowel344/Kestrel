@@ -10,10 +10,15 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import os
 import re
+import shutil
 import socket
 import struct
-from dataclasses import dataclass
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass, replace
 from numbers import Real
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -22,8 +27,10 @@ from .config import config_path as _config_path
 from .errors import KestrelError
 from .util import write_atomic
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 DEFAULT_RPC_PORT = 50052
+DEFAULT_SSH_PORT = 22
 MAX_PROBE_TIMEOUT = 10.0
 MAX_RPC_DEVICES = 64
 RPC_PROTO_MAJOR_VERSION = 4
@@ -34,6 +41,10 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+_SSH_USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+_SSH_KEY_TYPE_RE = re.compile(
+    r"^(?:ssh-(?:ed25519|rsa)|ecdsa-sha2-nistp(?:256|384|521)|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)$"
+)
 
 
 class NodeError(KestrelError):
@@ -56,6 +67,12 @@ class NodeSecurityError(NodeError):
 
 class NodePlanningError(NodeError):
     code = "node_planning_error"
+
+
+class SshTunnelError(NodeSecurityError):
+    """An authenticated SSH forwarding session could not be established."""
+
+    code = "ssh_tunnel_error"
 
 
 @dataclass(frozen=True)
@@ -145,6 +162,71 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def _validate_ssh_host(value: str | None) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.strip() != value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise NodeValidationError("ssh_host must be a non-empty host without whitespace or control characters")
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if not _HOST_RE.fullmatch(value):
+        raise NodeValidationError("ssh_host contains unsupported characters")
+    return value
+
+
+def _validate_path_value(value: str | None, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.strip() != value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise NodeValidationError(f"{field_name} must be a non-empty path without control characters")
+    return value
+
+
+def _validate_known_host_key(value: str) -> str:
+    """Validate pinned ``keytype base64`` host-key material.
+
+    Kestrel constructs the host/port field itself when writing a private
+    temporary known-hosts file. This prevents wildcard, hashed, or unrelated
+    host patterns from weakening the pin.
+    """
+
+    if (
+        not isinstance(value, str)
+        or value.strip() != value
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+    ):
+        raise NodeValidationError("ssh_host_key must be pinned keytype/base64 material")
+    fields = value.split()
+    if len(fields) != 2 or not _SSH_KEY_TYPE_RE.fullmatch(fields[0]):
+        raise NodeValidationError("ssh_host_key must contain exactly a key type and base64 key data")
+    import base64
+
+    try:
+        decoded = base64.b64decode(fields[1], validate=True)
+    except (ValueError, TypeError):
+        decoded = b""
+    key_type = fields[0].encode("ascii")
+    if len(decoded) < 4:
+        raise NodeValidationError("ssh_host_key contains an incomplete key blob")
+    key_type_size = struct.unpack(">I", decoded[:4])[0]
+    if (
+        key_type_size != len(key_type)
+        or decoded[4 : 4 + key_type_size] != key_type
+        or len(decoded) <= 4 + key_type_size
+    ):
+        raise NodeValidationError("ssh_host_key key blob does not match its key type")
+    return value
+
+
 def _check_endpoint_security(endpoint: Endpoint, *, allow_insecure_direct_rpc: bool) -> None:
     if not allow_insecure_direct_rpc and not is_loopback_host(endpoint.host):
         raise NodeSecurityError(
@@ -170,6 +252,14 @@ class Node:
     engine_version: str | None = None
     engine_commit: str | None = None
     model_cache_hashes: tuple[str, ...] = ()
+    # Managed-node fields. ``endpoint`` remains the local loopback endpoint
+    # used by llama.cpp after a tunnel is established.
+    ssh_host: str | None = None
+    ssh_user: str | None = None
+    ssh_port: int = DEFAULT_SSH_PORT
+    ssh_identity_file: str | None = None
+    ssh_host_key: str | None = None
+    remote_rpc_port: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.fullmatch(self.name):
@@ -189,6 +279,25 @@ class Node:
                 raise NodeValidationError(f"{field_name} must be a non-empty string or null")
         if self.engine_commit is not None and not _GIT_COMMIT_RE.fullmatch(self.engine_commit):
             raise NodeValidationError("engine_commit must be a 7-64 character hexadecimal git commit")
+        if isinstance(self.ssh_port, bool) or not isinstance(self.ssh_port, int) or not 1 <= self.ssh_port <= 65535:
+            raise NodeValidationError("ssh_port must be an integer between 1 and 65535")
+        if self.remote_rpc_port is not None and (
+            isinstance(self.remote_rpc_port, bool)
+            or not isinstance(self.remote_rpc_port, int)
+            or not 1 <= self.remote_rpc_port <= 65535
+        ):
+            raise NodeValidationError("remote_rpc_port must be null or an integer between 1 and 65535")
+        managed_values = (self.ssh_host, self.ssh_user, self.ssh_identity_file, self.ssh_host_key, self.remote_rpc_port)
+        if any(value is not None for value in managed_values):
+            if any(value is None for value in managed_values):
+                raise NodeValidationError(
+                    "managed nodes require ssh_host, ssh_user, ssh_identity_file, ssh_host_key, and remote_rpc_port"
+                )
+            _validate_ssh_host(self.ssh_host)
+            if not _SSH_USER_RE.fullmatch(self.ssh_user or ""):
+                raise NodeValidationError("ssh_user contains unsupported characters")
+            _validate_path_value(self.ssh_identity_file, "ssh_identity_file")
+            _validate_known_host_key(self.ssh_host_key or "")
         if not isinstance(self.model_cache_hashes, (tuple, list)):
             raise NodeValidationError("model_cache_hashes must be a sequence of SHA-256 strings")
         hashes = tuple(self.model_cache_hashes)
@@ -206,7 +315,7 @@ class Node:
     def rpc_endpoint(self) -> str:
         return self.parsed_endpoint.address
 
-    def as_dict(self) -> dict[str, Any]:
+    def _persist_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "endpoint": self.rpc_endpoint,
@@ -216,7 +325,38 @@ class Node:
             "engine_version": self.engine_version,
             "engine_commit": self.engine_commit,
             "model_cache_hashes": list(self.model_cache_hashes),
+            "ssh_host": self.ssh_host,
+            "ssh_user": self.ssh_user,
+            "ssh_port": self.ssh_port,
+            "ssh_identity_file": self.ssh_identity_file,
+            "ssh_host_key": self.ssh_host_key,
+            "remote_rpc_port": self.remote_rpc_port,
         }
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a safe public summary; private key paths/material are omitted."""
+
+        return {
+            "name": self.name,
+            "endpoint": self.rpc_endpoint,
+            "accelerator_memory_mib": self.accelerator_memory_mib,
+            "ram_mib": self.ram_mib,
+            "enabled": self.enabled,
+            "engine_version": self.engine_version,
+            "engine_commit": self.engine_commit,
+            "model_cache_hashes": list(self.model_cache_hashes),
+            "ssh_host": self.ssh_host,
+            "ssh_user": self.ssh_user,
+            "ssh_port": self.ssh_port,
+            "remote_rpc_port": self.remote_rpc_port,
+            "ssh_managed": self.managed,
+            "ssh_identity_configured": self.ssh_identity_file is not None,
+            "ssh_host_key_pinned": self.ssh_host_key is not None,
+        }
+
+    @property
+    def managed(self) -> bool:
+        return self.ssh_host is not None
 
 
 _NODE_KEYS = {
@@ -228,12 +368,38 @@ _NODE_KEYS = {
     "engine_version",
     "engine_commit",
     "model_cache_hashes",
+    "ssh_host",
+    "ssh_user",
+    "ssh_port",
+    "ssh_identity_file",
+    "ssh_host_key",
+    "remote_rpc_port",
+}
+
+_LEGACY_NODE_KEYS = _NODE_KEYS - {
+    "ssh_host",
+    "ssh_user",
+    "ssh_port",
+    "ssh_identity_file",
+    "ssh_host_key",
+    "remote_rpc_port",
 }
 
 
-def _node_from_dict(raw: Any) -> Node:
-    if not isinstance(raw, dict) or set(raw) != _NODE_KEYS:
+def _node_from_dict(raw: Any, *, legacy: bool = False) -> Node:
+    expected_keys = _LEGACY_NODE_KEYS if legacy else _NODE_KEYS
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
         raise NodeStateError("node inventory contains an object with missing or unknown fields")
+    if legacy:
+        raw = dict(raw)
+        raw.update(
+            ssh_host=None,
+            ssh_user=None,
+            ssh_port=DEFAULT_SSH_PORT,
+            ssh_identity_file=None,
+            ssh_host_key=None,
+            remote_rpc_port=None,
+        )
     try:
         return Node(**raw)
     except (NodeValidationError, TypeError) as exc:
@@ -242,12 +408,36 @@ def _node_from_dict(raw: Any) -> Node:
         raise NodeStateError("invalid node inventory entry types") from exc
 
 
+def _node_identity(node: Node) -> tuple[Any, ...]:
+    if node.managed:
+        return ("ssh", node.ssh_host, node.ssh_port, node.remote_rpc_port)
+    return ("direct", node.rpc_endpoint)
+
+
 class NodeStore:
     """Crash-safe named-node inventory backed by one strict JSON document."""
 
     def __init__(self, path: str | Path | None = None, *, allow_insecure_direct_rpc: bool = False) -> None:
         self.path = Path(path) if path is not None else node_store_path()
         self.allow_insecure_direct_rpc = allow_insecure_direct_rpc
+
+    def _check_private_state(self, entries: Iterable[Node]) -> None:
+        if not any(node.managed for node in entries):
+            return
+        target = self.path.resolve(strict=False) if self.path.is_symlink() else self.path
+        if not target.exists():
+            return
+        try:
+            metadata = target.stat()
+        except OSError as exc:
+            raise NodeStateError("unable to inspect managed node inventory permissions") from exc
+        if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+            raise NodeSecurityError("managed node inventory must be owned by the current user")
+        if metadata.st_mode & 0o077:
+            raise NodeSecurityError(
+                "managed node inventory is readable by group/other",
+                hint="chmod 600 the nodes.json file before adding managed SSH credentials.",
+            )
 
     def load(self) -> tuple[Node, ...]:
         if not self.path.exists() and not self.path.is_symlink():
@@ -258,17 +448,19 @@ class NodeStore:
             raise NodeStateError(f"unable to read node inventory {self.path}: {exc}") from exc
         if not isinstance(raw, dict) or set(raw) != {"schema_version", "nodes"}:
             raise NodeStateError("node inventory has an unknown or missing schema")
-        if type(raw["schema_version"]) is not int or raw["schema_version"] != SCHEMA_VERSION:
+        schema_version = raw.get("schema_version")
+        if type(schema_version) is not int or schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
             raise NodeStateError(f"unsupported node inventory schema version: {raw.get('schema_version')!r}")
         if not isinstance(raw["nodes"], list):
             raise NodeStateError("node inventory 'nodes' must be an array")
-        nodes = tuple(_node_from_dict(item) for item in raw["nodes"])
+        nodes = tuple(_node_from_dict(item, legacy=schema_version == LEGACY_SCHEMA_VERSION) for item in raw["nodes"])
         if len({node.name for node in nodes}) != len(nodes):
             raise NodeStateError("node inventory contains duplicate names")
-        if len({node.rpc_endpoint for node in nodes}) != len(nodes):
+        if len({_node_identity(node) for node in nodes}) != len(nodes):
             raise NodeStateError("node inventory contains duplicate endpoints")
         for node in nodes:
             _check_endpoint_security(node.parsed_endpoint, allow_insecure_direct_rpc=self.allow_insecure_direct_rpc)
+        self._check_private_state(nodes)
         return tuple(sorted(nodes, key=lambda node: node.name))
 
     def save(self, nodes: Iterable[Node]) -> Path:
@@ -277,13 +469,14 @@ class NodeStore:
             raise NodeValidationError("node inventory can only persist Node objects")
         if len({node.name for node in entries}) != len(entries):
             raise NodeValidationError("node inventory contains duplicate names")
-        if len({node.rpc_endpoint for node in entries}) != len(entries):
+        if len({_node_identity(node) for node in entries}) != len(entries):
             raise NodeValidationError("node inventory contains duplicate endpoints")
         for node in entries:
             _check_endpoint_security(node.parsed_endpoint, allow_insecure_direct_rpc=self.allow_insecure_direct_rpc)
+        self._check_private_state(entries)
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "nodes": [node.as_dict() for node in sorted(entries, key=lambda n: n.name)],
+            "nodes": [node._persist_dict() for node in sorted(entries, key=lambda n: n.name)],
         }
         try:
             write_atomic(self.path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -316,6 +509,365 @@ class NodeStore:
         """Return the sorted inventory (an alias convenient for CLI callers)."""
 
         return self.load()
+
+
+def _safe_process_detail(process: Any) -> str:
+    """Read a bounded, non-control diagnostic from an exited process."""
+
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return ""
+    try:
+        detail = stream.read(4096)
+    except (OSError, TypeError):
+        return ""
+    if not isinstance(detail, str):
+        return ""
+    cleaned = "".join(char for char in detail if 32 <= ord(char) < 127 or char in "\t\n")
+    return " ".join(cleaned.split())[:1000]
+
+
+class SshTunnel:
+    """Supervise one pinned-host-key SSH local port forward.
+
+    The worker RPC server is expected to listen on its own loopback interface.
+    Kestrel connects llama.cpp to a newly allocated local loopback port and
+    forwards that port through ``ssh``. No shell is involved, and every
+    process/temp-file path is cleaned up on startup failure or context exit.
+    """
+
+    def __init__(
+        self,
+        node: Node,
+        *,
+        timeout: float = 10.0,
+        ssh_binary: str | None = None,
+        process_factory: Callable[..., Any] | None = None,
+        connect: Callable[..., Any] | None = None,
+        rpc_probe: Callable[..., Any] | None = None,
+        listener_owner: Callable[[int, int], bool] | None = None,
+        poll_interval: float = 0.05,
+    ) -> None:
+        if not isinstance(node, Node) or not node.managed:
+            raise NodeValidationError("managed SSH tunnel requires a node with complete SSH configuration")
+        if isinstance(timeout, bool) or not isinstance(timeout, Real) or not math.isfinite(timeout) or timeout <= 0:
+            raise NodeValidationError("SSH tunnel timeout must be a positive finite number")
+        resolved_ssh = ssh_binary or shutil.which("ssh")
+        if (
+            not isinstance(resolved_ssh, str)
+            or not resolved_ssh
+            or any(ord(char) < 32 or ord(char) == 127 for char in resolved_ssh)
+        ):
+            raise NodeValidationError("SSH binary could not be resolved safely")
+        ssh_path = Path(resolved_ssh)
+        if (
+            not ssh_path.is_absolute()
+            or not ssh_path.is_file()
+            or ssh_path.is_symlink()
+            or not os.access(ssh_path, os.X_OK)
+        ):
+            raise NodeValidationError("SSH binary must be an absolute executable file")
+        if isinstance(poll_interval, bool) or not isinstance(poll_interval, Real) or poll_interval <= 0:
+            raise NodeValidationError("SSH tunnel poll interval must be positive")
+        self.node = node
+        self.timeout = min(float(timeout), MAX_PROBE_TIMEOUT * 6)
+        self.ssh_binary = str(ssh_path)
+        self._process_factory = process_factory or subprocess.Popen
+        self._connect = connect or socket.create_connection
+        self._rpc_probe = rpc_probe or probe_rpc
+        if listener_owner is None and not Path("/proc/net/tcp").exists():
+            raise NodeSecurityError(
+                "managed SSH tunnel requires Linux /proc socket ownership checks",
+                hint="Provide an explicit listener ownership verifier on unsupported platforms.",
+            )
+        self._listener_owner = listener_owner or self._listener_owned_by_process
+        self.poll_interval = min(float(poll_interval), 1.0)
+        self.process: Any | None = None
+        self.local_port: int | None = None
+        self.known_hosts_path: Path | None = None
+        self.argv: tuple[str, ...] = ()
+
+    @staticmethod
+    def _listener_owned_by_process(port: int, pid: int) -> bool:
+        """Check Linux socket inode ownership to close the local-port race."""
+
+        if not isinstance(pid, int) or pid <= 1 or not Path("/proc/net/tcp").exists():
+            return False
+        inodes: set[str] = set()
+        for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+            try:
+                lines = table.read_text(encoding="ascii").splitlines()[1:]
+            except (OSError, UnicodeError):
+                continue
+            for line in lines:
+                fields = line.split()
+                if len(fields) < 10 or fields[3] != "0A":
+                    continue
+                try:
+                    local_port = int(fields[1].rsplit(":", 1)[1], 16)
+                except (IndexError, ValueError):
+                    continue
+                if local_port == port:
+                    inodes.add(fields[9])
+        if not inodes:
+            return False
+        fd_dir = Path(f"/proc/{pid}/fd")
+        try:
+            descriptors = tuple(fd_dir.iterdir())
+        except OSError:
+            return False
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in inodes:
+                return True
+        return False
+
+    @property
+    def endpoint(self) -> str:
+        if self.local_port is None:
+            raise SshTunnelError("SSH tunnel has not been started")
+        return f"127.0.0.1:{self.local_port}"
+
+    def _allocate_port(self) -> int:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+        finally:
+            sock.close()
+
+    def _write_known_hosts(self) -> Path:
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="kestrel-known-hosts-", suffix=".tmp", delete=False
+        )
+        try:
+            handle.write(f"kestrel-node-{self.node.name} {self.node.ssh_host_key}\n")
+        finally:
+            handle.close()
+        path = Path(handle.name)
+        path.chmod(0o600)
+        return path
+
+    def _secure_identity_path(self) -> str:
+        path = Path(self.node.ssh_identity_file or "").expanduser()
+        try:
+            stat_result = path.stat()
+        except OSError as exc:
+            raise SshTunnelError("SSH identity file is unavailable") from exc
+        if not path.is_absolute() or not path.is_file() or path.is_symlink() or stat_result.st_mode & 0o077:
+            raise NodeSecurityError(
+                "SSH identity file must be an absolute, regular, non-symlink file with mode 0600 or stricter",
+                hint="Use a user-owned absolute key file with chmod 600 or stricter.",
+            )
+        if hasattr(os, "getuid") and stat_result.st_uid != os.getuid():
+            raise NodeSecurityError("SSH identity file must be owned by the current user")
+        parent = path.parent
+        try:
+            parent_stat = parent.stat()
+        except OSError as exc:
+            raise SshTunnelError("SSH identity file parent directory is unavailable") from exc
+        if parent_stat.st_mode & 0o022:
+            raise NodeSecurityError("SSH identity file parent directory must not be group/world writable")
+        if hasattr(os, "getuid") and parent_stat.st_uid != os.getuid():
+            raise NodeSecurityError("SSH identity file parent directory must be owned by the current user")
+        return str(path)
+
+    def _command(self, local_port: int, known_hosts: Path) -> tuple[str, ...]:
+        identity = self._secure_identity_path()
+        destination = f"{self.node.ssh_user}@{self.node.ssh_host}"
+        return (
+            self.ssh_binary,
+            "-N",
+            "-T",
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "IdentitiesOnly=yes",
+            "-o",
+            "IdentityAgent=none",
+            "-o",
+            "AddKeysToAgent=no",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            f"HostKeyAlias=kestrel-node-{self.node.name}",
+            "-o",
+            f"UserKnownHostsFile={known_hosts}",
+            "-o",
+            "GlobalKnownHostsFile=/dev/null",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ForwardX11=no",
+            "-o",
+            "PermitLocalCommand=no",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            f"ConnectTimeout={max(1, math.ceil(self.timeout))}",
+            "-p",
+            str(self.node.ssh_port),
+            "-i",
+            identity,
+            "-L",
+            f"127.0.0.1:{local_port}:127.0.0.1:{self.node.remote_rpc_port}",
+            destination,
+        )
+
+    def _redact_detail(self, detail: str) -> str:
+        """Keep SSH diagnostics useful without disclosing credential paths."""
+
+        secrets = {str(Path(self.node.ssh_identity_file or "").expanduser())}
+        if self.known_hosts_path is not None:
+            secrets.add(str(self.known_hosts_path))
+        for secret in secrets:
+            if secret:
+                detail = detail.replace(secret, "<redacted>")
+        return detail
+
+    def _wait_ready(self, deadline: float) -> None:
+        last_rpc_error = ""
+        while time.monotonic() < deadline:
+            if self.process is None:
+                raise SshTunnelError("SSH tunnel process disappeared during startup")
+            return_code = self.process.poll()
+            if return_code is not None:
+                detail = self._redact_detail(_safe_process_detail(self.process))
+                if "host key" in detail.lower() or "fingerprint" in detail.lower() or "verification" in detail.lower():
+                    raise NodeSecurityError(
+                        "SSH host-key verification failed",
+                        hint="Refresh the pinned ssh_host_key only after verifying the worker identity out of band.",
+                    )
+                raise SshTunnelError(
+                    f"SSH tunnel exited during startup with status {return_code}" + (f": {detail}" if detail else "")
+                )
+            try:
+                probe_socket = self._connect(("127.0.0.1", self.local_port), timeout=min(self.poll_interval, 0.2))
+            except OSError:
+                time.sleep(self.poll_interval)
+                continue
+            else:
+                try:
+                    probe_socket.close()
+                except OSError:
+                    pass
+                if self.process.poll() is not None:
+                    continue
+                try:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    result = self._rpc_probe(self.endpoint, timeout=min(1.0, max(0.25, remaining)))
+                except (OSError, NodeError, ValueError) as exc:
+                    last_rpc_error = str(exc)
+                    time.sleep(self.poll_interval)
+                    continue
+                if (
+                    getattr(result, "usable", False)
+                    and self.process.poll() is None
+                    and self._listener_owner(self.local_port, getattr(self.process, "pid", -1))
+                ):
+                    return
+                last_rpc_error = getattr(result, "error", None) or "RPC protocol/device probe failed"
+                time.sleep(self.poll_interval)
+        suffix = f": {last_rpc_error}" if last_rpc_error else ""
+        raise SshTunnelError(f"SSH tunnel did not become ready before timeout{suffix}")
+
+    def start(self) -> "SshTunnel":
+        if self.process is not None:
+            raise SshTunnelError("SSH tunnel is already started")
+        local_port = self._allocate_port()
+        known_hosts: Path | None = None
+        try:
+            known_hosts = self._write_known_hosts()
+            self.local_port = local_port
+            self.known_hosts_path = known_hosts
+            self.argv = self._command(local_port, known_hosts)
+            self.process = self._process_factory(
+                list(self.argv),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+                close_fds=True,
+            )
+            self._wait_ready(time.monotonic() + self.timeout)
+            return self
+        except NodeError:
+            self.close()
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.close()
+            raise SshTunnelError(f"unable to start SSH tunnel: {exc}") from exc
+        except BaseException:
+            self.close()
+            raise
+        finally:
+            if known_hosts is not None and self.known_hosts_path is None:
+                try:
+                    known_hosts.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def close(self) -> None:
+        process, self.process = self.process, None
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    pid = getattr(process, "pid", None)
+                    if isinstance(pid, int) and pid > 1 and hasattr(os, "killpg"):
+                        try:
+                            os.killpg(os.getpgid(pid), 15)
+                        except OSError:
+                            process.terminate()
+                    else:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        pid = getattr(process, "pid", None)
+                        if isinstance(pid, int) and pid > 1 and hasattr(os, "killpg"):
+                            try:
+                                os.killpg(os.getpgid(pid), 9)
+                            except OSError:
+                                process.kill()
+                        else:
+                            process.kill()
+                        process.wait(timeout=2.0)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            for stream_name in ("stdout", "stderr"):
+                stream = getattr(process, stream_name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        known_hosts, self.known_hosts_path = self.known_hosts_path, None
+        if known_hosts is not None:
+            try:
+                known_hosts.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self.local_port = None
+
+    def __enter__(self) -> "SshTunnel":
+        return self.start()
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
+        self.close()
 
 
 def probe_reachability(
@@ -561,7 +1113,7 @@ def plan_placement(
         raise NodeValidationError("placement nodes must be Node objects")
     if len({node.name for node in candidates}) != len(candidates):
         raise NodeValidationError("placement nodes contain duplicate names")
-    if len({node.rpc_endpoint for node in candidates}) != len(candidates):
+    if len({_node_identity(node) for node in candidates}) != len(candidates):
         raise NodeValidationError("placement nodes contain duplicate endpoints")
     selected: list[Node] = []
     live_memory: dict[str, tuple[Real, ...]] = {}
@@ -646,6 +1198,7 @@ def resolve_node_plan(
     local_engine_commit: str | None = None,
     expected_engine: EngineProvenance | Mapping[str, str | None] | tuple[str, str] | str | None = None,
     timeout: float = 1.0,
+    endpoint_overrides: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve selected inventory entries using RPC protocol preflight.
 
@@ -673,12 +1226,18 @@ def resolve_node_plan(
         raise NodePlanningError("selected inventory contains no enabled RPC nodes")
     results: dict[str, RpcProbeResult] = {}
     failures: list[str] = []
+    runtime_nodes: list[Node] = []
     for item in selected:
         if not item.enabled:
             if selector != "all":
                 failures.append(f"{item.name}: node is disabled")
             continue
-        result = probe_rpc(item, timeout=timeout, allow_insecure_direct_rpc=allow_insecure_rpc)
+        override = endpoint_overrides.get(item.name) if endpoint_overrides else None
+        runtime_item = replace(item, endpoint=override) if override else item
+        if override:
+            _check_endpoint_security(runtime_item.parsed_endpoint, allow_insecure_direct_rpc=allow_insecure_rpc)
+        runtime_nodes.append(runtime_item)
+        result = probe_rpc(runtime_item, timeout=timeout, allow_insecure_direct_rpc=allow_insecure_rpc)
         results[item.name] = result
         if not result.usable:
             if result.error:
@@ -696,7 +1255,7 @@ def resolve_node_plan(
         )
     plan = plan_placement(
         local_free_vram_mib,
-        selected,
+        runtime_nodes,
         allow_insecure_direct_rpc=allow_insecure_rpc,
         expected_engine=expected_engine,
         local_engine_version=local_engine_version,
@@ -714,9 +1273,12 @@ def resolve_node_plan(
         for name, result in sorted(results.items())
     }
     active = [item for item in selected if item.enabled]
+    endpoint_by_name = {item.name: item.rpc_endpoint for item in runtime_nodes}
     return {
         "status": "planned",
-        "nodes": [dict(item.as_dict(), rpc_endpoint=item.rpc_endpoint) for item in active],
+        "nodes": [
+            dict(item.as_dict(), rpc_endpoint=endpoint_by_name.get(item.name, item.rpc_endpoint)) for item in active
+        ],
         "rpc_endpoints": list(plan.rpc_endpoints),
         "tensor_split": plan.tensor_split_arg,
         "tensor_split_ratios": plan.tensor_split,
@@ -746,6 +1308,8 @@ __all__ = [
     "RPC_PROTO_MINOR_VERSION",
     "RPC_PROTO_PATCH_VERSION",
     "RpcProbeResult",
+    "SshTunnel",
+    "SshTunnelError",
     "format_endpoint",
     "is_loopback_host",
     "node_store_path",

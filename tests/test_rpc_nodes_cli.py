@@ -8,7 +8,7 @@ import pytest
 
 from kestrel import engine
 from kestrel.backends.llama_cpp import LlamaCppBackend, LlamaCppCapabilities
-from kestrel.cli import parser, runtime
+from kestrel.cli import parser, run, runtime
 from kestrel.errors import BackendError, InputError
 
 
@@ -43,6 +43,15 @@ def test_node_plan_requires_loopback_or_explicit_override(monkeypatch):
     import kestrel
 
     class FakeNodes:
+        class NodeStore:
+            def __init__(self, **_kwargs):
+                pass
+
+            def load(self):
+                return ()
+
+        SshTunnel = object
+
         @staticmethod
         def resolve_node_plan(**_kwargs):
             return {"nodes": [{"name": "lan", "rpc_endpoint": "10.0.0.2:50052"}]}
@@ -62,3 +71,14 @@ def test_engine_selects_legacy_rpc_target_without_substring_match(tmp_path):
     rpc.mkdir(parents=True)
     (rpc / "CMakeLists.txt").write_text("set(TARGET ggml-rpc-server)\n")
     assert engine._rpc_target_for_source(str(source)) == "ggml-rpc-server"
+
+
+@pytest.mark.parametrize(("handler", "inner"), [(run.cmd_run, "_cmd_run_live"), (run.cmd_serve, "_cmd_serve_live")])
+def test_managed_tunnels_close_when_run_or_serve_is_interrupted(monkeypatch, handler, inner):
+    args = SimpleNamespace()
+    closed = []
+    monkeypatch.setattr(run, inner, lambda _args: (_ for _ in ()).throw(KeyboardInterrupt()))
+    monkeypatch.setattr(runtime, "_close_node_tunnels", lambda value: closed.append(value))
+    with pytest.raises(KeyboardInterrupt):
+        handler(args)
+    assert closed == [args]

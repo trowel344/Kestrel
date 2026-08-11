@@ -1,0 +1,46 @@
+[Unit]
+Description=Kestrel llama.cpp RPC worker (loopback only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kestrel-rpc
+Group=kestrel-rpc
+WorkingDirectory=/opt/kestrel/llama.cpp
+# Keep upstream's unauthenticated protocol inaccessible to the network. The
+# coordinator reaches this port through an SSH local forward.
+ExecStart=/opt/kestrel/llama.cpp/build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+TasksMax=256
+LimitNOFILE=1024
+DevicePolicy=closed
+# Add only the GPU device nodes needed by this host, for example:
+# DeviceAllow=/dev/nvidia0 rwm
+# DeviceAllow=/dev/nvidiactl rwm
+# DeviceAllow=/dev/nvidia-uvm rwm
+
+[Install]
+WantedBy=multi-user.target

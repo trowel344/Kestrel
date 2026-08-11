@@ -13,9 +13,11 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from typing import TextIO
 from urllib.parse import urlsplit
 
+from .. import nodes
 from ..backends.llama_cpp import LlamaCppBackend
 from ..errors import BackendError, InputError
 from . import probes, state
@@ -80,7 +82,7 @@ def _node_plan_payload(plan: dict | None) -> dict:
             nodes.append(
                 {
                     key: node[key]
-                    for key in ("name", "rpc_endpoint", "endpoint", "status", "role", "vram_free_mb")
+                    for key in ("name", "rpc_endpoint", "endpoint", "status", "role", "transport", "vram_free_mb")
                     if key in node and isinstance(node[key], (str, int, float, bool, type(None)))
                 }
             )
@@ -169,16 +171,60 @@ def _resolve_node_plan(args) -> dict:
             "installed node inventory cannot perform an RPC protocol preflight",
             hint="update Kestrel before using distributed nodes",
         )
-    local_capacities, local_commit = _local_node_inputs(args)
-    raw = resolver(
-        names=names,
-        selector=selector,
-        allow_insecure_rpc=allow_insecure,
-        local_free_vram_mib=local_capacities,
-        local_engine_commit=local_commit,
-        expected_engine={"commit": local_commit},
+    # Open pinned SSH forwards before the protocol resolver probes them.  The
+    # resolver receives an in-memory inventory whose managed endpoints are the
+    # newly allocated loopback ports; llama.cpp sees only those ports and no
+    # SSH credentials. The ExitStack is closed by run/serve in every path.
+    inventory_store = nodes.NodeStore(allow_insecure_direct_rpc=allow_insecure)
+    inventory = inventory_store.load()
+    selected_names = set(names)
+    if selector == "all":
+        selected_names = {item.name for item in inventory}
+    elif selector:
+        selected_names.update(item for item in selector.split(",") if item)
+    stack = ExitStack()
+    endpoint_overrides: dict[str, str] = {}
+    active_tunnels: dict[str, nodes.SshTunnel] = {}
+    managed_names: set[str] = set()
+    try:
+        for item in inventory:
+            if item.name not in selected_names or not item.managed or not item.enabled:
+                continue
+            tunnel = stack.enter_context(nodes.SshTunnel(item))
+            endpoint_overrides[item.name] = tunnel.endpoint
+            active_tunnels[item.name] = tunnel
+            managed_names.add(item.name)
+        args._ssh_tunnel_stack = stack
+    except BaseException:
+        stack.close()
+        raise
+
+    try:
+        local_capacities, local_commit = _local_node_inputs(args)
+        raw = resolver(
+            names=names,
+            selector=selector,
+            allow_insecure_rpc=allow_insecure,
+            local_free_vram_mib=local_capacities,
+            local_engine_commit=local_commit,
+            expected_engine={"commit": local_commit},
+            store=inventory_store,
+            endpoint_overrides=endpoint_overrides,
+        )
+    except BaseException:
+        _close_node_tunnels(args)
+        raise
+    dead = sorted(
+        name for name, tunnel in active_tunnels.items() if tunnel.process is None or tunnel.process.poll() is not None
     )
+    if dead:
+        _close_node_tunnels(args)
+        raise InputError(
+            f"managed SSH tunnel exited during node preflight: {', '.join(dead)}",
+            hint="inspect SSH authentication and the pinned worker host key",
+        )
     if not isinstance(raw, dict):
+        _close_node_tunnels(args)
         raise InputError("node inventory returned an invalid placement plan")
     plan = dict(raw)
     plan["requested"] = True
@@ -191,17 +237,31 @@ def _resolve_node_plan(args) -> dict:
                 if endpoint:
                     endpoints.append(str(endpoint).strip())
     if not endpoints:
+        _close_node_tunnels(args)
         raise InputError("selected nodes have no usable llama.cpp RPC endpoints")
     if not getattr(args, "allow_insecure_rpc", False):
         unsafe = [endpoint for endpoint in endpoints if not _endpoint_is_loopback(endpoint)]
         if unsafe:
+            _close_node_tunnels(args)
             raise InputError(
                 "selected RPC nodes are not loopback endpoints",
                 hint="verify the nodes are protected by an authenticated tunnel, then pass --allow-insecure-rpc explicitly",
             )
     plan["rpc_endpoints"] = endpoints
+    for entry in plan.get("nodes") or []:
+        if isinstance(entry, dict) and entry.get("name") in managed_names:
+            entry["transport"] = "managed_ssh"
     plan.setdefault("status", "planned")
     return plan
+
+
+def _close_node_tunnels(args) -> None:
+    """Close all managed SSH forwards associated with a launch namespace."""
+
+    stack = getattr(args, "_ssh_tunnel_stack", None)
+    args._ssh_tunnel_stack = None
+    if stack is not None:
+        stack.close()
 
 
 def _annotate_node_model_fit(plan: dict | None, model_info: dict) -> dict:

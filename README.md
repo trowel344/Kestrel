@@ -128,20 +128,45 @@ an authenticated SSH tunnel:
 ```bash
 # Worker: never bind this unauthenticated service to 0.0.0.0.
 ./build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052
+# From a trusted console, copy the key type and base64 data (not the comment)
+# from /etc/ssh/ssh_host_ed25519_key.pub for --host-key below.
 
-# Coordinator: keep this tunnel open (host-key checking remains enabled).
-ssh -N -L 50052:127.0.0.1:50052 user@worker
-
-# Record the worker's exact llama.cpp commit, inspect it, then run.
+# Record the worker's exact llama.cpp commit, inspect it, then register a
+# managed tunnel. Kestrel launches and supervises the SSH forward for the
+# complete run/serve lifetime; the llama.cpp child receives only a temporary
+# loopback RPC endpoint and never receives the key path or host-key material.
 kestrel nodes add worker --endpoint 127.0.0.1:50052 \
-  --memory-mib 8192 --engine-commit "$(git -C /path/to/llama.cpp rev-parse HEAD)"
+  --memory-mib 8192 --engine-commit "$(git -C /path/to/llama.cpp rev-parse HEAD)" \
+  --ssh-host worker --ssh-user kestrel \
+  --identity-file /absolute/path/.ssh/kestrel_worker \
+  --host-key "ssh-ed25519 AAAA..." \
+  --remote-rpc-port 50052
 kestrel nodes doctor worker
 kestrel nodes plan /models/model.gguf --node worker --json
 kestrel run /models/model.gguf --node worker
 ```
 
-`nodes doctor` proves that the endpoint speaks a compatible RPC protocol and
-reports its live devices/memory. It does not authenticate the remote machine.
+Managed SSH requires an absolute private-key file owned by the current user
+with mode `0600` or stricter and a pinned public host key. Kestrel writes a
+short-lived restricted `known_hosts` file, uses `BatchMode=yes`,
+`IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`, and `ExitOnForwardFailure=yes`,
+then tears down the whole SSH process group on normal exit, failure, or
+Ctrl-C. Verify the host key out of band before recording it. A node's
+`ssh_host`, user, and port are safe status metadata; private-key paths and key
+material are deliberately omitted from JSON reports.
+
+Managed tunnel supervision currently requires a Linux coordinator because it
+uses `/proc` socket ownership checks to ensure the forwarded loopback listener
+actually belongs to the SSH child it launched.
+
+For disposable manual tunnels, the older `ssh -N -L ...` workflow still works
+with a direct loopback node entry, but Kestrel cannot supervise that external
+process. Prefer managed SSH for `run`, `chat`, and `serve`.
+
+For managed nodes, SSH authenticates the pinned worker host before `nodes
+doctor` proves that the forwarded endpoint speaks a compatible RPC protocol
+and reports its live devices/memory. A direct/manual node has no equivalent
+Kestrel-managed transport authentication.
 Kestrel also fails closed when the configured worker commit differs from the
 coordinator engine. `nodes plan` reports a coarse weights-only accelerator fit;
 it is evidence, not a guarantee that the full inference working set fits.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from contextlib import contextmanager
 
 from kestrel import nodes
 from kestrel.cli import nodes as node_commands
@@ -64,6 +65,63 @@ def test_nodes_rejects_direct_lan_by_default(tmp_path, monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert status != 0
     assert payload["error"]["code"] == "node_security_error"
+
+
+def test_nodes_add_managed_ssh_persists_only_pinned_worker_metadata(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KESTREL_CONFIG", str(tmp_path / "config.toml"))
+    status = _dispatch(
+        [
+            "nodes",
+            "add",
+            "worker",
+            "--endpoint",
+            "127.0.0.1:50052",
+            "--memory-mib",
+            "8192",
+            "--engine-commit",
+            "a" * 40,
+            "--ssh-host",
+            "worker.example",
+            "--ssh-user",
+            "kestrel",
+            "--identity-file",
+            "/home/user/.ssh/kestrel_worker",
+            "--host-key",
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA==",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert status == 0
+    assert payload["node"]["ssh_host"] == "worker.example"
+    assert payload["node"]["remote_rpc_port"] == 50052
+    serialized = json.dumps(payload)
+    assert "known_hosts" not in serialized
+    assert "/home/user/.ssh/kestrel_worker" not in serialized
+    assert "AAAAC3NzaC1lZDI1NTE5" not in serialized
+
+
+def test_nodes_add_rejects_partial_managed_ssh_configuration(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("KESTREL_CONFIG", str(tmp_path / "config.toml"))
+    status = _dispatch(
+        [
+            "nodes",
+            "add",
+            "worker",
+            "--endpoint",
+            "127.0.0.1:50052",
+            "--memory-mib",
+            "8192",
+            "--engine-commit",
+            "a" * 40,
+            "--ssh-host",
+            "worker.example",
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert status != 0
+    assert payload["error"]["code"] == "invalid_input"
 
 
 def test_nodes_plan_empty_inventory_is_typed_failure(tmp_path, monkeypatch, capsys):
@@ -140,6 +198,53 @@ def test_nodes_plan_single_node_does_not_implicitly_select_all(monkeypatch, caps
     capsys.readouterr()
     assert captured["names"] == ["only"]
     assert captured["selector"] is None
+
+
+def test_nodes_plan_defaults_to_all_managed_inventory(monkeypatch, capsys):
+    managed = nodes.Node(
+        "worker",
+        "127.0.0.1:50052",
+        1024,
+        engine_commit="a" * 40,
+        ssh_host="worker.example",
+        ssh_user="kestrel",
+        ssh_identity_file="/home/user/.ssh/worker",
+        ssh_host_key="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA==",
+        remote_rpc_port=50052,
+    )
+
+    class Store:
+        def load(self):
+            return (managed,)
+
+    captured = {}
+
+    @contextmanager
+    def tunnels(entries, timeout):
+        captured["tunnel_names"] = [item.name for item in entries]
+        yield tuple(entries)
+
+    def resolve(**kwargs):
+        captured["selector"] = kwargs["selector"]
+        return {
+            "status": "planned",
+            "nodes": [{"name": "worker", "endpoint": "127.0.0.1:50052"}],
+            "rpc_endpoints": ["127.0.0.1:50052"],
+            "tensor_split": "0.5,0.5",
+            "device_order": ["local:0", "worker:0"],
+            "capacities_mib": [1024, 1024],
+            "total_capacity_mib": 2048,
+            "total_devices": 2,
+            "probe_evidence": {},
+        }
+
+    monkeypatch.setattr(node_commands, "_store", lambda _args: Store())
+    monkeypatch.setattr(node_commands, "_local_provenance", lambda: ([1024], "a" * 40))
+    monkeypatch.setattr(node_commands, "_with_tunnels", tunnels)
+    monkeypatch.setattr(nodes, "resolve_node_plan", resolve)
+    assert _dispatch(["nodes", "plan", "--json"]) == 0
+    capsys.readouterr()
+    assert captured == {"tunnel_names": ["worker"], "selector": "all"}
 
 
 def test_nodes_parser_rejects_bad_name_as_one_json_document(capsys):

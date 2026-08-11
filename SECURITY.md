@@ -40,11 +40,43 @@ worker as fully trusted: it receives model data and participates in inference.
 Kestrel does not discover LAN workers, start remote daemons, install SSH keys,
 or make an exposed RPC socket safe.
 
-The supported default is a worker bound to `127.0.0.1` and an authenticated
-SSH local-forward whose coordinator endpoint is also loopback. Keep ordinary
-SSH host-key checking enabled. Never expose a worker on `0.0.0.0`, the public
-internet, or an untrusted shared network. `--allow-insecure-rpc` is an explicit
-experimental escape hatch, not a security control.
+The supported default is a worker bound to `127.0.0.1` and a Kestrel-managed,
+authenticated SSH local-forward whose coordinator endpoint is also loopback.
+Managed nodes require an explicitly pinned public host key and a current-user,
+0600-or-stricter identity file. Kestrel uses an argument vector (never a shell),
+`BatchMode`, `IdentitiesOnly`, `StrictHostKeyChecking`, and
+`ExitOnForwardFailure`; it supervises and reaps the tunnel for the complete
+llama.cpp child lifetime. Private-key paths and key material are not passed to
+llama.cpp or emitted in node JSON. Managed mode currently requires a Linux
+coordinator so Kestrel can verify the listening socket belongs to its SSH
+child through `/proc` rather than trusting a pre-existing local listener.
+
+Verify a worker host key out of band before registering it. Never expose a
+worker on `0.0.0.0`, the public internet, or an untrusted shared network.
+`--allow-insecure-rpc` is an explicit experimental escape hatch, not a
+security control, and managed SSH is not a hostile-worker solution: the worker
+receives model data and can return incorrect or malicious protocol responses.
+
+The repository includes a starting-point
+[`contrib/kestrel-rpc-worker.service`](contrib/kestrel-rpc-worker.service)
+unit. Install it only after replacing the paths and allowing the exact GPU
+device nodes for the worker. Create a dedicated account with no sudo access,
+disable SSH agent forwarding, and keep the private key on the coordinator.
+The unit is sandbox guidance, not a universal production profile; validate it
+with the installed CUDA/ROCm driver and your local llama.cpp build.
+
+Restrict the coordinator's authorized key as well. Obtain the worker host key
+from a trusted console—not an unauthenticated `ssh-keyscan` over the network.
+For OpenSSH, use an entry along the following lines (replace the key and
+account) and configure `sshd` with `AllowTcpForwarding local`:
+
+```text
+restrict,port-forwarding,permitopen="127.0.0.1:50052" ssh-ed25519 AAAA... kestrel-coordinator
+```
+
+This prevents the key used by Kestrel from becoming a general-purpose SSH
+forwarding credential. Keep the worker account free of sudo and do not enable
+agent forwarding.
 
 Before launch, Kestrel verifies a bounded RPC HELLO, protocol compatibility,
 device enumeration, live device memory, and the worker's configured pinned

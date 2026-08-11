@@ -16,6 +16,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a coarse weights-only capacity plan. JSON reports retain probe evidence,
   per-device order, and live capacities instead of equating TCP reachability
   with compatibility.
+- Managed node registration now supports pinned public host keys and
+  Kestrel-supervised SSH local forwards. SSH children use strict batch/key
+  checking, loopback-only ephemeral endpoints, process-group cleanup, and
+  never pass credentials to llama.cpp.
 
 ### Security
 

@@ -205,7 +205,7 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
     print(ui.box("Command", "\n".join(command_lines), title_color=ui.cyan), file=out)
 
 
-def cmd_run(args):
+def _cmd_run_live(args):
     prepared = _prepare_run_model(args)
     if prepared is None:
         return 0
@@ -292,6 +292,15 @@ def cmd_run(args):
     )
 
 
+def cmd_run(args):
+    """Run a model and always reap any managed SSH worker forwards."""
+
+    try:
+        return _cmd_run_live(args)
+    finally:
+        runtime._close_node_tunnels(args)
+
+
 cmd_chat = cmd_run
 
 
@@ -318,7 +327,7 @@ def _wait_server_process(proc) -> int:
         return 130
 
 
-def cmd_serve(args):
+def _cmd_serve_live(args):
     """Serve the planned model over an OpenAI-compatible llama-server endpoint."""
     if not args.model:
         args.model = parser._default_model(
@@ -452,3 +461,12 @@ def cmd_serve(args):
         result["exit_code"] = returncode
         return runtime._finish_json(args, result)
     raise SystemExit(returncode)
+
+
+def cmd_serve(args):
+    """Serve a model and always reap any managed SSH worker forwards."""
+
+    try:
+        return _cmd_serve_live(args)
+    finally:
+        runtime._close_node_tunnels(args)

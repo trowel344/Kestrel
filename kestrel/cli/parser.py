@@ -183,7 +183,7 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
     parser.add_argument(
         "--allow-insecure-rpc",
         action="store_true",
-        help="explicitly allow RPC to non-loopback endpoints; use only on a trusted network",
+        help="DEV-ONLY acknowledgement for unauthenticated RPC to non-loopback endpoints (never network-safe)",
     )
     parser.add_argument(
         "--prompt",
@@ -444,7 +444,7 @@ def build_parser():
         command_parser.add_argument(
             "--allow-insecure-rpc",
             action="store_true",
-            help="acknowledge unauthenticated direct RPC outside loopback (experimental and unsafe on open networks)",
+            help="DEV-ONLY acknowledgement for unauthenticated direct RPC outside loopback (never a network security control)",
         )
         _add_json_flag(command_parser)
 
@@ -459,6 +459,19 @@ def build_parser():
     nodes_add.add_argument("--engine-commit", required=True, help="worker llama.cpp git commit")
     nodes_add.add_argument("--model-hash", action="append", default=[], help="cached model SHA-256 (repeatable)")
     nodes_add.add_argument("--disabled", action="store_true")
+    nodes_add.add_argument("--ssh-host", help="worker SSH host; creates a managed loopback forward")
+    nodes_add.add_argument("--ssh-user", help="worker SSH user (required with --ssh-host)")
+    nodes_add.add_argument("--ssh-port", type=_port, default=22)
+    nodes_add.add_argument("--remote-rpc-port", type=_port, default=None)
+    nodes_add.add_argument(
+        "--identity-file", dest="ssh_identity_file", help="absolute SSH private-key path (passed only to ssh)"
+    )
+    nodes_add.add_argument(
+        "--host-key",
+        dest="ssh_host_key",
+        required=False,
+        help="pinned OpenSSH public host key (for example ssh-ed25519 AAAA...)",
+    )
     add_node_common(nodes_add)
     nodes_remove = nodes_sub.add_parser("remove", help="Remove a named RPC worker")
     nodes_remove.add_argument("name", type=_node_name)
