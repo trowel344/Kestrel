@@ -198,7 +198,10 @@ def test_managed_inventory_rejects_live_symlink_even_when_referent_is_private(tm
 def test_managed_inventory_rejects_writable_parent_directory(tmp_path):
     identity = _identity(tmp_path)
     shared = tmp_path / "shared"
-    shared.mkdir(mode=0o770)
+    shared.mkdir()
+    # CI runners may apply a restrictive umask to mkdir(mode=...), which would
+    # accidentally make this attack fixture safe on macOS.
+    shared.chmod(0o770)
 
     with pytest.raises(NodeSecurityError, match="directory must not be"):
         NodeStore(shared / "nodes.json").save([_node(str(identity))])
