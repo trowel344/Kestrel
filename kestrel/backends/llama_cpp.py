@@ -77,7 +77,10 @@ class LlamaCppCapabilities:
     version: str = "unknown"
 
     def supports(self, flag: str) -> bool:
-        return flag in self.help_text
+        # Avoid treating ``--rpc-server`` as support for ``--rpc`` (or
+        # ``--fit-target`` as support for ``--fit``). Capability gating must
+        # reflect the actual option exposed by this engine binary.
+        return re.search(rf"(?<![A-Za-z0-9_-]){re.escape(flag)}(?![A-Za-z0-9_-])", self.help_text) is not None
 
     @property
     def spec_types(self) -> set[str]:
@@ -185,6 +188,7 @@ class LlamaCppBackend:
         moe_cache: str = "auto",
         direct_io: bool = False,
         tensor_split: str | None = None,
+        rpc_endpoints: list[str] | tuple[str, ...] | None = None,
         extra_args: list[str] | None = None,
     ):
         self.model_path = model_path
@@ -205,6 +209,7 @@ class LlamaCppBackend:
         self.use_mlock = use_mlock
         self.direct_io = direct_io
         self.tensor_split = tensor_split
+        self.rpc_endpoints = tuple(str(endpoint).strip() for endpoint in (rpc_endpoints or ()) if str(endpoint).strip())
         self.extra_args = list(extra_args or ())
         self.n_threads = max(0, n_threads)
         self.moe_cache = moe_cache
@@ -302,6 +307,16 @@ class LlamaCppBackend:
             args.append("--no-mmap")
         if self.tensor_split and caps.supports("--tensor-split"):
             args += ["--tensor-split", self.tensor_split]
+        if self.rpc_endpoints:
+            # RPC is an explicit distributed execution request. Never drop it
+            # when an older llama.cpp is selected: silently falling back to a
+            # local-only launch can load the wrong placement or OOM.
+            if not caps.supports("--rpc"):
+                raise BackendError(
+                    "selected llama.cpp engine does not support RPC nodes",
+                    hint="rebuild the engine with -DGGML_RPC=ON or remove --node/--nodes",
+                )
+            args += ["--rpc", ",".join(self.rpc_endpoints)]
         if self.use_mlock and caps.supports("--mlock"):
             args.append("--mlock")
         if self.fit and caps.supports("--fit"):

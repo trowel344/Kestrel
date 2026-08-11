@@ -87,6 +87,9 @@ def _prepare_run_model(args):
 
     gpu_info = probes.detect_gpu()
     args._gpu = gpu_info
+    # Resolve node placement before command construction. A requested node
+    # must become an explicit RPC endpoint or produce a typed error.
+    args._node_plan = runtime._resolve_node_plan(args)
     out = runtime._human_stream(args)
     print(ui.kv("Model", args.model, value_color=ui.bold), file=out)
     if gpu_info:
@@ -102,6 +105,7 @@ def _prepare_run_model(args):
         print(ui.kv("GPU", "not detected; planning a CPU-compatible launch", value_color=ui.yellow), file=out)
 
     model_info = model_source._ensure_local_gguf(model_info, args)
+    args._node_plan = runtime._annotate_node_model_fit(args._node_plan, model_info)
 
     config = planning.estimate_config(model_info, gpu_info, args)
     return model_info, config
@@ -132,6 +136,12 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
             f"{config['moe_cache']} ({config['moe_cache_budget_mib']} MiB budget)",
         ),
     ]
+    node_plan = runtime._node_plan_payload(getattr(args, "_node_plan", None))
+    if node_plan["requested"]:
+        plan_lines.append(ui.kv("Nodes", ", ".join(node.get("name", "?") for node in node_plan["nodes"]) or "selected"))
+        plan_lines.append(ui.kv("RPC", ",".join(node_plan["rpc_endpoints"])))
+        if node_plan.get("tensor_split"):
+            plan_lines.append(ui.kv("Tensor split", str(node_plan["tensor_split"])))
     if hot_model_path:
         plan_lines.append(ui.kv("MoE Q4 hot sidecar", hot_model_path))
     if cold_model_path:
@@ -246,6 +256,7 @@ def cmd_run(args):
                 "dry_run": True,
                 "model_path": model_info["path"],
                 "command": cmd,
+                "nodes": runtime._node_plan_payload(getattr(args, "_node_plan", None)),
             },
         )
     if args.prompt:
@@ -271,7 +282,14 @@ def cmd_run(args):
         env=run_env,
         stdout=runtime._human_stream(args) if args.json else None,
     )
-    return runtime._finish_json(args, {"model": args.model, "exit_code": rc})
+    return runtime._finish_json(
+        args,
+        {
+            "model": args.model,
+            "exit_code": rc,
+            "nodes": runtime._node_plan_payload(getattr(args, "_node_plan", None)),
+        },
+    )
 
 
 cmd_chat = cmd_run
@@ -328,6 +346,7 @@ def cmd_serve(args):
 
     gpu_info = probes.detect_gpu()
     args._gpu = gpu_info
+    args._node_plan = runtime._resolve_node_plan(args)
     config = planning.estimate_config(model_info, gpu_info, args)
     cmd = runtime._build_server_cmd(model_info, config, args)
     host = args.host
@@ -344,6 +363,24 @@ def cmd_serve(args):
                     ui.kv("Context", f"{config['context_size']} ({config['context_reason']})"),
                     ui.kv("GPU layers", str(config["gpu_layers"])),
                     ui.kv("CPU MoE", "enabled" if config["cpu_moe"] else "disabled"),
+                    *(
+                        [
+                            ui.kv(
+                                "Nodes",
+                                ", ".join(
+                                    node.get("name", "?")
+                                    for node in runtime._node_plan_payload(args._node_plan)["nodes"]
+                                )
+                                or "selected",
+                            ),
+                            ui.kv(
+                                "RPC",
+                                ",".join(runtime._node_plan_payload(args._node_plan)["rpc_endpoints"]),
+                            ),
+                        ]
+                        if runtime._node_plan_payload(args._node_plan)["requested"]
+                        else []
+                    ),
                     "",
                     "OpenAI-compatible endpoints: /v1/chat/completions, /v1/completions, /v1/models",
                     "Press Ctrl+C to stop the server.",
@@ -362,6 +399,7 @@ def cmd_serve(args):
                 "dry_run": True,
                 "url": f"http://{host}:{port}",
                 "command": cmd,
+                "nodes": runtime._node_plan_payload(getattr(args, "_node_plan", None)),
             },
         )
     if not args.wait and not getattr(args, "json", False):
@@ -376,6 +414,7 @@ def cmd_serve(args):
         "host": host,
         "port": port,
         "command": cmd,
+        "nodes": runtime._node_plan_payload(getattr(args, "_node_plan", None)),
     }
     timeout = float(args.wait) if args.wait else 30.0
     print(

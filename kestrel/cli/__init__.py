@@ -21,6 +21,7 @@ from . import (  # module references (``cli.probes`` etc.) resolve here
     menu,
     model_source,
     models,
+    nodes,
     parser,
     planning,
     probes,
@@ -75,6 +76,7 @@ from .models import (
     _models_search,
     cmd_models,
 )
+from .nodes import cmd_nodes
 from .parser import (
     _add_json_flag,
     _add_local_run_options,
@@ -131,6 +133,7 @@ __all__ = [
     "menu",
     "model_source",
     "models",
+    "nodes",
     "parser",
     "planning",
     "probes",
@@ -181,6 +184,7 @@ __all__ = [
     "_models_recommend",
     "_models_search",
     "cmd_models",
+    "cmd_nodes",
     "_add_json_flag",
     "_add_local_run_options",
     "_default_model",

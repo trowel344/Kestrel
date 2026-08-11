@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -24,9 +25,11 @@ from .errors import EngineError
 DEFAULT_CMAKE_FLAGS = [
     "-DLLAMA_CUDA=ON",
     "-DLLAMA_CUDA_NVFP4=ON",
+    "-DGGML_RPC=ON",
     "-DCMAKE_BUILD_TYPE=Release",
 ]
-BUILD_TARGETS = ["llama-cli", "llama-server", "llama-bench"]
+BUILD_TARGETS = ["llama-cli", "llama-server", "llama-bench", "rpc-server"]
+RPC_TARGETS = ("rpc-server", "ggml-rpc-server")
 CONFIGURE_TIMEOUT_SECONDS = 10 * 60
 BUILD_TIMEOUT_SECONDS = 2 * 60 * 60
 MANIFEST_NAME = ".kestrel-engine.json"
@@ -70,6 +73,27 @@ def manifest_path(directory: str) -> Path:
     return Path(directory) / MANIFEST_NAME
 
 
+def _rpc_target_for_source(directory: str) -> str:
+    """Select the RPC target name used by this llama.cpp checkout.
+
+    Upstream renamed ``ggml-rpc-server`` to ``rpc-server`` across revisions;
+    passing both to CMake fails because one is necessarily unknown. Keep the
+    target in the manifest so rebuilds remain reproducible for that checkout.
+    """
+    rpc_cmake = Path(directory) / "tools" / "rpc" / "CMakeLists.txt"
+    try:
+        text = rpc_cmake.read_text(errors="strict")
+    except OSError:
+        text = ""
+    match = re.search(r"(?m)^\s*set\s*\(\s*TARGET\s+([A-Za-z0-9_-]+)\s*\)", text)
+    if match and match.group(1) in RPC_TARGETS:
+        return match.group(1)
+    for target in RPC_TARGETS:
+        if re.search(rf"add_executable\s*\(\s*{re.escape(target)}(?:\s|\))", text):
+            return target
+    return RPC_TARGETS[0]
+
+
 def load_manifest(directory: str) -> EngineManifest | None:
     path = manifest_path(directory)
     try:
@@ -77,13 +101,23 @@ def load_manifest(directory: str) -> EngineManifest | None:
     except (OSError, ValueError):
         return None
     try:
+        cmake_flags = list(payload.get("cmake_flags") or DEFAULT_CMAKE_FLAGS)
+        if "-DGGML_RPC=ON" not in cmake_flags:
+            cmake_flags.append("-DGGML_RPC=ON")
+        targets = list(payload.get("targets") or BUILD_TARGETS)
+        rpc_target = _rpc_target_for_source(directory)
+        old_rpc = next((target for target in RPC_TARGETS if target in targets), None)
+        if old_rpc is None:
+            targets.append(rpc_target)
+        elif old_rpc != rpc_target:
+            targets[targets.index(old_rpc)] = rpc_target
         return EngineManifest(
             remote=payload["remote"],
             branch=payload.get("branch"),
             commit=payload["commit"],
-            cmake_flags=payload.get("cmake_flags") or list(DEFAULT_CMAKE_FLAGS),
+            cmake_flags=cmake_flags,
             built_at=payload.get("built_at"),
-            targets=payload.get("targets") or list(BUILD_TARGETS),
+            targets=targets,
             artifacts=payload.get("artifacts") or {},
         )
     except KeyError as exc:
@@ -273,6 +307,7 @@ def adopt(directory: str, remote: str | None = None) -> EngineManifest:
         remote=resolved,
         branch=git_branch(directory),
         commit=commit,
+        targets=["llama-cli", "llama-server", "llama-bench", _rpc_target_for_source(directory)],
         built_at=None,
     )
     save_manifest(directory, manifest)

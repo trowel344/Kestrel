@@ -78,6 +78,19 @@ def _nonnegative_float(value: str) -> float:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return parsed
+
+
+def _node_name(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", value):
+        raise argparse.ArgumentTypeError("must be 1-128 letters, digits, '.', '-' or '_'")
+    return value
+
+
 def _gpu_layers(value: str) -> str:
     lowered = value.lower()
     if lowered in {"auto", "all"}:
@@ -100,6 +113,30 @@ def _tensor_split(value: str) -> str:
     if not ratios or any(not math.isfinite(item) or item < 0 for item in ratios) or sum(ratios) <= 0:
         raise argparse.ArgumentTypeError("must be comma-separated nonnegative numbers with a positive total")
     return value
+
+
+def _nodes_selector(value: str) -> str:
+    """Validate the compact node selector used by ``--nodes``.
+
+    ``all`` selects every node returned by the configured inventory. Otherwise
+    the value is a comma-separated list; ``--node`` remains the convenient
+    repeatable spelling for names containing no commas.
+    """
+    value = value.strip()
+    if not value:
+        raise argparse.ArgumentTypeError("must be 'all' or a comma-separated node name list")
+    names = [item.strip() for item in value.split(",")]
+    if any(not item for item in names):
+        raise argparse.ArgumentTypeError("must be 'all' or a comma-separated node name list")
+    if value.lower() == "all":
+        return "all"
+    if any(item.lower() == "all" for item in names):
+        raise argparse.ArgumentTypeError("'all' cannot be combined with named nodes")
+    if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", item) for item in names):
+        raise argparse.ArgumentTypeError("node names must use only letters, digits, '.', '-' or '_'")
+    if len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError("node names must not be repeated")
+    return ",".join(names)
 
 
 def _add_json_flag(parser):
@@ -129,6 +166,25 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
     parser.add_argument("--no-convert", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Print the validated command")
     _add_json_flag(parser)
+    parser.add_argument(
+        "--node",
+        action="append",
+        type=_node_name,
+        default=[],
+        metavar="NAME",
+        help="use a configured llama.cpp RPC node (repeatable; requires node inventory)",
+    )
+    parser.add_argument(
+        "--nodes",
+        type=_nodes_selector,
+        metavar="all|NAME[,NAME...]",
+        help="select all configured nodes or a comma-separated node set",
+    )
+    parser.add_argument(
+        "--allow-insecure-rpc",
+        action="store_true",
+        help="explicitly allow RPC to non-loopback endpoints; use only on a trusted network",
+    )
     parser.add_argument(
         "--prompt",
         help="run a one-shot, non-interactive generation with this prompt (otherwise launches the interactive CLI)",
@@ -377,6 +433,46 @@ def build_parser():
     models_import = models_sub.add_parser("import", help="reuse a local GGUF or Ollama blob")
     models_import.add_argument("source", help="local path or ollama://NAME")
     models_import.add_argument("--set-default", action="store_true")
+
+    nodes_group = sub.add_parser(
+        "nodes",
+        help="Manage experimental trusted llama.cpp RPC workers",
+    )
+    nodes_sub = nodes_group.add_subparsers(dest="nodes_command")
+
+    def add_node_common(command_parser):
+        command_parser.add_argument(
+            "--allow-insecure-rpc",
+            action="store_true",
+            help="acknowledge unauthenticated direct RPC outside loopback (experimental and unsafe on open networks)",
+        )
+        _add_json_flag(command_parser)
+
+    nodes_list = nodes_sub.add_parser("list", help="List configured RPC workers")
+    add_node_common(nodes_list)
+    nodes_add = nodes_sub.add_parser("add", help="Add or replace a named RPC worker")
+    nodes_add.add_argument("name", type=_node_name)
+    nodes_add.add_argument("--endpoint", required=True, help="loopback RPC endpoint, normally an SSH tunnel")
+    nodes_add.add_argument("--memory-mib", type=_nonnegative_int, required=True, help="advertised accelerator memory")
+    nodes_add.add_argument("--ram-mib", type=_nonnegative_int)
+    nodes_add.add_argument("--engine-version")
+    nodes_add.add_argument("--engine-commit", required=True, help="worker llama.cpp git commit")
+    nodes_add.add_argument("--model-hash", action="append", default=[], help="cached model SHA-256 (repeatable)")
+    nodes_add.add_argument("--disabled", action="store_true")
+    add_node_common(nodes_add)
+    nodes_remove = nodes_sub.add_parser("remove", help="Remove a named RPC worker")
+    nodes_remove.add_argument("name", type=_node_name)
+    add_node_common(nodes_remove)
+    nodes_doctor = nodes_sub.add_parser("doctor", help="Perform live RPC protocol and device preflight")
+    nodes_doctor.add_argument("name", nargs="*", type=_node_name, help="specific nodes (default: all)")
+    nodes_doctor.add_argument("--timeout", type=_positive_float, default=1.0)
+    add_node_common(nodes_doctor)
+    nodes_plan = nodes_sub.add_parser("plan", help="Probe nodes and show local plus remote tensor placement")
+    nodes_plan.add_argument("model", nargs="?", help="optional local model for a coarse weights-only fit comparison")
+    nodes_plan.add_argument("--node", action="append", type=_node_name, default=[])
+    nodes_plan.add_argument("--nodes", type=_nodes_selector, metavar="all|NAME[,NAME...]")
+    nodes_plan.add_argument("--timeout", type=_positive_float, default=1.0)
+    add_node_common(nodes_plan)
 
     build = sub.add_parser("build", help="Transactionally build llama.cpp with CUDA")
     build.add_argument("--dir", help="engine checkout (default: configured llama_cpp_dir)")

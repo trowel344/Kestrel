@@ -6,6 +6,24 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Experimental trusted RPC nodes**: strict atomic named-node inventory,
+  loopback/SSH-tunnel secure default, live ggml-rpc HELLO/device/memory
+  preflight, pinned engine-commit matching, and deterministic local-plus-remote
+  tensor split ordering for `run`, `chat`, and `serve`.
+- **`kestrel nodes`** commands for add/list/remove, protocol-aware doctor, and
+  a coarse weights-only capacity plan. JSON reports retain probe evidence,
+  per-device order, and live capacities instead of equating TCP reachability
+  with compatibility.
+
+### Security
+
+- Direct non-loopback llama.cpp RPC is rejected unless the user supplies the
+  explicit `--allow-insecure-rpc` acknowledgement. Documentation states that
+  upstream RPC has no authentication/encryption and recommends loopback-bound
+  workers carried through authenticated SSH tunnels.
+
 ## [1.6.0] - 2026-08-11
 
 The reliability and maintainability release: a modular CLI, deterministic

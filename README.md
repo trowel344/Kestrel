@@ -47,6 +47,10 @@ decisions visible through human and machine-readable CLI output.
   loads (opt-in; warm mmap reloads stay the default).
 - **Uses every GPU.** Multi-GPU rigs are detected and `--tensor-split` balances
   tensors across all of them; planning fits against combined VRAM.
+- **Can pool trusted machines (experimental).** Named llama.cpp RPC workers
+  extend the device list over loopback or authenticated SSH tunnels. Kestrel
+  verifies the RPC protocol, device count, live memory, and pinned engine
+  commit before it sends model data.
 - **Handles 100 GB+ models.** Split-GGUF shards are discovered as one model and
   sized across all shards; NVFP4 conversion compacts MoE experts to Q1/IQ1_S
   with optional MTP drafts.
@@ -84,6 +88,7 @@ kestrel benchmark   reproduce prompt/decode measurements
 kestrel evaluate    deterministic capability tests against llama-server
 kestrel optimize    create and optionally benchmark a hardware profile
 kestrel models      search, list, recommend, info, pull, import
+kestrel nodes       manage and preflight experimental trusted RPC workers
 kestrel convert     convert safetensors to GGUF (NVFP4 or --generic)
 kestrel audit       validate a GGUF against its source
 kestrel build       transactionally build llama.cpp with CUDA and rollback
@@ -101,10 +106,49 @@ kestrel self-update install a verified local checkout or checksummed wheel
 | `--kv-cache-type q8_0` | Quantized KV cache to stretch context under VRAM pressure. |
 | `--cpu-moe on` | Route MoE experts through CPU to keep the GPU dense-only. |
 | `--warm-cache` | Pre-read the model into the OS page cache before launch. |
+| `--node NAME` | Add a preconfigured, protocol-checked RPC worker to this run (repeatable). |
+| `--nodes all` | Use every enabled node in the local inventory. |
 
 `serve --embeddings` enables the `/v1/embeddings` endpoint for RAG workloads.
 `convert --generic` wraps llama.cpp's `convert_hf_to_gguf.py` so any Hugging
 Face safetensors model can become GGUF, not just the NVFP4 Qwen3.5 layout.
+
+## Experimental trusted nodes
+
+Nodes let one Kestrel coordinator use accelerator devices exposed by
+llama.cpp RPC workers. This is useful for fitting a model that is too large
+for one machine; it is not a general cluster scheduler and does not make raw
+RPC safe. llama.cpp still owns the final tensor, KV-cache, host-RAM, and disk
+placement.
+
+Build the same pinned llama.cpp revision on the coordinator and worker with
+`GGML_RPC=ON`. Start the worker bound to loopback, then carry that port through
+an authenticated SSH tunnel:
+
+```bash
+# Worker: never bind this unauthenticated service to 0.0.0.0.
+./build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052
+
+# Coordinator: keep this tunnel open (host-key checking remains enabled).
+ssh -N -L 50052:127.0.0.1:50052 user@worker
+
+# Record the worker's exact llama.cpp commit, inspect it, then run.
+kestrel nodes add worker --endpoint 127.0.0.1:50052 \
+  --memory-mib 8192 --engine-commit "$(git -C /path/to/llama.cpp rev-parse HEAD)"
+kestrel nodes doctor worker
+kestrel nodes plan /models/model.gguf --node worker --json
+kestrel run /models/model.gguf --node worker
+```
+
+`nodes doctor` proves that the endpoint speaks a compatible RPC protocol and
+reports its live devices/memory. It does not authenticate the remote machine.
+Kestrel also fails closed when the configured worker commit differs from the
+coordinator engine. `nodes plan` reports a coarse weights-only accelerator fit;
+it is evidence, not a guarantee that the full inference working set fits.
+
+Direct non-loopback RPC requires the loud `--allow-insecure-rpc` acknowledgement
+on both inventory and run commands. That escape hatch provides no encryption,
+authentication, or hostile-node isolation and is not recommended.
 
 ## Measure capability, not just speed
 
@@ -203,6 +247,7 @@ kestrel/                 installable package (the product)
     run.py               run / serve / chat
     health.py            doctor / status / setup
     models.py            models subcommands
+    nodes.py             experimental RPC node inventory / doctor / planning
     bench.py             benchmark / optimize
     menu.py              interactive menu
     engine.py            engine build / status
@@ -211,6 +256,7 @@ kestrel/                 installable package (the product)
   config.py              config/env loading
   ui.py                  std library terminal UI
   model_store.py         model discovery, HF/Ollama stores, snapshot resolution
+  nodes.py               strict node persistence, RPC probing, device placement
   core/planner.py        memory placement planning
   core/pipeline.py       llama.cpp wrapper
   backends/llama_cpp.py  process launch, capability probe, metrics

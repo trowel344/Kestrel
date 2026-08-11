@@ -18,6 +18,7 @@ from .evaluate import cmd_evaluate
 from .health import cmd_doctor, cmd_setup, cmd_status
 from .menu import cmd_menu
 from .models import cmd_models
+from .nodes import cmd_nodes
 from .parser import build_parser
 from .run import cmd_run, cmd_serve
 from .updater import cmd_self_update
@@ -34,6 +35,7 @@ _COMMAND_HANDLERS = {
     "model-test": cmd_evaluate,
     "optimize": cmd_optimize,
     "models": cmd_models,
+    "nodes": cmd_nodes,
     "build": cmd_build,
     "engine": cmd_engine,
     "self-update": cmd_self_update,
