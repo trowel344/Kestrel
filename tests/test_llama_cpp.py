@@ -260,7 +260,8 @@ def test_backend_binary_not_found_raises(monkeypatch):
 def _backend_with_caps(caps: LlamaCppCapabilities, tmp_path: Path) -> LlamaCppBackend:
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF" + b"\x00" * 8)
-    backend = LlamaCppBackend(str(model))
+    _make_bin(str(tmp_path / "build" / "bin"), "llama-cli")
+    backend = LlamaCppBackend(str(model), llama_cpp_dir=str(tmp_path))
     backend._capabilities = caps
     return backend
 

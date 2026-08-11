@@ -374,6 +374,7 @@ def test_models_recommend_json_ranks_fit(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr("kestrel.model_store.discover_local_models", lambda root: paths)
     monkeypatch.setattr("kestrel.model_store.complete_gguf_models", lambda values: values)
     monkeypatch.setattr("kestrel.model_store.model_total_size", lambda path: 100 if path == paths[0] else 10**12)
+    monkeypatch.setattr("kestrel.model_store.list_ollama_models", lambda **_kwargs: [])
     monkeypatch.setattr(models.probes, "detect_gpu", lambda: {"name": "test", "vram_total_mb": 1000})
     monkeypatch.setattr(models.probes, "_available_ram_mib", lambda: 100)
     monkeypatch.setattr(models.model_source, "read_gguf_config", lambda path: {"architecture": "qwen", "n_layer": 2})

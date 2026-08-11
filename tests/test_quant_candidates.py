@@ -1,8 +1,25 @@
 import numpy as np
 import pytest
 
+from kestrel.analysis import quant_candidates
 from kestrel.analysis.quant_candidates import assess_quant_candidates
 from kestrel.gguf.quants import quantize_q2_k
+
+
+@pytest.fixture(autouse=True)
+def _portable_quantizer_boundary(monkeypatch):
+    """The assessor contract is independent of a host-native GGML build."""
+
+    def quantize(matrix, _importance=None):
+        return np.asarray(matrix, dtype=np.float16).tobytes()
+
+    def dequantize(raw, rows, cols):
+        return np.frombuffer(raw, dtype=np.float16).astype(np.float32).reshape(rows, cols)
+
+    monkeypatch.setattr(quant_candidates, "quantize_q2_k", quantize)
+    monkeypatch.setattr(quant_candidates, "quantize_q3_k", quantize)
+    monkeypatch.setattr(quant_candidates, "dequantize_q2_k", dequantize)
+    monkeypatch.setattr(quant_candidates, "dequantize_q3_k", dequantize)
 
 
 def test_q2_importance_is_strictly_validated():

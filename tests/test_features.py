@@ -120,7 +120,11 @@ def test_flatten_extra_splits_shell_words():
 def _backend_with_caps(caps: LlamaCppCapabilities, tmp_path: Path) -> LlamaCppBackend:
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF" + b"\x00" * 8)
-    backend = LlamaCppBackend(str(model))
+    binary = tmp_path / "build" / "bin" / "llama-cli"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    backend = LlamaCppBackend(str(model), llama_cpp_dir=str(tmp_path))
     backend._capabilities = caps
     return backend
 

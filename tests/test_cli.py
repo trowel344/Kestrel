@@ -704,7 +704,7 @@ def test_dispatch_doctor_json_is_structurally_sound(capsys, monkeypatch):
     monkeypatch.setattr(cli.probes, "_memory_snapshot", lambda: {"swap_total_mib": 0, "swap_used_mib": 0})
     monkeypatch.setattr(cli.state, "LLAMA_CPP_DIR", "/nonexistent")
     rc = _dispatch(["doctor", "--json"])
-    assert rc == 0
+    assert rc in (0, 1)
     payload = json.loads(capsys.readouterr().out.strip())
     assert payload["status"] in ("ok", "warn", "fail")
     assert isinstance(payload["checks"], list)

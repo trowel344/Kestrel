@@ -345,15 +345,9 @@ def pull_huggingface(
 ) -> HuggingFaceDownload:
     """Acquire an HF model with the official CLI and a deterministic destination."""
 
-    binary = _hf_cli()
-    if not binary:
-        raise ModelStoreError("Hugging Face CLI is missing; install `huggingface_hub[cli]`")
     repo = repo_id.removeprefix("hf://")
     if "/" not in repo:
         raise ModelStoreError("Hugging Face source must be OWNER/REPOSITORY")
-    target = destination or default_models_dir() / repo.replace("/", "--")
-    target.mkdir(parents=True, exist_ok=True)
-    command = [binary, "download", repo]
     if filename and include:
         raise ModelStoreError("choose either an exact --file or an --include glob")
     if filename:
@@ -362,6 +356,13 @@ def pull_huggingface(
         file_path = Path(filename)
         if file_path.is_absolute() or ".." in file_path.parts:
             raise ModelStoreError("filenames must stay within the Hugging Face repository")
+    binary = _hf_cli()
+    if not binary:
+        raise ModelStoreError("Hugging Face CLI is missing; install `huggingface_hub[cli]`")
+    target = destination or default_models_dir() / repo.replace("/", "--")
+    target.mkdir(parents=True, exist_ok=True)
+    command = [binary, "download", repo]
+    if filename:
         command.append(filename)
     if include:
         command.extend(["--include", include])
