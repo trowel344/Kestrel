@@ -1,7 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 224 224" role="img" aria-labelledby="title desc">
   <title id="title">Kestrel pixel K</title>
-  <desc id="desc">A centered off-white block-pixel letter K with amber side depth on a deep navy square.</desc>
-  <rect width="224" height="224" rx="32" fill="#0c1826"/>
+  <desc id="desc">A centered layered off-white block-pixel letter K on a deep navy tile.</desc>
+  <rect width="224" height="224" rx="32" fill="#07121f"/>
+  <rect x="8" y="8" width="208" height="208" rx="26" fill="#0b1b2b" stroke="#173149" stroke-width="2"/>
 
   <defs>
     <!-- A literal 14 px grid keeps the mark crisp from favicon to banner. -->
@@ -33,7 +34,7 @@
     </g>
   </defs>
 
-  <!-- The warm underlay appears only on the two arms, like side-lit block depth. -->
-  <use href="#pixel-k-arms" fill="#c77b30" opacity="0.9" transform="translate(5 6)"/>
-  <use href="#pixel-k" fill="#f2efe6"/>
+  <!-- A tonal underlay appears only on the two arms, like stacked pixel blocks. -->
+  <use href="#pixel-k-arms" fill="#bbb8af" transform="translate(5 6)"/>
+  <use href="#pixel-k" fill="#f3f0e7"/>
 </svg>
