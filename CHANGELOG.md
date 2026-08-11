@@ -26,7 +26,7 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The GitHub landing page now leads with Kestrel's measured out-of-core result,
   a two-command start, and a compact explanation of the memory planner. A new
   layered off-white block-pixel K with a complete tonal shadow on a clean,
-  uninterrupted deep-navy tile gives the project a
+  softly lit deep-navy tile gives the project a
   terminal-native visual identity, and
   the detailed trusted-node guide has moved into focused documentation.
 - The interactive front door is reduced to Start chat, Models, Tools, and Exit.

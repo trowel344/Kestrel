@@ -1,9 +1,20 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 224 224" role="img" aria-labelledby="title desc">
   <title id="title">Kestrel pixel K</title>
-  <desc id="desc">A centered layered off-white block-pixel letter K on a deep navy tile.</desc>
-  <rect width="224" height="224" rx="32" fill="#0b1b2b"/>
+  <desc id="desc">A centered dimensional off-white block-pixel letter K on a softly lit deep navy tile.</desc>
 
   <defs>
+    <!-- Soft directional light adds depth without drawing a rim around the tile. -->
+    <linearGradient id="navy-depth" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#132c42"/>
+      <stop offset="0.52" stop-color="#0d2133"/>
+      <stop offset="1" stop-color="#091827"/>
+    </linearGradient>
+    <radialGradient id="navy-light" cx="0.3" cy="0.2" r="0.78">
+      <stop offset="0" stop-color="#31516a" stop-opacity="0.2"/>
+      <stop offset="0.58" stop-color="#18354b" stop-opacity="0.06"/>
+      <stop offset="1" stop-color="#07131f" stop-opacity="0"/>
+    </radialGradient>
+
     <!-- A literal 14 px grid keeps the mark crisp from favicon to banner. -->
     <g id="pixel-k">
       <rect x="56" y="42" width="28" height="140"/>
@@ -21,7 +32,11 @@
     </g>
   </defs>
 
-  <!-- A complete tonal underlay makes the K read as one stacked pixel form. -->
-  <use href="#pixel-k" fill="#bbb8af" transform="translate(5 6)"/>
-  <use href="#pixel-k" fill="#f3f0e7"/>
+  <rect width="224" height="224" rx="32" fill="url(#navy-depth)"/>
+  <rect width="224" height="224" rx="32" fill="url(#navy-light)"/>
+
+  <!-- Two full underlays make the K read as a shallow, stacked pixel form. -->
+  <use href="#pixel-k" fill="#767a7b" transform="translate(8 9)"/>
+  <use href="#pixel-k" fill="#bbb8af" transform="translate(4 5)"/>
+  <use href="#pixel-k" fill="#e8e5dc"/>
 </svg>
