@@ -35,6 +35,9 @@ class OllamaGeneration:
 
 
 class OllamaClient:
+    _MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+    _MAX_METRIC_VALUE = (1 << 63) - 1
+
     def __init__(self, *, base_url: str | None = None, timeout: float = 600.0, opener=None):
         self.base_url = (base_url or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
         if not self.base_url.startswith(("http://", "https://")):
@@ -70,22 +73,43 @@ class OllamaClient:
         )
         try:
             with self._opener(request, timeout=self.timeout) as response:
-                decoded = json.loads(response.read())
+                body = response.read(self._MAX_RESPONSE_BYTES + 1)
+                if len(body) > self._MAX_RESPONSE_BYTES:
+                    raise OllamaError("Ollama response exceeded the 16 MiB safety limit")
+                decoded = json.loads(body)
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(errors="replace")[:1000]
+            detail = exc.read(1001)[:1000].decode(errors="replace")
             raise OllamaError(f"Ollama returned HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise OllamaError(f"Could not reach Ollama: {exc}") from exc
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError, RecursionError) as exc:
             raise OllamaError("Ollama returned invalid JSON") from exc
+        if not isinstance(decoded, dict):
+            raise OllamaError("Ollama returned an unexpected JSON response")
         if "error" in decoded:
-            raise OllamaError(str(decoded["error"]))
+            error = decoded["error"]
+            if not isinstance(error, str):
+                raise OllamaError("Ollama returned an invalid error response")
+            raise OllamaError(error[:1000])
+        text_fields = ("response", "thinking")
+        if any(field in decoded and not isinstance(decoded[field], str) for field in text_fields):
+            raise OllamaError("Ollama returned invalid generation text")
+        numeric_fields = (
+            "prompt_eval_count",
+            "prompt_eval_duration",
+            "eval_count",
+            "eval_duration",
+            "total_duration",
+        )
+        metrics = {field: decoded.get(field, 0) for field in numeric_fields}
+        if any(type(value) is not int or not 0 <= value <= self._MAX_METRIC_VALUE for value in metrics.values()):
+            raise OllamaError("Ollama returned invalid generation metrics")
         return OllamaGeneration(
             response=decoded.get("response") or "",
             thinking=decoded.get("thinking") or "",
-            prompt_tokens=int(decoded.get("prompt_eval_count") or 0),
-            prompt_duration_ns=int(decoded.get("prompt_eval_duration") or 0),
-            generated_tokens=int(decoded.get("eval_count") or 0),
-            generation_duration_ns=int(decoded.get("eval_duration") or 0),
-            total_duration_ns=int(decoded.get("total_duration") or 0),
+            prompt_tokens=metrics["prompt_eval_count"],
+            prompt_duration_ns=metrics["prompt_eval_duration"],
+            generated_tokens=metrics["eval_count"],
+            generation_duration_ns=metrics["eval_duration"],
+            total_duration_ns=metrics["total_duration"],
         )

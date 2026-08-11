@@ -143,16 +143,23 @@ def ttl_cache(seconds: float):
 
     def deco(fn):
         cached_at = None
+        cached_key = None
         value = None
 
         @functools.wraps(fn)
         def wrapped(*args, **kwargs):
-            nonlocal cached_at, value
+            nonlocal cached_at, cached_key, value
             now = time.monotonic()
-            if cached_at is not None and now - cached_at < seconds:
+            key = (args, tuple(sorted(kwargs.items())))
+            try:
+                same_key = cached_key == key
+            except (TypeError, ValueError):
+                same_key = False
+            if cached_at is not None and same_key and now - cached_at < seconds:
                 return value
             value = fn(*args, **kwargs)
             cached_at = now
+            cached_key = key
             return value
 
         return wrapped

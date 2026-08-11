@@ -24,7 +24,14 @@ def test_parser_accepts_repeatable_nodes_and_all_selector():
 def test_backend_emits_rpc_as_single_endpoint_list(tmp_path):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF")
-    backend = LlamaCppBackend(str(model), rpc_endpoints=["127.0.0.1:50052", "localhost:50053"])
+    binary = tmp_path / "llama-cli"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    backend = LlamaCppBackend(
+        str(model),
+        llama_cpp_dir=str(tmp_path),
+        rpc_endpoints=["127.0.0.1:50052", "localhost:50053"],
+    )
     backend._capabilities = LlamaCppCapabilities(help_text="--rpc\n--mmap\n")
     command = backend._base_cmd()
     assert command[command.index("--rpc") + 1] == "127.0.0.1:50052,localhost:50053"
@@ -33,7 +40,10 @@ def test_backend_emits_rpc_as_single_endpoint_list(tmp_path):
 def test_backend_rejects_rpc_when_engine_lacks_capability(tmp_path):
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF")
-    backend = LlamaCppBackend(str(model), rpc_endpoints=["127.0.0.1:50052"])
+    binary = tmp_path / "llama-cli"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    backend = LlamaCppBackend(str(model), llama_cpp_dir=str(tmp_path), rpc_endpoints=["127.0.0.1:50052"])
     backend._capabilities = LlamaCppCapabilities(help_text="--mmap\n")
     with pytest.raises(BackendError, match="does not support RPC"):
         backend._base_cmd()
@@ -57,6 +67,7 @@ def test_node_plan_requires_loopback_or_explicit_override(monkeypatch):
             return {"nodes": [{"name": "lan", "rpc_endpoint": "10.0.0.2:50052"}]}
 
     monkeypatch.setattr(kestrel, "nodes", FakeNodes, raising=False)
+    monkeypatch.setattr(runtime, "_local_node_inputs", lambda _args: ([1024.0], "a" * 40))
     args = SimpleNamespace(node=["lan"], nodes=None, allow_insecure_rpc=False)
     with pytest.raises(InputError, match="not loopback"):
         runtime._resolve_node_plan(args)

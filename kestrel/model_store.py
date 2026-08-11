@@ -79,13 +79,17 @@ def hf_snapshot_dir(path: str | Path, *, marker: str = "config.json") -> Path | 
     refs_main = root / "refs" / "main"
     snapshots = root / "snapshots"
 
+    try:
+        resolved_snapshots = snapshots.resolve()
+    except OSError:
+        return None
+
     def valid_snapshot(candidate: Path) -> Path | None:
         try:
-            resolved_root = snapshots.resolve()
             resolved = candidate.resolve()
         except OSError:
             return None
-        if resolved == resolved_root or resolved_root not in resolved.parents:
+        if resolved == resolved_snapshots or resolved_snapshots not in resolved.parents:
             return None
         return resolved if (resolved / marker).is_file() else None
 
@@ -602,7 +606,8 @@ def _walk_ggufs(root: Path) -> list[Path]:
                 except (OSError, ValueError):
                     continue
                 try:
-                    if not resolved.is_file() or resolved.stat().st_size <= 0:
+                    model_stat = resolved.stat()
+                    if not stat.S_ISREG(model_stat.st_mode) or model_stat.st_size <= 0:
                         continue
                 except (OSError, ValueError):
                     continue

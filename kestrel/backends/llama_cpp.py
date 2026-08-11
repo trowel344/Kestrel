@@ -18,6 +18,10 @@ NATIVE_LLAMA_CPP_DIRS = (
     os.path.expanduser("~/llama.cpp"),
 )
 
+_CAPABILITY_CACHE_VERSION = 2
+_CAPABILITY_CACHE_MAX_ENTRIES = 8
+_CAPABILITY_CACHE_MAX_BYTES = 2 * 1024 * 1024
+
 
 def _find_binary(directory: str, name: str) -> str | None:
     """Return the executable path for ``name`` under a llama.cpp build tree."""
@@ -108,6 +112,22 @@ def _capability_cache_path() -> str:
     return os.path.join(base, "kestrel", "llama-cli-capabilities.json")
 
 
+def _capability_cache_key(binary: str) -> str:
+    """Identify one concrete binary build, including atomic replacements."""
+    stat = os.stat(binary)
+    return "\0".join(
+        str(value)
+        for value in (
+            os.path.realpath(binary),
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+            stat.st_size,
+        )
+    )
+
+
 def _capability_cache_read(binary: str) -> tuple[str, str] | None:
     """Return cached ``(help_text, version)`` when the binary is unchanged.
 
@@ -117,23 +137,54 @@ def _capability_cache_read(binary: str) -> tuple[str, str] | None:
     launches skip both subprocesses entirely.
     """
     try:
-        stat = os.stat(binary)
-        key = f"{binary}\0{stat.st_mtime_ns}\0{stat.st_size}"
-        with open(_capability_cache_path()) as f:
+        path = _capability_cache_path()
+        if os.stat(path).st_size > _CAPABILITY_CACHE_MAX_BYTES:
+            return None
+        key = _capability_cache_key(binary)
+        with open(path) as f:
             data = json.load(f)
-        if data.get("key") == key and isinstance(data.get("help"), str) and isinstance(data.get("version"), str):
-            return data["help"], data["version"]
-    except (OSError, ValueError, KeyError):
+        entries = data.get("entries") if data.get("version") == _CAPABILITY_CACHE_VERSION else None
+        entry = entries.get(key) if isinstance(entries, dict) else None
+        if isinstance(entry, dict) and isinstance(entry.get("help"), str) and isinstance(entry.get("version"), str):
+            return entry["help"], entry["version"]
+    except (OSError, ValueError, KeyError, AttributeError, TypeError):
         pass
     return None
 
 
 def _capability_cache_write(binary: str, help_text: str, version: str) -> None:
     try:
-        stat = os.stat(binary)
-        key = f"{binary}\0{stat.st_mtime_ns}\0{stat.st_size}"
+        key = _capability_cache_key(binary)
         path = _capability_cache_path()
-        util.write_atomic(path, json.dumps({"key": key, "help": help_text, "version": version}), backup=False)
+        entries: dict[str, dict[str, str]] = {}
+        try:
+            if os.stat(path).st_size <= _CAPABILITY_CACHE_MAX_BYTES:
+                with open(path) as handle:
+                    cached = json.load(handle)
+                loaded = cached.get("entries") if cached.get("version") == _CAPABILITY_CACHE_VERSION else None
+                if isinstance(loaded, dict):
+                    entries = {
+                        cached_key: entry
+                        for cached_key, entry in loaded.items()
+                        if isinstance(cached_key, str)
+                        and isinstance(entry, dict)
+                        and isinstance(entry.get("help"), str)
+                        and isinstance(entry.get("version"), str)
+                    }
+        except (OSError, ValueError, KeyError, AttributeError, TypeError):
+            pass
+
+        # Reinsert the current binary last, then retain only the newest bounded
+        # set. A bounded inventory lets cli/server and multiple builds coexist
+        # without turning the cache into an unbounded history file.
+        entries.pop(key, None)
+        entries[key] = {"help": help_text, "version": version}
+        entries = dict(list(entries.items())[-_CAPABILITY_CACHE_MAX_ENTRIES:])
+        util.write_atomic(
+            path,
+            json.dumps({"version": _CAPABILITY_CACHE_VERSION, "entries": entries}),
+            backup=False,
+        )
     except OSError:
         pass
 

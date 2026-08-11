@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -424,13 +425,39 @@ class NodeStore:
     def _check_private_state(self, entries: Iterable[Node]) -> None:
         if not any(node.managed for node in entries):
             return
-        target = self.path.resolve(strict=False) if self.path.is_symlink() else self.path
-        if not target.exists():
+
+        # Unlike ordinary configuration, this document contains the identity
+        # file location used for unattended SSH authentication.  Following a
+        # symlink here lets another account that can write the configuration
+        # directory redirect a later save into an arbitrary path.  Refuse that
+        # ambiguity instead of inheriting write_atomic's convenient symlink
+        # behaviour for non-secret configuration files.
+        if self.path.is_symlink():
+            raise NodeSecurityError("managed node inventory must not be a symbolic link")
+
+        parent = self.path.parent
+        existing_parent = parent
+        while not existing_parent.exists() and existing_parent != existing_parent.parent:
+            existing_parent = existing_parent.parent
+        try:
+            parent_metadata = existing_parent.stat()
+        except OSError as exc:
+            raise NodeStateError("unable to inspect managed node inventory directory") from exc
+        if not stat.S_ISDIR(parent_metadata.st_mode):
+            raise NodeSecurityError("managed node inventory parent must be a directory")
+        if hasattr(os, "getuid") and parent_metadata.st_uid != os.getuid():
+            raise NodeSecurityError("managed node inventory directory must be owned by the current user")
+        if parent_metadata.st_mode & 0o022:
+            raise NodeSecurityError("managed node inventory directory must not be group/world writable")
+
+        if not self.path.exists():
             return
         try:
-            metadata = target.stat()
+            metadata = self.path.lstat()
         except OSError as exc:
             raise NodeStateError("unable to inspect managed node inventory permissions") from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise NodeSecurityError("managed node inventory must be a regular file")
         if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
             raise NodeSecurityError("managed node inventory must be owned by the current user")
         if metadata.st_mode & 0o077:
@@ -944,10 +971,23 @@ class RpcProbeResult:
         )
 
 
-def _recv_exact(sock: Any, size: int) -> bytes:
+def _apply_socket_deadline(sock: Any, deadline: float) -> None:
+    """Apply one absolute RPC deadline to the next socket operation."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("RPC probe exceeded its deadline")
+    settimeout = getattr(sock, "settimeout", None)
+    if callable(settimeout):
+        settimeout(remaining)
+
+
+def _recv_exact(sock: Any, size: int, *, deadline: float | None = None) -> bytes:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
+        if deadline is not None:
+            _apply_socket_deadline(sock, deadline)
         chunk = sock.recv(remaining)
         if not chunk:
             raise OSError("peer closed the RPC connection")
@@ -980,34 +1020,38 @@ def probe_rpc(
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise NodeValidationError("probe timeout must be positive")
     bounded_timeout = min(float(timeout), MAX_PROBE_TIMEOUT)
+    deadline = time.monotonic() + bounded_timeout
     sock: Any = None
     try:
         sock = socket.create_connection((endpoint.host, endpoint.port), timeout=bounded_timeout)
         # ggml-rpc v4.0.0: command, little-endian uint64 payload length,
         # followed by 24 capability bytes. Zero capabilities avoid transport
         # negotiation and keep this probe limited to ordinary TCP.
+        _apply_socket_deadline(sock, deadline)
         sock.sendall(bytes((14,)) + struct.pack("<Q", RPC_CONN_CAPS_SIZE) + bytes(RPC_CONN_CAPS_SIZE))
-        hello_size = struct.unpack("<Q", _recv_exact(sock, 8))[0]
+        hello_size = struct.unpack("<Q", _recv_exact(sock, 8, deadline=deadline))[0]
         if hello_size != 28:
             raise ValueError(f"unexpected HELLO response size {hello_size}")
-        hello = _recv_exact(sock, 4 + RPC_CONN_CAPS_SIZE)
+        hello = _recv_exact(sock, 4 + RPC_CONN_CAPS_SIZE, deadline=deadline)
         version = (hello[0], hello[1], hello[2])
+        _apply_socket_deadline(sock, deadline)
         sock.sendall(bytes((15,)) + struct.pack("<Q", 0))
-        device_size = struct.unpack("<Q", _recv_exact(sock, 8))[0]
+        device_size = struct.unpack("<Q", _recv_exact(sock, 8, deadline=deadline))[0]
         if device_size != 4:
             raise ValueError(f"unexpected DEVICE_COUNT response size {device_size}")
-        device_count = struct.unpack("<I", _recv_exact(sock, 4))[0]
+        device_count = struct.unpack("<I", _recv_exact(sock, 4, deadline=deadline))[0]
         if device_count > MAX_RPC_DEVICES:
             raise ValueError(f"RPC worker reports too many devices ({device_count}; maximum {MAX_RPC_DEVICES})")
         device_memory: list[tuple[int, int]] = []
         for device in range(device_count):
             # GET_DEVICE_MEMORY is command 11 in the pinned ggml-rpc v4
             # command table (command 10 is GRAPH_COMPUTE).
+            _apply_socket_deadline(sock, deadline)
             sock.sendall(bytes((11,)) + struct.pack("<Q", 4) + struct.pack("<I", device))
-            memory_size = struct.unpack("<Q", _recv_exact(sock, 8))[0]
+            memory_size = struct.unpack("<Q", _recv_exact(sock, 8, deadline=deadline))[0]
             if memory_size != 16:
                 raise ValueError(f"unexpected GET_DEVICE_MEMORY response size {memory_size}")
-            device_memory.append(struct.unpack("<QQ", _recv_exact(sock, 16)))
+            device_memory.append(struct.unpack("<QQ", _recv_exact(sock, 16, deadline=deadline)))
         return RpcProbeResult(True, True, version, device_count, device_memory=tuple(device_memory))
     except (OSError, ValueError, struct.error) as exc:
         if sock is None:

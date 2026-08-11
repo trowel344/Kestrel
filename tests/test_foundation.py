@@ -127,3 +127,19 @@ def test_ttl_cache_refreshes_after_window():
     assert probe(3) == 6
     assert calls == [3]
     _time.monotonic()  # stall a moment (cache never expires within the window)
+
+
+def test_ttl_cache_does_not_reuse_result_for_different_arguments():
+    from kestrel.util import ttl_cache
+
+    calls = []
+
+    @ttl_cache(seconds=3600)
+    def probe(value, *, scale=1):
+        calls.append((value, scale))
+        return value * scale
+
+    assert probe(3, scale=2) == 6
+    assert probe(4, scale=2) == 8
+    assert probe(4, scale=2) == 8
+    assert calls == [(3, 2), (4, 2)]

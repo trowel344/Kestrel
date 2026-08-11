@@ -3,10 +3,20 @@
 from __future__ import annotations
 
 import io
+import socket
 
 import pytest
 
-from kestrel.nodes import Node, NodeValidationError, RpcProbeResult, SshTunnel, SshTunnelError
+from kestrel.nodes import (
+    Node,
+    NodeSecurityError,
+    NodeStore,
+    NodeValidationError,
+    RpcProbeResult,
+    SshTunnel,
+    SshTunnelError,
+    probe_rpc,
+)
 
 HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
@@ -159,3 +169,76 @@ def test_effective_ssh_argv_disables_ambient_credentials_and_config(tmp_path):
         assert required.issubset(argv)
         assert argv[argv.index("-F") + 1] == "/dev/null"
         assert sum(value.startswith("127.0.0.1:") for value in argv) == 1
+
+
+def test_managed_inventory_rejects_dangling_symlink_write_redirection(tmp_path):
+    identity = _identity(tmp_path)
+    redirected = tmp_path / "redirected.json"
+    inventory = tmp_path / "nodes.json"
+    inventory.symlink_to(redirected)
+
+    with pytest.raises(NodeSecurityError, match="symbolic link"):
+        NodeStore(inventory).save([_node(str(identity))])
+
+    assert not redirected.exists()
+
+
+def test_managed_inventory_rejects_live_symlink_even_when_referent_is_private(tmp_path):
+    identity = _identity(tmp_path)
+    redirected = tmp_path / "redirected.json"
+    NodeStore(redirected).save([])
+    redirected.chmod(0o600)
+    inventory = tmp_path / "nodes.json"
+    inventory.symlink_to(redirected)
+
+    with pytest.raises(NodeSecurityError, match="symbolic link"):
+        NodeStore(inventory).save([_node(str(identity))])
+
+
+def test_managed_inventory_rejects_writable_parent_directory(tmp_path):
+    identity = _identity(tmp_path)
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o770)
+
+    with pytest.raises(NodeSecurityError, match="directory must not be"):
+        NodeStore(shared / "nodes.json").save([_node(str(identity))])
+
+    assert not (shared / "nodes.json").exists()
+
+
+def test_rpc_probe_uses_one_deadline_against_byte_drip_attack(monkeypatch):
+    class DripSocket:
+        def __init__(self):
+            self.recv_calls = 0
+            self.timeouts = []
+
+        def sendall(self, _payload):
+            pass
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+        def recv(self, _size):
+            self.recv_calls += 1
+            return b"\x00"
+
+        def close(self):
+            pass
+
+    now = [100.0]
+
+    def monotonic():
+        value = now[0]
+        now[0] += 0.2
+        return value
+
+    peer = DripSocket()
+    monkeypatch.setattr(socket, "create_connection", lambda *_args, **_kwargs: peer)
+    monkeypatch.setattr("kestrel.nodes.time.monotonic", monotonic)
+
+    result = probe_rpc("127.0.0.1:50052", timeout=0.5)
+
+    assert result.tcp_reachable and not result.usable
+    assert "deadline" in (result.error or "")
+    assert peer.recv_calls <= 2
+    assert peer.timeouts == sorted(peer.timeouts, reverse=True)

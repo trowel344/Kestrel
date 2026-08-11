@@ -1,3 +1,5 @@
+import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -102,3 +104,132 @@ def test_convert_uses_unique_partial_files_and_syncs_directory(tmp_path, monkeyp
 
     assert len(set(partial_paths)) == 2
     assert synced == [str(tmp_path), str(tmp_path)]
+
+
+def test_generic_convert_atomically_replaces_prior_output(tmp_path, monkeypatch):
+    output = tmp_path / "model.gguf"
+    output.write_bytes(b"old-good")
+    script = tmp_path / "convert_hf_to_gguf.py"
+    script.write_text("placeholder")
+    staged = []
+    synced = []
+
+    def convert(command, **_kwargs):
+        stage = command[command.index("--outfile") + 1]
+        staged.append(stage)
+        assert stage.endswith(".partial.gguf")
+        assert str(tmp_path) in stage
+        with open(stage, "wb") as handle:
+            handle.write(b"GGUF-new-good")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(converter_module.subprocess, "run", convert)
+    monkeypatch.setattr(converter_module.util, "sync_directory", lambda path: synced.append(path))
+
+    converter_module.generic_convert_hf_to_gguf("/source", str(output), llama_cpp_dir=str(tmp_path))
+
+    assert output.read_bytes() == b"GGUF-new-good"
+    assert not list(tmp_path.glob("*.partial.gguf"))
+    assert synced == [tmp_path]
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "interrupt"])
+def test_generic_convert_failure_preserves_prior_output_and_cleans_stage(tmp_path, monkeypatch, failure):
+    output = tmp_path / "model.gguf"
+    output.write_bytes(b"old-good")
+    (tmp_path / "convert_hf_to_gguf.py").write_text("placeholder")
+
+    def fail(command, **_kwargs):
+        stage = command[command.index("--outfile") + 1]
+        with open(stage, "wb") as handle:
+            handle.write(b"partial-bad")
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(command, 1)
+        if failure == "interrupt":
+            raise KeyboardInterrupt
+        return SimpleNamespace(returncode=9, stdout="", stderr="conversion failed")
+
+    monkeypatch.setattr(converter_module.subprocess, "run", fail)
+
+    expected = KeyboardInterrupt if failure == "interrupt" else RuntimeError
+    with pytest.raises(expected):
+        converter_module.generic_convert_hf_to_gguf("/source", str(output), llama_cpp_dir=str(tmp_path))
+
+    assert output.read_bytes() == b"old-good"
+    assert not list(tmp_path.glob("*.partial.gguf"))
+
+
+def test_generic_convert_discards_unbounded_logs(tmp_path, monkeypatch):
+    output = tmp_path / "model.gguf"
+    (tmp_path / "convert_hf_to_gguf.py").write_text("placeholder")
+
+    def fail(_command, **kwargs):
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.DEVNULL
+        return SimpleNamespace(returncode=9)
+
+    monkeypatch.setattr(converter_module.subprocess, "run", fail)
+
+    with pytest.raises(RuntimeError, match="exit 9"):
+        converter_module.generic_convert_hf_to_gguf("/source", str(output), llama_cpp_dir=str(tmp_path))
+
+    assert not output.exists()
+    assert not list(tmp_path.glob("*.partial.gguf"))
+
+
+def test_generic_convert_rejects_tool_that_derives_a_different_output_path(tmp_path, monkeypatch):
+    output = tmp_path / "model.gguf"
+    output.write_bytes(b"old-good")
+    (tmp_path / "convert_hf_to_gguf.py").write_text("placeholder")
+
+    def derive(command, **_kwargs):
+        stage = command[command.index("--outfile") + 1]
+        # Simulate a converter that ignores the exact outfile and derives its
+        # own sibling. Kestrel must not guess and replace the good model.
+        with open(stage + ".derived", "wb") as handle:
+            handle.write(b"wrong-path")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(converter_module.subprocess, "run", derive)
+
+    with pytest.raises(RuntimeError, match="non-empty regular"):
+        converter_module.generic_convert_hf_to_gguf("/source", str(output), llama_cpp_dir=str(tmp_path))
+
+    assert output.read_bytes() == b"old-good"
+    assert not list(tmp_path.glob("*.partial.gguf"))
+
+
+def test_generic_convert_does_not_propagate_output_placeholders_to_stage(tmp_path, monkeypatch):
+    output = tmp_path / "model-{ftype}.gguf"
+    output.write_bytes(b"old-good")
+    (tmp_path / "convert_hf_to_gguf.py").write_text("placeholder")
+
+    def convert(command, **_kwargs):
+        stage = command[command.index("--outfile") + 1]
+        assert "{" not in stage and "}" not in stage
+        with open(stage, "wb") as handle:
+            handle.write(b"GGUF-new-good")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(converter_module.subprocess, "run", convert)
+    converter_module.generic_convert_hf_to_gguf("/source", str(output), llama_cpp_dir=str(tmp_path))
+
+    assert output.read_bytes() == b"GGUF-new-good"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["convert_hf_to_gguf.py", "model-{ftype}.gguf"]
+
+
+def test_generic_convert_rejects_success_without_gguf_magic(tmp_path, monkeypatch):
+    output = tmp_path / "model.gguf"
+    output.write_bytes(b"GGUF-old-good")
+    (tmp_path / "convert_hf_to_gguf.py").write_text("placeholder")
+
+    def invalid(command, **_kwargs):
+        Path(command[command.index("--outfile") + 1]).write_bytes(b"not-a-gguf")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(converter_module.subprocess, "run", invalid)
+    with pytest.raises(RuntimeError, match="GGUF magic"):
+        converter_module.generic_convert_hf_to_gguf("/source", str(output), llama_cpp_dir=str(tmp_path))
+
+    assert output.read_bytes() == b"GGUF-old-good"
+    assert not list(tmp_path.glob("*.partial.gguf"))

@@ -12,7 +12,9 @@ from kestrel.backends.llama_cpp import (
     LlamaCppCapabilities,
     RunMetrics,
     _candidate_dirs,
+    _capability_cache_key,
     _capability_cache_read,
+    _capability_cache_write,
     _find_binary,
     _load_capabilities,
     default_llama_cpp_dir,
@@ -138,20 +140,66 @@ def test_capability_probe_spawn_failure_is_typed(monkeypatch):
 def test_capability_cache_rejects_wrong_value_types(monkeypatch, tmp_path):
     binary = tmp_path / "llama-cli"
     binary.write_bytes(b"bin")
-    stat_result = binary.stat()
     cache = tmp_path / "capabilities.json"
     cache.write_text(
         json.dumps(
             {
-                "key": f"{binary}\0{stat_result.st_mtime_ns}\0{stat_result.st_size}",
-                "help": ["not", "text"],
-                "version": "1",
+                "version": 2,
+                "entries": {
+                    _capability_cache_key(str(binary)): {
+                        "help": ["not", "text"],
+                        "version": "1",
+                    }
+                },
             }
         )
     )
     monkeypatch.setattr("kestrel.backends.llama_cpp._capability_cache_path", lambda: str(cache))
 
     assert _capability_cache_read(str(binary)) is None
+
+
+def test_capability_cache_keeps_multiple_binaries(monkeypatch, tmp_path):
+    cli = tmp_path / "llama-cli"
+    server = tmp_path / "llama-server"
+    cli.write_bytes(b"cli")
+    server.write_bytes(b"server")
+    cache = tmp_path / "capabilities.json"
+    monkeypatch.setattr("kestrel.backends.llama_cpp._capability_cache_path", lambda: str(cache))
+
+    _capability_cache_write(str(cli), "cli help", "cli version")
+    _capability_cache_write(str(server), "server help", "server version")
+
+    assert _capability_cache_read(str(cli)) == ("cli help", "cli version")
+    assert _capability_cache_read(str(server)) == ("server help", "server version")
+
+
+def test_capability_cache_invalidates_atomic_binary_replacement(monkeypatch, tmp_path):
+    binary = tmp_path / "llama-cli"
+    binary.write_bytes(b"old")
+    cache = tmp_path / "capabilities.json"
+    monkeypatch.setattr("kestrel.backends.llama_cpp._capability_cache_path", lambda: str(cache))
+    _capability_cache_write(str(binary), "old help", "old version")
+
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"new")
+    replacement.replace(binary)
+
+    assert _capability_cache_read(str(binary)) is None
+
+
+def test_capability_cache_is_bounded(monkeypatch, tmp_path):
+    cache = tmp_path / "capabilities.json"
+    monkeypatch.setattr("kestrel.backends.llama_cpp._capability_cache_path", lambda: str(cache))
+    binaries = []
+    for index in range(10):
+        binary = tmp_path / f"llama-{index}"
+        binary.write_bytes(str(index).encode())
+        binaries.append(binary)
+        _capability_cache_write(str(binary), f"help {index}", f"version {index}")
+
+    assert _capability_cache_read(str(binaries[0])) is None
+    assert _capability_cache_read(str(binaries[-1])) == ("help 9", "version 9")
 
 
 def test_resolved_spec_type_none_maps_to_none():

@@ -189,19 +189,24 @@ def test_generic_convert_hf_to_gguf_runs_script(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls["cmd"] = cmd
+        Path(cmd[cmd.index("--outfile") + 1]).write_bytes(b"GGUF")
         return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr("kestrel.gguf.converter.subprocess.run", fake_run)
     command, code = generic_convert_hf_to_gguf(
         str(tmp_path / "model_hf"),
-        "/out/m.gguf",
+        str(tmp_path / "out.gguf"),
         outtype="q8_0",
         llama_cpp_dir=str(tmp_path),
     )
     assert code == 0
     assert "--outtype" in calls["cmd"]
     assert calls["cmd"][-1] == "q8_0"
-    assert "--outfile" in calls["cmd"] and "/out/m.gguf" in calls["cmd"]
+    staged = calls["cmd"][calls["cmd"].index("--outfile") + 1]
+    assert staged.endswith(".partial.gguf")
+    assert (tmp_path / "out.gguf").read_bytes() == b"GGUF"
+    assert str(tmp_path / "out.gguf") in command
+    assert ".partial.gguf" not in command
 
 
 def test_generic_convert_hf_to_gguf_propagates_failure(tmp_path, monkeypatch):
@@ -212,8 +217,8 @@ def test_generic_convert_hf_to_gguf_propagates_failure(tmp_path, monkeypatch):
         "kestrel.gguf.converter.subprocess.run",
         lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr="boom"),
     )
-    with pytest.raises(RuntimeError, match="boom"):
-        generic_convert_hf_to_gguf(str(tmp_path / "src"), "/out/m.gguf", llama_cpp_dir=str(tmp_path))
+    with pytest.raises(RuntimeError, match="exit 1"):
+        generic_convert_hf_to_gguf(str(tmp_path / "src"), str(tmp_path / "m.gguf"), llama_cpp_dir=str(tmp_path))
 
 
 def test_generic_convert_timeout_is_typed(tmp_path, monkeypatch):
@@ -228,7 +233,7 @@ def test_generic_convert_timeout_is_typed(tmp_path, monkeypatch):
     )
 
     with pytest.raises(RuntimeError, match="24-hour"):
-        generic_convert_hf_to_gguf(str(tmp_path / "src"), "/out/m.gguf", llama_cpp_dir=str(tmp_path))
+        generic_convert_hf_to_gguf(str(tmp_path / "src"), str(tmp_path / "m.gguf"), llama_cpp_dir=str(tmp_path))
 
 
 def test_generic_convert_missing_script_raises(tmp_path, monkeypatch):

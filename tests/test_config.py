@@ -43,6 +43,22 @@ def test_invalid_config_raises(tmp_path, monkeypatch):
         load_config(path)
 
 
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("local = []", "local.*must be a table"),
+        ("[local]\nmodels_dir = 42", "local.models_dir must be a string"),
+    ],
+)
+def test_invalid_config_schema_is_typed(tmp_path, text, message):
+    from kestrel.errors import ConfigError
+
+    path = tmp_path / "bad-schema.toml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match=message):
+        load_config(path)
+
+
 def test_config_path_env_override(tmp_path, monkeypatch):
     target = tmp_path / "custom" / "k.toml"
     monkeypatch.setenv("KESTREL_CONFIG", str(target))

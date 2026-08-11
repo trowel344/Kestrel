@@ -34,6 +34,12 @@ def load_config(path: str | Path | None = None) -> KestrelConfig:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"invalid Kestrel config {target}: {exc}") from exc
     local = payload.get("local", {})
+    if not isinstance(local, dict):
+        raise ConfigError(f"invalid Kestrel config {target}: [local] must be a table")
+    for field in ("default_model", "models_dir", "llama_cpp_dir"):
+        value = local.get(field)
+        if value is not None and not isinstance(value, str):
+            raise ConfigError(f"invalid Kestrel config {target}: local.{field} must be a string")
     return KestrelConfig(
         default_model=local.get("default_model"),
         models_dir=local.get("models_dir"),

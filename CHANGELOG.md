@@ -21,12 +21,29 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   checking, loopback-only ephemeral endpoints, process-group cleanup, and
   never pass credentials to llama.cpp.
 
+### Changed
+
+- llama.cpp capability discovery now retains a bounded, binary-identity keyed
+  cache for CLI, server, and alternate builds. Repeated doctor/startup checks
+  avoid redundant engine processes while atomic binary replacements invalidate
+  stale capabilities.
+- Model discovery resolves invariant Hugging Face snapshot roots once and
+  avoids a redundant filesystem stat per GGUF candidate.
+- Generic upstream Hugging Face conversion now stages, fsyncs, and atomically
+  replaces its target, preserving an existing GGUF across conversion failure,
+  timeout, or interruption.
+- Config and Ollama provider responses now have strict typed schemas; provider
+  bodies and error details are bounded before decoding.
+
 ### Security
 
 - Direct non-loopback llama.cpp RPC is rejected unless the user supplies the
   explicit `--allow-insecure-rpc` acknowledgement. Documentation states that
   upstream RPC has no authentication/encryption and recommends loopback-bound
   workers carried through authenticated SSH tunnels.
+- Managed inventory rejects symlink/non-regular redirection and insecure parent
+  directories. RPC probing uses one absolute deadline so a byte-dripping worker
+  cannot multiply the configured timeout across protocol fields and devices.
 
 ## [1.6.0] - 2026-08-11
 

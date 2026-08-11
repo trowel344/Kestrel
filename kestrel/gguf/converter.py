@@ -2,6 +2,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 
@@ -1527,26 +1529,75 @@ def generic_convert_hf_to_gguf(
         raise FileNotFoundError(
             "convert_hf_to_gguf.py not found; clone llama.cpp and (optional) set KESTREL_LLAMA_CPP_DIR to its checkout"
         )
+    output = Path(output_path).expanduser().absolute()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Keep the staging name GGUF-shaped. Some third-party converter versions
+    # infer or replace an output suffix; an explicit final `.gguf` suffix and
+    # no `{ftype}` placeholder makes the requested path unambiguous.
+    partial_fd, partial_name = tempfile.mkstemp(
+        dir=output.parent,
+        # Do not include the caller's filename: upstream treats placeholders
+        # such as ``{ftype}`` specially and could derive an unowned sibling.
+        prefix=".kestrel-convert-",
+        suffix=".partial.gguf",
+    )
+    os.close(partial_fd)
+    partial = Path(partial_name)
     command = [
         sys.executable,
         script,
         src_path,
         "--outfile",
-        output_path,
+        str(partial),
         "--outtype",
         outtype,
     ]
+    display_command = [*command]
+    display_command[display_command.index("--outfile") + 1] = str(output)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=24 * 60 * 60)
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("convert_hf_to_gguf.py exceeded its 24-hour time budget") from exc
-    except OSError as exc:
-        raise RuntimeError(f"could not start convert_hf_to_gguf.py: {exc}") from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"convert_hf_to_gguf.py failed (exit {result.returncode}): " + (result.stderr or result.stdout).strip()
-        )
-    return " ".join(command), result.returncode
+        # A converter can run for hours and emit unbounded output. Do not let
+        # its logs consume coordinator RAM or disk; the exit status remains a
+        # stable diagnostic and users can run the returned command directly
+        # when they need upstream's verbose output.
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=24 * 60 * 60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("convert_hf_to_gguf.py exceeded its 24-hour time budget") from exc
+        except OSError as exc:
+            raise RuntimeError(f"could not start convert_hf_to_gguf.py: {exc}") from exc
+        if result.returncode != 0:
+            raise RuntimeError(f"convert_hf_to_gguf.py failed (exit {result.returncode})")
+
+        # Success means the exact path we supplied was populated. Do not guess
+        # at an alternate derived filename: adopting a nearby file could move
+        # unrelated data over the requested model.
+        try:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(partial, flags)
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size == 0:
+                    raise RuntimeError("convert_hf_to_gguf.py did not produce a non-empty regular GGUF staging file")
+                if os.read(fd, 4) != b"GGUF":
+                    raise RuntimeError("convert_hf_to_gguf.py produced a file without GGUF magic")
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise RuntimeError("convert_hf_to_gguf.py did not produce its exact requested output path") from exc
+        os.replace(partial, output)
+        util.sync_directory(output.parent)
+        return " ".join(display_command), result.returncode
+    finally:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

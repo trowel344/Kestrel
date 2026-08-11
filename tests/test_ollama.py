@@ -16,8 +16,8 @@ class _FakeResponse:
     def __exit__(self, *args):
         return False
 
-    def read(self):
-        return self._payload
+    def read(self, amount=None):
+        return self._payload if amount is None else self._payload[:amount]
 
 
 class _FakeHTTPError(Exception):
@@ -87,6 +87,72 @@ def test_invalid_json_wrapped():
         return _FakeResponse(b"not json {")
 
     client = OllamaClient(base_url="http://localhost:11434", opener=opener)
+    with pytest.raises(OllamaError, match="invalid JSON"):
+        client.generate("m", "p")
+
+
+def test_oversized_response_is_rejected_without_unbounded_read():
+    response = _FakeResponse(b"x" * 17)
+    client = OllamaClient(base_url="http://localhost:11434", opener=lambda *args, **kwargs: response)
+    client._MAX_RESPONSE_BYTES = 16
+
+    with pytest.raises(OllamaError, match="exceeded"):
+        client.generate("m", "p")
+
+
+def test_invalid_utf8_is_wrapped():
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        opener=lambda *args, **kwargs: _FakeResponse(b'"\xff"'),
+    )
+    with pytest.raises(OllamaError, match="invalid JSON"):
+        client.generate("m", "p")
+
+
+def test_non_object_json_is_wrapped():
+    def opener(request, timeout):
+        return _FakeResponse(b"[]")
+
+    client = OllamaClient(base_url="http://localhost:11434", opener=opener)
+    with pytest.raises(OllamaError, match="unexpected JSON response"):
+        client.generate("m", "p")
+
+
+@pytest.mark.parametrize("value", ["many", True, 1.5, -1, None, float("nan"), float("inf"), 1 << 64])
+def test_invalid_metrics_are_wrapped(value):
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        opener=_success_opener({"response": "ok", "eval_count": value}),
+    )
+    with pytest.raises(OllamaError, match="invalid generation metrics"):
+        client.generate("m", "p")
+
+
+@pytest.mark.parametrize("field", ["response", "thinking"])
+def test_invalid_generation_text_is_wrapped(field):
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        opener=_success_opener({field: ["not", "text"]}),
+    )
+    with pytest.raises(OllamaError, match="invalid generation text"):
+        client.generate("m", "p")
+
+
+def test_invalid_or_oversized_error_detail_is_bounded():
+    malformed = OllamaClient(base_url="http://localhost:11434", opener=_success_opener({"error": ["bad"]}))
+    with pytest.raises(OllamaError, match="invalid error response"):
+        malformed.generate("m", "p")
+
+    bounded = OllamaClient(base_url="http://localhost:11434", opener=_success_opener({"error": "x" * 2000}))
+    with pytest.raises(OllamaError) as caught:
+        bounded.generate("m", "p")
+    assert len(str(caught.value)) == 1000
+
+
+def test_huge_json_integer_is_wrapped(monkeypatch):
+    monkeypatch.setattr("sys.get_int_max_str_digits", lambda: 4300, raising=False)
+    payload = b'{"eval_count": ' + (b"9" * 5000) + b"}"
+    client = OllamaClient(base_url="http://localhost:11434", opener=lambda *_args, **_kwargs: _FakeResponse(payload))
     with pytest.raises(OllamaError, match="invalid JSON"):
         client.generate("m", "p")
 
