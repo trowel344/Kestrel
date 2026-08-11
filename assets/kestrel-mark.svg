@@ -2,7 +2,7 @@
   <title id="title">Kestrel pixel K</title>
   <desc id="desc">A centered layered off-white block-pixel letter K on a deep navy tile.</desc>
   <rect width="224" height="224" rx="32" fill="#07121f"/>
-  <rect x="8" y="8" width="208" height="208" rx="26" fill="#0b1b2b" stroke="#173149" stroke-width="2"/>
+  <rect x="8" y="8" width="208" height="208" rx="26" fill="#0b1b2b"/>
 
   <defs>
     <!-- A literal 14 px grid keeps the mark crisp from favicon to banner. -->
@@ -20,21 +20,9 @@
       <rect x="126" y="140" width="28" height="28"/>
       <rect x="140" y="154" width="28" height="28"/>
     </g>
-    <g id="pixel-k-arms">
-      <rect x="140" y="42" width="28" height="28"/>
-      <rect x="126" y="56" width="28" height="28"/>
-      <rect x="112" y="70" width="28" height="28"/>
-      <rect x="98" y="84" width="28" height="28"/>
-      <rect x="84" y="98" width="42" height="28"/>
-
-      <rect x="98" y="112" width="28" height="28"/>
-      <rect x="112" y="126" width="28" height="28"/>
-      <rect x="126" y="140" width="28" height="28"/>
-      <rect x="140" y="154" width="28" height="28"/>
-    </g>
   </defs>
 
-  <!-- A tonal underlay appears only on the two arms, like stacked pixel blocks. -->
-  <use href="#pixel-k-arms" fill="#bbb8af" transform="translate(5 6)"/>
+  <!-- A complete tonal underlay makes the K read as one stacked pixel form. -->
+  <use href="#pixel-k" fill="#bbb8af" transform="translate(5 6)"/>
   <use href="#pixel-k" fill="#f3f0e7"/>
 </svg>

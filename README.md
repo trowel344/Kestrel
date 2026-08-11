@@ -2,7 +2,7 @@
 
 <img src="assets/kestrel-mark.svg" width="132" alt="Kestrel block-pixel K logo">
 
-# Kestrel
+<p><strong>K E S T R E L</strong></p>
 
 **Run models larger than your memory.**
 
