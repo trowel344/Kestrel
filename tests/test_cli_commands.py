@@ -517,9 +517,48 @@ def test_setup_persists_resolved_model_and_refreshes_state(monkeypatch, tmp_path
     monkeypatch.setattr(health, "save_config", lambda value: saved.append(value) or tmp_path / "config.toml")
     refreshed = []
     monkeypatch.setattr(health.state, "reload_state", lambda: refreshed.append(True))
-    args = parser.build_parser().parse_args(["setup", "--model", str(model), "--models-dir", str(tmp_path / "models")])
+    args = parser.build_parser().parse_args(
+        [
+            "setup",
+            "--model",
+            str(model),
+            "--models-dir",
+            str(tmp_path / "models"),
+            "--context",
+            "8192",
+            "--reasoning",
+            "high",
+        ]
+    )
     assert main._run_dispatched(parser.build_parser(), args) == 0
     assert saved[0].default_model == str(model.resolve())
     assert saved[0].models_dir == str(tmp_path / "models")
+    assert saved[0].context_size == 8192
+    assert saved[0].reasoning_level == "high"
     assert refreshed == [True]
     assert "configuration saved" in capsys.readouterr().out
+
+
+def test_settings_show_and_update_persistent_model_defaults(monkeypatch, tmp_path, capsys):
+    current = config.KestrelConfig(default_model="model.gguf", context_size="auto", reasoning_level="auto")
+    monkeypatch.setattr(health, "load_config", lambda: current)
+    saved = []
+    monkeypatch.setattr(health, "save_config", lambda value: saved.append(value) or tmp_path / "config.toml")
+    monkeypatch.setattr(health.state, "reload_state", lambda: None)
+
+    assert _dispatch(["settings", "--context", "16384", "--reasoning", "medium", "--json"]) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["context_size"] == 16384
+    assert payload["reasoning_level"] == "medium"
+    assert payload["reasoning_budgets"]["medium"] == 2048
+    assert saved[0].default_model == "model.gguf"
+
+
+def test_run_parser_uses_saved_settings_and_allows_one_launch_override(monkeypatch):
+    monkeypatch.setattr(state, "USER_CONFIG", config.KestrelConfig(context_size=8192, reasoning_level="high"))
+    saved = parser.build_parser().parse_args(["run", "model.gguf"])
+    overridden = parser.build_parser().parse_args(["run", "model.gguf", "--ctx-size", "4096", "--reasoning", "off"])
+
+    assert (saved.ctx_size, saved.reasoning) == (8192, "high")
+    assert (overridden.ctx_size, overridden.reasoning) == (4096, "off")

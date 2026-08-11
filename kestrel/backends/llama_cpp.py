@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .. import util
+from ..config import REASONING_BUDGETS
 from ..errors import BackendError
 
 NATIVE_LLAMA_CPP_DIRS = (
@@ -241,6 +242,7 @@ class LlamaCppBackend:
         tensor_split: str | None = None,
         rpc_endpoints: list[str] | tuple[str, ...] | None = None,
         extra_args: list[str] | None = None,
+        reasoning_level: str = "auto",
     ):
         self.model_path = model_path
         self.n_gpu_layers = n_gpu_layers
@@ -262,6 +264,9 @@ class LlamaCppBackend:
         self.tensor_split = tensor_split
         self.rpc_endpoints = tuple(str(endpoint).strip() for endpoint in (rpc_endpoints or ()) if str(endpoint).strip())
         self.extra_args = list(extra_args or ())
+        if reasoning_level not in REASONING_BUDGETS:
+            raise ValueError(f"invalid reasoning level: {reasoning_level}")
+        self.reasoning_level = reasoning_level
         self.n_threads = max(0, n_threads)
         self.moe_cache = moe_cache
         self.llama_cpp_dir = llama_cpp_dir or default_llama_cpp_dir()
@@ -390,6 +395,14 @@ class LlamaCppBackend:
             args += ["--spec-type", spec_type]
             if caps.supports("--spec-draft-n-max"):
                 args += ["--spec-draft-n-max", str(self.spec_draft_n)]
+        reasoning_budget = REASONING_BUDGETS[self.reasoning_level]
+        if reasoning_budget is not None:
+            if not caps.supports("--reasoning-budget"):
+                raise BackendError(
+                    f"reasoning level '{self.reasoning_level}' requires llama.cpp --reasoning-budget support",
+                    hint="run `kestrel build` to update the engine or set reasoning to auto",
+                )
+            args += ["--reasoning-budget", str(reasoning_budget)]
         if self.extra_args:
             args += self.extra_args
         return args

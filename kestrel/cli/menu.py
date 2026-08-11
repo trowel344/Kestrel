@@ -243,6 +243,7 @@ class _MenuSession:
         index = self._pick(
             [
                 ("Choose default model", "used when chat starts"),
+                ("Model settings", "context window and reasoning level"),
                 ("Installed models", "show local and provider models"),
                 ("Add a model", "local GGUF, Ollama, or Hugging Face"),
                 ("Find models online", "search the GGUF model market"),
@@ -254,13 +255,67 @@ class _MenuSession:
         if index == 0:
             self._select_model()
         elif index == 1:
-            self._launch("models", "list", "--resolve")
+            self._model_settings()
         elif index == 2:
-            self._import_models()
+            self._launch("models", "list", "--resolve")
         elif index == 3:
-            self._search_models()
+            self._import_models()
         elif index == 4:
+            self._search_models()
+        elif index == 5:
             self._configure_models_dir()
+
+    def _model_settings(self) -> None:
+        config = load_config()
+        context = str(getattr(config, "context_size", "auto"))
+        reasoning = str(getattr(config, "reasoning_level", "auto"))
+        index = self._pick(
+            [
+                ("Context window", f"currently {context}"),
+                ("Reasoning level", f"currently {reasoning}"),
+                _BACK,
+            ],
+            "Model settings",
+        )
+        if index == 0:
+            self._configure_context()
+        elif index == 1:
+            self._configure_reasoning()
+
+    def _configure_context(self) -> None:
+        options = [
+            ("Automatic", "fit the context to current memory"),
+            ("2K", "2,048 tokens"),
+            ("4K", "4,096 tokens"),
+            ("8K", "8,192 tokens"),
+            ("16K", "16,384 tokens"),
+            ("32K", "32,768 tokens"),
+            ("Custom", "enter any value of at least 512"),
+            _BACK,
+        ]
+        index = self._pick(options, "Context window")
+        values = ("auto", "2048", "4096", "8192", "16384", "32768")
+        if index < len(values):
+            self._launch("settings", "--context", values[index])
+        elif index == 6:
+            value = self._prompt_required("Context tokens (minimum 512)")
+            if value:
+                self._launch("settings", "--context", value)
+
+    def _configure_reasoning(self) -> None:
+        levels = [
+            ("Automatic", "use the model and engine default"),
+            ("Off", "answer without a reasoning budget"),
+            ("Low", "up to 512 reasoning tokens"),
+            ("Medium", "up to 2,048 reasoning tokens"),
+            ("High", "up to 8,192 reasoning tokens"),
+            ("Maximum", "allow unrestricted reasoning"),
+            _BACK,
+        ]
+        index = self._pick(levels, "Reasoning level")
+        values = ("auto", "off", "low", "medium", "high", "maximum")
+        if index < len(values):
+            self._launch("settings", "--reasoning", values[index])
 
     def _tools(self) -> None:
         index = self._pick(

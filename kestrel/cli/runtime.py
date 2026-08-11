@@ -337,6 +337,7 @@ def _configure_backend(model_info: dict, config: dict, args=None) -> LlamaCppBac
         ),
         rpc_endpoints=node_plan.get("rpc_endpoints") or [],
         extra_args=_flatten_extra(args.extra if args else None),
+        reasoning_level=(getattr(args, "reasoning", "auto") if args else "auto"),
         n_threads=(args.threads if args and args.threads is not None else config["threads"]),
         llama_cpp_dir=state.LLAMA_CPP_DIR,
         moe_cache=(

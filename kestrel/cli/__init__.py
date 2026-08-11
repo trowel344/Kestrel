@@ -49,6 +49,7 @@ from .health import (
     _save_default_model,
     _writable_probe,
     cmd_doctor,
+    cmd_settings,
     cmd_setup,
     cmd_status,
 )
@@ -160,6 +161,7 @@ __all__ = [
     "_save_default_model",
     "_writable_probe",
     "cmd_doctor",
+    "cmd_settings",
     "cmd_setup",
     "cmd_status",
     "_run_dispatched",

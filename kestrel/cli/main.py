@@ -15,7 +15,7 @@ from .bench import cmd_benchmark, cmd_optimize
 from .convert import cmd_audit, cmd_convert
 from .engine import cmd_build, cmd_engine
 from .evaluate import cmd_evaluate
-from .health import cmd_doctor, cmd_setup, cmd_status
+from .health import cmd_doctor, cmd_settings, cmd_setup, cmd_status
 from .menu import cmd_menu
 from .models import cmd_models
 from .nodes import cmd_nodes
@@ -30,6 +30,7 @@ _COMMAND_HANDLERS = {
     "chat": cmd_run,
     "serve": cmd_serve,
     "setup": cmd_setup,
+    "settings": cmd_settings,
     "benchmark": cmd_benchmark,
     "evaluate": cmd_evaluate,
     "model-test": cmd_evaluate,

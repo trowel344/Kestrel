@@ -67,8 +67,13 @@ class FakeUI:
         self.pauses += 1
 
 
-def _config(default_model="model.gguf"):
-    return SimpleNamespace(default_model=default_model, models_dir="")
+def _config(default_model="model.gguf", context_size="auto", reasoning_level="auto"):
+    return SimpleNamespace(
+        default_model=default_model,
+        models_dir="",
+        context_size=context_size,
+        reasoning_level=reasoning_level,
+    )
 
 
 def test_cmd_menu_requires_a_terminal(monkeypatch):
@@ -92,7 +97,7 @@ def test_chat_action_builds_the_same_dispatch_vector_and_exit_returns(monkeypatc
 
 
 def test_submenu_back_is_a_noop_and_returns_to_main(monkeypatch):
-    fake_ui = FakeUI(selections=[1, 5, 3])
+    fake_ui = FakeUI(selections=[1, 6, 3])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -104,7 +109,7 @@ def test_submenu_back_is_a_noop_and_returns_to_main(monkeypatch):
 
 
 def test_cancelled_prompt_does_not_dispatch(monkeypatch):
-    fake_ui = FakeUI(selections=[1, 3, 3], answers=[KeyboardInterrupt()])
+    fake_ui = FakeUI(selections=[1, 4, 3], answers=[KeyboardInterrupt()])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -320,12 +325,13 @@ def test_submenu_dispatchers_route_models_tools_and_add_actions(monkeypatch):
     monkeypatch.setattr(session, "_convert_model", lambda: routed.append("convert"))
     monkeypatch.setattr(session, "_select_model", lambda: routed.append("default"))
     monkeypatch.setattr(session, "_configure_models_dir", lambda: routed.append("directory"))
+    monkeypatch.setattr(session, "_model_settings", lambda: routed.append("settings"))
     monkeypatch.setattr(session, "_use_local_model", lambda: routed.append("local"))
     monkeypatch.setattr(session, "_import_ollama", lambda: routed.append("ollama"))
     monkeypatch.setattr(session, "_pull_hugging_face", lambda: routed.append("huggingface"))
     monkeypatch.setattr(session, "_import_models", lambda: routed.append("add"))
 
-    for index in range(5):
+    for index in range(6):
         monkeypatch.setattr(session, "_pick", lambda _items, _title, index=index: index)
         session._models()
     monkeypatch.setattr(session, "_pick", lambda _items, _title: 0)
@@ -343,4 +349,34 @@ def test_submenu_dispatchers_route_models_tools_and_add_actions(monkeypatch):
     session._import_models()
 
     assert launches == [("models", "list", "--resolve"), ("doctor",), ("benchmark",)]
-    assert routed == ["default", "add", "search", "directory", "convert", "local", "ollama", "huggingface"]
+    assert routed == [
+        "default",
+        "settings",
+        "add",
+        "search",
+        "directory",
+        "convert",
+        "local",
+        "ollama",
+        "huggingface",
+    ]
+
+
+def test_model_settings_dispatch_context_presets_custom_and_reasoning(monkeypatch):
+    launches = []
+    session = menu._MenuSession(launch=lambda *args: launches.append(args))
+    fake_ui = FakeUI(answers=["12288"])
+    monkeypatch.setattr(menu, "ui", fake_ui)
+
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 3)
+    session._configure_context()
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 6)
+    session._configure_context()
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 4)
+    session._configure_reasoning()
+
+    assert launches == [
+        ("settings", "--context", "8192"),
+        ("settings", "--context", "12288"),
+        ("settings", "--reasoning", "high"),
+    ]

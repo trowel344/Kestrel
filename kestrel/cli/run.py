@@ -19,6 +19,18 @@ from ..errors import BackendError, InputError, ModelError, ServiceError
 from . import model_source, parser, planning, probes, runtime
 
 
+def _ollama_run_command(name: str, reasoning: str) -> list[str]:
+    """Build the provider fallback command without pretending it owns context."""
+    command = ["ollama", "run", name]
+    if reasoning == "off":
+        command.extend(["--think", "false"])
+    elif reasoning in {"low", "medium", "high"}:
+        command.extend(["--think", reasoning])
+    elif reasoning == "maximum":
+        command.extend(["--think", "true"])
+    return command
+
+
 def _prepare_run_model(args):
     """Resolve the requested model, converting/placing it for the Kestrel
     runtime and producing the fitting config.
@@ -48,10 +60,11 @@ def _prepare_run_model(args):
             )
             args.model = blob
         else:
+            ollama_command = _ollama_run_command(name, getattr(args, "reasoning", "auto"))
             if args.dry_run:
                 out = runtime._human_stream(args)
                 print("Runtime: Ollama adapter", file=out)
-                print("Command: " + shlex.join(["ollama", "run", name]), file=out)
+                print("Command: " + shlex.join(ollama_command), file=out)
                 print(
                     "Note: context and placement are owned by the Ollama runtime for this adapter.",
                     file=out,
@@ -62,13 +75,13 @@ def _prepare_run_model(args):
                         "model": args.model,
                         "dry_run": True,
                         "engine": "ollama",
-                        "command": ["ollama", "run", name],
+                        "command": ollama_command,
                     },
                 )
                 return None
             try:
                 if getattr(args, "json", False):
-                    result = subprocess.run(["ollama", "run", name], stdout=sys.stderr, stderr=sys.stderr)
+                    result = subprocess.run(ollama_command, stdout=sys.stderr, stderr=sys.stderr)
                     return runtime._finish_json(
                         args,
                         {
@@ -77,7 +90,7 @@ def _prepare_run_model(args):
                             "exit_code": result.returncode,
                         },
                     )
-                result = subprocess.run(["ollama", "run", name])
+                result = subprocess.run(ollama_command)
             except FileNotFoundError as exc:
                 raise BackendError("Ollama is not installed", hint="install Ollama or pass a local GGUF path") from exc
             except OSError as exc:
@@ -151,6 +164,7 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
         [
             ui.kv("Threads", str(planned_threads)),
             ui.kv("Context", f"{config['context_size']} ({config['context_reason']})"),
+            ui.kv("Reasoning", config.get("reasoning_level", "auto")),
             ui.kv("KV cache", str(args.kv_cache_type)),
             ui.kv(
                 "Batch / micro-batch",
@@ -370,6 +384,7 @@ def _cmd_serve_live(args):
                     ui.kv("Engine", "llama-server"),
                     ui.kv("URL", f"http://{host}:{port}", value_color=ui.cyan),
                     ui.kv("Context", f"{config['context_size']} ({config['context_reason']})"),
+                    ui.kv("Reasoning", config.get("reasoning_level", "auto")),
                     ui.kv("GPU layers", str(config["gpu_layers"])),
                     ui.kv("CPU MoE", "enabled" if config["cpu_moe"] else "disabled"),
                     *(

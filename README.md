@@ -55,7 +55,9 @@ hardware, quantization, context, storage, and model architecture all matter.
 ```
 
 Choose **Models → Add a model** once, then **Start chat**. Kestrel automatically
-chooses conservative memory and hardware settings for the first run.
+chooses conservative memory and hardware settings for the first run. Use
+**Models → Model settings** to keep context automatic or select a fixed window,
+and to set reasoning to automatic, off, low, medium, high, or maximum.
 
 Already have a GGUF and prefer the scriptable path?
 
@@ -121,6 +123,7 @@ kestrel                 open the minimal interactive menu
 kestrel doctor          inspect hardware, storage, models, and llama.cpp
 kestrel run             plan and run a local model
 kestrel chat            chat with the configured model
+kestrel settings        view or change context and reasoning defaults
 kestrel serve           expose an OpenAI-compatible local endpoint
 kestrel benchmark       measure prompt and decode throughput
 kestrel evaluate        run deterministic capability checks
@@ -136,6 +139,8 @@ kestrel build           build the pinned llama.cpp engine safely
 
 | Flag | Purpose |
 | --- | --- |
+| `--ctx-size 8192` | Override the saved or automatic context window for this launch. |
+| `--reasoning high` | Give supported reasoning models an 8,192-token thinking budget. |
 | `--direct-io` | Bypass the page cache for a cold NVMe load. |
 | `--mlock` | Pin CPU-offloaded weights when enough RAM exists. |
 | `--tensor-split 60,40` | Override multi-GPU split ratios. |
@@ -148,6 +153,18 @@ kestrel build           build the pinned llama.cpp engine safely
 `kestrel run --json --dry-run MODEL` prints the validated plan and complete
 command without launching the model. `serve --embeddings` enables the local
 OpenAI-compatible embeddings endpoint.
+
+Persistent defaults can also be managed without the menu:
+
+```bash
+kestrel settings --context 8192 --reasoning high
+kestrel settings --json
+```
+
+Reasoning levels are real llama.cpp budgets: off is 0 tokens, low is 512,
+medium is 2,048, high is 8,192, and maximum is unrestricted. The selected
+model must expose a compatible reasoning template. Kestrel fails clearly when
+an explicit level is used with an engine that lacks reasoning-budget support.
 
 </details>
 

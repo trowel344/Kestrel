@@ -9,6 +9,8 @@ def test_config_roundtrip(tmp_path, monkeypatch):
         default_model="ollama://qwen3.6:27b",
         models_dir="/tmp/models",
         llama_cpp_dir="/tmp/llama.cpp",
+        context_size=8192,
+        reasoning_level="high",
     )
     save_config(cfg, path)
     loaded = load_config(path)
@@ -48,6 +50,9 @@ def test_invalid_config_raises(tmp_path, monkeypatch):
     [
         ("local = []", "local.*must be a table"),
         ("[local]\nmodels_dir = 42", "local.models_dir must be a string"),
+        ("[local]\ncontext_size = 128", "local.context_size"),
+        ("[local]\ncontext_size = true", "local.context_size"),
+        ("[local]\nreasoning_level = 'extreme'", "local.reasoning_level"),
     ],
 )
 def test_invalid_config_schema_is_typed(tmp_path, text, message):

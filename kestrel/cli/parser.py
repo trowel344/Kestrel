@@ -16,6 +16,7 @@ import re
 import sys
 from pathlib import Path
 
+from ..config import REASONING_LEVELS
 from ..errors import InputError
 from . import model_source, planning, state
 
@@ -198,8 +199,14 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
     parser.add_argument(
         "--ctx-size",
         type=planning._context_size_arg,
-        default="auto",
-        help="context tokens (default: hardware-aware auto)",
+        default=getattr(state.USER_CONFIG, "context_size", "auto"),
+        help="context tokens (default: saved model setting, initially hardware-aware auto)",
+    )
+    parser.add_argument(
+        "--reasoning",
+        choices=REASONING_LEVELS,
+        default=getattr(state.USER_CONFIG, "reasoning_level", "auto"),
+        help="reasoning budget: auto, off, low, medium, high, or maximum (default: saved model setting)",
     )
     parser.add_argument("--gpu-layers", type=_gpu_layers, default="auto", help="auto, all, or an exact count")
     parser.add_argument("--cpu-moe", choices=("auto", "on", "off"), default="auto")
@@ -354,11 +361,18 @@ def build_parser():
     setup.add_argument("--model", help="default local GGUF, directory, or tested alias")
     setup.add_argument("--models-dir", help="managed model download directory")
     setup.add_argument("--llama-cpp-dir")
+    setup.add_argument("--context", type=planning._context_size_arg, help="saved context: auto or at least 512 tokens")
+    setup.add_argument("--reasoning", choices=REASONING_LEVELS, help="saved reasoning level")
     setup.add_argument(
         "--reset",
         action="store_true",
         help="replace all saved defaults; also repairs a malformed config",
     )
+
+    settings = sub.add_parser("settings", help="View or change default model context and reasoning")
+    settings.add_argument("--context", type=planning._context_size_arg, help="auto or at least 512 tokens")
+    settings.add_argument("--reasoning", choices=REASONING_LEVELS, help="auto, off, low, medium, high, or maximum")
+    _add_json_flag(settings)
 
     benchmark = sub.add_parser("benchmark", help="Measure prompt and decode rates reproducibly")
     benchmark.add_argument("model", nargs="?")

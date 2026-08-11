@@ -252,5 +252,6 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
         "measured-q1-fallback" if args and getattr(args, "moe_cold_model", None) else "uncalibrated-model-estimate"
     )
     result["context_reason"] = context_reason
+    result["reasoning_level"] = getattr(args, "reasoning", "auto") if args else "auto"
     result["memory_overcommit"] = overcommitted
     return result

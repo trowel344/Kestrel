@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .. import ui
 from ..backends.llama_cpp import LlamaCppBackend, default_llama_cpp_dir
-from ..config import KestrelConfig, config_path, load_config, save_config
+from ..config import REASONING_BUDGETS, KestrelConfig, config_path, load_config, save_config
 from ..errors import ModelError
 from ..model_store import default_models_dir
 from ..util import available_disk_bytes
@@ -538,6 +538,10 @@ def cmd_setup(args):
         default_model=model,
         models_dir=args.models_dir or current.models_dir,
         llama_cpp_dir=llama_dir,
+        context_size=getattr(args, "context", None)
+        if getattr(args, "context", None) is not None
+        else current.context_size,
+        reasoning_level=getattr(args, "reasoning", None) or current.reasoning_level,
     )
     target = save_config(configured)
     state.reload_state()
@@ -554,6 +558,49 @@ def cmd_setup(args):
                     ),
                     ui.kv("Models directory", configured.models_dir or "platform default"),
                     ui.kv("llama.cpp", configured.llama_cpp_dir),
+                    ui.kv("Context", str(configured.context_size)),
+                    ui.kv("Reasoning", configured.reasoning_level),
+                ]
+            ),
+        )
+    )
+
+
+def cmd_settings(args):
+    """Show or atomically update the defaults applied to model launches."""
+    current = load_config()
+    configured = KestrelConfig(
+        default_model=current.default_model,
+        models_dir=current.models_dir,
+        llama_cpp_dir=current.llama_cpp_dir,
+        context_size=args.context if args.context is not None else current.context_size,
+        reasoning_level=args.reasoning or current.reasoning_level,
+    )
+    changed = configured != current
+    target = config_path()
+    if changed:
+        target = save_config(configured)
+        state.reload_state()
+    payload = {
+        "context_size": configured.context_size,
+        "reasoning_level": configured.reasoning_level,
+        "reasoning_budgets": REASONING_BUDGETS,
+        "changed": changed,
+        "file": str(target),
+    }
+    if args.json:
+        print(json.dumps(payload))
+        return
+    print(
+        ui.box(
+            "Default model settings" + (" saved" if changed else ""),
+            "\n".join(
+                [
+                    ui.kv("Context", str(configured.context_size), value_color=ui.cyan),
+                    ui.kv("Reasoning", configured.reasoning_level, value_color=ui.cyan),
+                    ui.kv("File", str(target)),
+                    "",
+                    ui.dim("CLI overrides: --ctx-size and --reasoning"),
                 ]
             ),
         )
@@ -568,6 +615,8 @@ def _save_default_model(model: str | Path) -> None:
             default_model=value,
             models_dir=current.models_dir,
             llama_cpp_dir=current.llama_cpp_dir,
+            context_size=current.context_size,
+            reasoning_level=current.reasoning_level,
         )
     )
     state.reload_state()

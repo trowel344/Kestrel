@@ -224,6 +224,32 @@ def test_resolved_spec_type_unsupported_returns_none():
     assert backend._resolved_spec_type(caps) is None
 
 
+@pytest.mark.parametrize(
+    ("level", "budget"),
+    [("off", "0"), ("low", "512"), ("medium", "2048"), ("high", "8192"), ("maximum", "-1")],
+)
+def test_reasoning_levels_emit_real_engine_budgets(tmp_path, level, budget):
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text="--reasoning-budget\n"), tmp_path)
+    backend.reasoning_level = level
+
+    cmd = backend._base_cmd()
+
+    index = cmd.index("--reasoning-budget")
+    assert cmd[index + 1] == budget
+
+
+def test_reasoning_auto_leaves_engine_default_untouched(tmp_path):
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text=""), tmp_path)
+    assert "--reasoning-budget" not in backend._base_cmd()
+
+
+def test_explicit_reasoning_fails_when_engine_cannot_honor_it(tmp_path):
+    backend = _backend_with_caps(LlamaCppCapabilities(help_text="--mmap\n"), tmp_path)
+    backend.reasoning_level = "high"
+    with pytest.raises(BackendError, match="requires llama.cpp --reasoning-budget support"):
+        backend._base_cmd()
+
+
 def test_parse_metrics_populates_fields():
     stderr = """
 ggml_sync: llama_get_logits done
@@ -357,7 +383,7 @@ _ENGINE_HELP = (
     "--fit\n--fit-target\n--mlock\n--tensor-split\n--mmap\n--no-mmap\n"
     "--cpu-moe\n--moe-cache\n--cache-type-k\n--cache-type-v\n--flash-attn\n"
     "--threads\n--threads-batch\n--spec-type none,draft-mtp\n--spec-draft-n-max\n"
-    "--direct-io\n--embeddings\n"
+    "--direct-io\n--embeddings\n--reasoning-budget\n"
 )
 
 
@@ -368,6 +394,7 @@ def test_build_server_cmd_emits_fit_and_engine_flags(tmp_path):
     backend.use_mlock = True
     backend.tensor_split = "25,75"
     backend.use_mmap = True
+    backend.reasoning_level = "high"
     backend.extra_args = ["--temp", "0.4"]
     cmd = backend.build_server_cmd(host="0.0.0.0", port=9000, alias="m", embeddings=True)
     for flag in (
@@ -407,6 +434,7 @@ def test_server_and_interactive_share_engine_flags(tmp_path):
     backend.use_mlock = True
     backend.tensor_split = "25,75"
     backend.use_mmap = True
+    backend.reasoning_level = "high"
     base = backend._base_cmd()
     server = backend.build_server_cmd()
     for flag in (
@@ -419,6 +447,8 @@ def test_server_and_interactive_share_engine_flags(tmp_path):
         "25,75",
         "--flash-attn",
         "auto",
+        "--reasoning-budget",
+        "8192",
     ):
         assert flag in base
         assert flag in server

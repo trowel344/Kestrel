@@ -6,6 +6,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Added persistent model settings for context size and reasoning level. They
+  are available from **Models → Model settings**, `kestrel settings`, and
+  per-launch `--ctx-size` / `--reasoning` overrides; explicit reasoning levels
+  now become real llama.cpp reasoning budgets rather than UI-only labels.
+
 ### Added
 
 - **Experimental trusted RPC nodes**: strict atomic named-node inventory,

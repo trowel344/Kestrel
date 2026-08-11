@@ -551,11 +551,11 @@ def test_cmd_run_ollama_cloud_model_keeps_passthrough(monkeypatch, capsys, tmp_p
         return SimpleNamespace(returncode=7)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    args = _run_args("ollama://qwen3-cloud:latest", dry_run=False)
+    args = _run_args("ollama://qwen3-cloud:latest", dry_run=False, reasoning="high")
     with pytest.raises(SystemExit) as exc:
         cli.cmd_run(args)
     assert exc.value.code == 7
-    assert calls == [["ollama", "run", "qwen3-cloud:latest"]]
+    assert calls == [["ollama", "run", "qwen3-cloud:latest", "--think", "high"]]
 
 
 def test_self_update_wheel_sha256_mismatch(monkeypatch, tmp_path):

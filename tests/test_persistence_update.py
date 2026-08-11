@@ -28,7 +28,8 @@ def test_save_config_uses_atomic_writer(monkeypatch, tmp_path):
     result = config.save_config(config.KestrelConfig(default_model="m"), target)
     assert result == target
     assert calls and calls[0][0] == target
-    assert calls[0][1].endswith('default_model = "m"\n')
+    assert 'default_model = "m"\n' in calls[0][1]
+    assert calls[0][1].endswith('reasoning_level = "auto"\n')
 
 
 def test_planner_cache_write_is_atomic(monkeypatch, tmp_path):
