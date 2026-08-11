@@ -6,6 +6,9 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from .errors import ConfigError
+from .util import write_atomic
+
 
 @dataclass(frozen=True)
 class KestrelConfig:
@@ -29,7 +32,7 @@ def load_config(path: str | Path | None = None) -> KestrelConfig:
     try:
         payload = tomllib.loads(target.read_text())
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ValueError(f"invalid Kestrel config {target}: {exc}") from exc
+        raise ConfigError(f"invalid Kestrel config {target}: {exc}") from exc
     local = payload.get("local", {})
     return KestrelConfig(
         default_model=local.get("default_model"),
@@ -48,5 +51,5 @@ def save_config(config: KestrelConfig, path: str | Path | None = None) -> Path:
         lines.append(f"models_dir = {json.dumps(config.models_dir)}")
     if config.llama_cpp_dir:
         lines.append(f"llama_cpp_dir = {json.dumps(config.llama_cpp_dir)}")
-    target.write_text("\n".join(lines) + "\n")
+    write_atomic(target, "\n".join(lines) + "\n")
     return target

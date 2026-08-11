@@ -171,18 +171,8 @@ def predict_decode_tokens_per_second(
 
     active_bytes = params["active_params"] * bpp / 1024**3
     dense_bytes = model.n_layers * params["dense_per_layer"] * bpp / 1024**3
-    expert_bpp = (
-        BYTES_PER_PARAM.get(cpu_expert_quant, bpp)
-        if cpu_expert_quant
-        else bpp
-    )
-    expert_bytes = (
-        model.n_layers
-        * model.n_experts_used
-        * params["expert_params"]
-        * expert_bpp
-        / 1024**3
-    )
+    expert_bpp = BYTES_PER_PARAM.get(cpu_expert_quant, bpp) if cpu_expert_quant else bpp
+    expert_bytes = model.n_layers * model.n_experts_used * params["expert_params"] * expert_bpp / 1024**3
 
     if not cpu_moe:
         tps = gpu_bw / active_bytes
@@ -201,12 +191,7 @@ def predict_decode_tokens_per_second(
         # All routed experts are computed on the CPU in CPU-MoE mode; the
         # expert cache avoids weight re-uploads but not the matmuls, so it does
         # not relax this compute bound.
-        cpu_flops = (
-            model.n_layers
-            * model.n_experts_used
-            * params["expert_params"]
-            * FLOP_PER_PARAM_PER_TOKEN
-        )
+        cpu_flops = model.n_layers * model.n_experts_used * params["expert_params"] * FLOP_PER_PARAM_PER_TOKEN
         cpu_tps = (hardware.cpu_gflops * 1e9) / max(1e-9, cpu_flops)
         if cpu_expert_quant == "q1_0":
             cpu_tps = DEFAULT_CPU_Q1_LAYER_TPS / max(1, model.n_layers)
@@ -244,14 +229,8 @@ def plan_runtime(
     fit_target = _fit_target_mib(total_vram)
 
     usable_vram_bytes = max(0, free_vram - fit_target) * MIB
-    model_is_larger_than_vram = bool(
-        model.file_size_bytes and model.file_size_bytes > usable_vram_bytes
-    )
-    cpu_moe = (
-        model_is_larger_than_vram
-        if requested_cpu_moe is None
-        else requested_cpu_moe
-    )
+    model_is_larger_than_vram = bool(model.file_size_bytes and model.file_size_bytes > usable_vram_bytes)
+    cpu_moe = model_is_larger_than_vram if requested_cpu_moe is None else requested_cpu_moe
     threads = _tune_threads(cpu_moe, hardware.logical_cpu_count)
 
     verified = _is_qwen35_122b_a10b(model)
@@ -268,9 +247,7 @@ def plan_runtime(
         verified=verified,
         n_layers=model.n_layers,
     )
-    moe_cache, moe_cache_budget_mib = _select_moe_cache(
-        cpu_moe, model.n_experts
-    )
+    moe_cache, moe_cache_budget_mib = _select_moe_cache(cpu_moe, model.n_experts)
 
     return _apply_mode(
         RuntimePlan(
@@ -286,9 +263,7 @@ def plan_runtime(
             # On 8 GiB hardware, an oversized CPU-MoE target plus its MTP context
             # either OOMs or requires an all-CPU profile that is slower than the
             # non-speculative baseline. Do not enable it automatically there.
-            use_mtp=model.has_mtp and not (
-                cpu_moe and total_vram and total_vram <= 8192
-            ),
+            use_mtp=model.has_mtp and not (cpu_moe and total_vram and total_vram <= 8192),
             moe_cache=moe_cache,
             moe_cache_budget_mib=moe_cache_budget_mib,
             mmap=True,
@@ -343,9 +318,10 @@ def _select_batch_sizes(
         batch_size, ubatch_size = 2048, 512
 
     if cpu_moe and total_vram and total_vram <= 8192 and verified:
-        # Verified on an RTX 4060 Laptop 8 GiB at a real 2048-token context.
-        # This model's hybrid graph needs a smaller physical batch, while 12
-        # dense layers fit in 4.51 GiB and materially reduce host-side traffic.
+        # Keep temporary CUDA allocations bounded for the verified 8 GiB
+        # hybrid placement. Routed experts remain on CPU, so all dense layers
+        # and the output tensor can still fit; the smaller physical batch
+        # leaves the fitter room to account for context and graph buffers.
         batch_size, ubatch_size = 256, 64
     return batch_size, ubatch_size
 
@@ -359,21 +335,21 @@ def _resolve_verified_placement(
     verified: bool,
     n_layers: int,
 ) -> str:
-    if not (
-        requested_gpu_layers == "auto"
-        and cpu_moe
-        and n_experts > 0
-        and total_vram
-        and total_vram <= 8192
-    ):
+    if not (requested_gpu_layers == "auto" and cpu_moe and n_experts > 0 and total_vram and total_vram <= 8192):
         return requested_gpu_layers
     # llama.cpp's fitter currently accounts poorly for some mixed
     # CPU-MoE/CUDA layouts. Use the measured Qwen3.5-122B-A10B placement;
     # retain the conservative four-layer fallback for unknown MoE shapes.
     # Dense models are left to llama.cpp's own fitter so they offload as
     # many layers as fit instead of being pinned to four CPU layers.
-    verified_layers = 12 if verified else 4
-    return str(min(verified_layers, max(0, n_layers)))
+    if verified:
+        # 49 requests all 48 transformer blocks plus the output tensor. A real
+        # 38.67 GiB Q2-expert/Q4-dense artifact used 3.94 GiB VRAM on the
+        # reference RTX 4060 Laptop and improved decode from 3.28 to 6.25 t/s.
+        # Runtime --fit remains enabled and can lower this if other VRAM users
+        # or a larger context consume the remaining safety margin.
+        return str(max(0, n_layers) + 1)
+    return str(min(4, max(0, n_layers)))
 
 
 def _select_moe_cache(cpu_moe: bool, n_experts: int) -> tuple[str, int]:

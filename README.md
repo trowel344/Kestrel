@@ -1,18 +1,36 @@
+<div align="center">
+
 # Kestrel
 
-Hardware-aware local model orchestration for large AI work — run, convert, and
-manage multi-hundred-GB models on the hardware you actually have.
+**Run frontier-scale GGUF models on the edge hardware you already own.**
 
-Kestrel profiles the machine, inspects the model, and enables only the
-capabilities the installed llama.cpp binary supports. It plans a memory layout
-that fits your VRAM and RAM, loads weights as fast as your disk allows, and
-manages GGUFs (including split shards) without a cloud account.
+Hardware-aware orchestration, conversion, evaluation, and model management for
+llama.cpp—without requiring a cloud account or hiding the real memory plan.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/test.yml?label=tests)](https://github.com/trowel344/Kestrel/actions)
-[![Lint](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/lint.yml?label=lint)](https://github.com/trowel344/Kestrel/actions)
-[![PyPI version](https://img.shields.io/pypi/v/kestrel)](https://pypi.org/project/kestrel/)
-[![Python](https://img.shields.io/pypi/pyversions/kestrel)](https://pypi.org/project/kestrel/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/test.yml?branch=main&label=tests&logo=github)](https://github.com/trowel344/Kestrel/actions/workflows/test.yml)
+[![Lint](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/lint.yml?branch=main&label=lint&logo=ruff)](https://github.com/trowel344/Kestrel/actions/workflows/lint.yml)
+[![Distribution](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/distribution.yml?branch=main&label=wheel&logo=pypi)](https://github.com/trowel344/Kestrel/actions/workflows/distribution.yml)
+[![PyPI](https://img.shields.io/pypi/v/kestrel?logo=pypi)](https://pypi.org/project/kestrel/)
+[![Python](https://img.shields.io/pypi/pyversions/kestrel?logo=python)](https://pypi.org/project/kestrel/)
+[![License](https://img.shields.io/github/license/trowel344/Kestrel)](LICENSE)
+[![Status](https://img.shields.io/badge/status-beta-2f81f7)](CHANGELOG.md)
+
+[Quick start](#quick-start) · [Commands](#command-reference) ·
+[How it works](#why-kestrel) · [Contributing](CONTRIBUTING.md) ·
+[Security](SECURITY.md)
+
+</div>
+
+Kestrel profiles the host, inspects the model, and enables only capabilities
+the installed llama.cpp binary actually supports. It plans a layout across
+VRAM, RAM, and disk; handles split GGUFs and sparse MoE models; and keeps its
+decisions visible through human and machine-readable CLI output.
+
+> [!NOTE]
+> Kestrel is beta software. It is designed to make oversized local models
+> runnable and measurable; it does not promise that every model will be fast
+> or capable on every machine. Use `kestrel benchmark` and `kestrel evaluate`
+> to record what a specific artifact can actually do on your hardware.
 
 ## Why Kestrel
 
@@ -58,11 +76,13 @@ kestrel run         plan and run a local model
 kestrel chat        chat with the configured local model
 kestrel serve       serve a GGUF over an OpenAI-compatible HTTP endpoint
 kestrel benchmark   reproduce prompt/decode measurements
+kestrel evaluate    deterministic capability tests against llama-server
 kestrel optimize    create and optionally benchmark a hardware profile
 kestrel models      search, list, recommend, info, pull, import
 kestrel convert     convert safetensors to GGUF (NVFP4 or --generic)
 kestrel audit       validate a GGUF against its source
-kestrel build       build llama.cpp with CUDA
+kestrel build       transactionally build llama.cpp with CUDA and rollback
+kestrel self-update install a verified local checkout or checksummed wheel
 ```
 
 ## Run-time controls
@@ -80,6 +100,24 @@ kestrel build       build llama.cpp with CUDA
 `serve --embeddings` enables the `/v1/embeddings` endpoint for RAG workloads.
 `convert --generic` wraps llama.cpp's `convert_hf_to_gguf.py` so any Hugging
 Face safetensors model can become GGUF, not just the NVFP4 Qwen3.5 layout.
+
+## Measure capability, not just speed
+
+`benchmark` measures prompt processing and decode throughput. `evaluate`
+checks whether a running OpenAI-compatible llama-server can complete a small,
+deterministic capability manifest and records the model and artifact evidence
+in JSON:
+
+```bash
+kestrel benchmark /models/model.gguf --repetitions 3 --json
+kestrel serve /models/model.gguf --port 8080
+kestrel evaluate --endpoint http://127.0.0.1:8080 \
+  --artifact /models/model.gguf --sha256 --output evaluation.json
+```
+
+These reports are deliberately separate. A model can fit and run reliably yet
+remain slow, or generate quickly while failing capability checks. Kestrel does
+not collapse those outcomes into a projected score.
 
 ## Agent-friendly output
 
@@ -112,6 +150,9 @@ accepts an inline one-shot prompt; `--max-tokens` caps its budget.
   Q1/IQ1_S expert tiers, expert pruning, and optional MTP drafts.
 - **GGUF auditing** — validates an artifact against its source model.
 - **Reproducible benchmark** — separates measured results from projections.
+- **Deterministic evaluation** — records capability results, generation
+  metadata, and artifact provenance without silently treating a partial run as
+  a full pass.
 
 ## Install
 
@@ -124,6 +165,14 @@ pip install '.[dev]'          # + pytest, ruff (for contributors)
 
 See `./install.sh --help` for options (`--convert`, `--dir`).
 
+## Supported platform
+
+Kestrel targets Linux for native CUDA/llama.cpp operation. The dependency-light
+Python package and offline test suite are continuously checked on Linux and
+macOS with Python 3.11, 3.12, and 3.13. GPU behavior still depends on the
+selected llama.cpp build and driver stack; `kestrel doctor` is the authoritative
+compatibility report for a host.
+
 ## Development
 
 ```bash
@@ -133,22 +182,38 @@ ruff check kestrel/ tests/
 ```
 
 Tests never touch a real user config, model directory, or cache — `tests/`
-runs fully offline. CI runs the same suite on Python 3.11 and 3.12.
+runs fully offline. CI runs the same suite on Python 3.11, 3.12, and 3.13.
 
 ## Repository layout
 
 ```text
 kestrel/                 installable package (the product)
-  cli.py                 command-line entry point, menus, planning
+  cli/                   command-line entry point (main), parser, and command families
+    main.py              dispatch + entry point
+    parser.py            argument parser
+    probes.py            hardware probes (GPU, RAM, power)
+    model_source.py      model/GGUF/safetensors resolution
+    planning.py          memory-placement planning glue
+    runtime.py           llama.cpp launch glue, JSON contracts
+    run.py               run / serve / chat
+    health.py            doctor / status / setup
+    models.py            models subcommands
+    bench.py             benchmark / optimize
+    menu.py              interactive menu
+    engine.py            engine build / status
+    updater.py           self-update
+    convert.py           convert / audit
   config.py              config/env loading
   ui.py                  std library terminal UI
-  model_store.py         model discovery and blob resolution
+  model_store.py         model discovery, HF/Ollama stores, snapshot resolution
   core/planner.py        memory placement planning
   core/pipeline.py       llama.cpp wrapper
   backends/llama_cpp.py  process launch, capability probe, metrics
   gguf/converter.py      NVFP4 -> GGUF conversion
+  gguf/quants.py         low-level quant/dequant primitives
   gguf/metadata.py       GGUF metadata parsing
   gguf/audit.py          audit
+  evals/model_eval.py    deterministic model capability evaluation
   providers/             Ollama adapter
 ```
 

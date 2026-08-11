@@ -29,18 +29,12 @@ def _valid_gguf() -> bytes:
         key_b = key.encode("utf-8")
         value_b = value.encode("utf-8")
         kvs.append(
-            struct.pack("<Q", len(key_b)) + key_b
-            + struct.pack("<I", 8)
-            + struct.pack("<Q", len(value_b)) + value_b
+            struct.pack("<Q", len(key_b)) + key_b + struct.pack("<I", 8) + struct.pack("<Q", len(value_b)) + value_b
         )
 
     def add_uint32(key: str, value: int) -> None:
         key_b = key.encode("utf-8")
-        kvs.append(
-            struct.pack("<Q", len(key_b)) + key_b
-            + struct.pack("<I", 4)
-            + struct.pack("<I", value)
-        )
+        kvs.append(struct.pack("<Q", len(key_b)) + key_b + struct.pack("<I", 4) + struct.pack("<I", value))
 
     add_string("general.architecture", "qwen35moe")
     add_uint32("qwen35moe.block_count", 48)
@@ -75,12 +69,7 @@ def test_bad_magic_raises_corrupt_model(tmp_path):
 def test_declared_size_beyond_eof_raises(tmp_path):
     # The string value claims 100000 bytes but only 9 are present.
     key = b"general.architecture"
-    kv = (
-        struct.pack("<Q", len(key)) + key
-        + struct.pack("<I", 8)
-        + struct.pack("<Q", 100000)
-        + b"qwen35moe"
-    )
+    kv = struct.pack("<Q", len(key)) + key + struct.pack("<I", 8) + struct.pack("<Q", 100000) + b"qwen35moe"
     body = bytearray(b"GGUF")
     body += struct.pack("<I", 3)
     body += struct.pack("<Q", 0)

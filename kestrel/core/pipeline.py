@@ -5,31 +5,15 @@ from pathlib import Path
 from typing import Iterator
 
 from ..backends.llama_cpp import LlamaCppBackend
+from ..model_store import hf_snapshot_dir
 
 
 def _resolve_model_dir(path: str) -> str:
     root = Path(path).expanduser()
-    if (root / "model.safetensors.index.json").is_file():
-        return str(root)
-    refs_main = root / "refs" / "main"
-    if refs_main.is_file():
-        snapshot = root / "snapshots" / refs_main.read_text().strip()
-        if (snapshot / "model.safetensors.index.json").is_file():
-            return str(snapshot)
-    snapshots = root / "snapshots"
-    if snapshots.is_dir():
-        candidates = sorted(
-            (
-                item
-                for item in snapshots.iterdir()
-                if (item / "model.safetensors.index.json").is_file()
-            ),
-            key=lambda item: item.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            return str(candidates[0])
-    return str(root)
+    snapshot = hf_snapshot_dir(root, marker="model.safetensors.index.json")
+    # The pipeline falls back to the raw directory name so a plain model dir
+    # (not an HF cache tree) still resolves as-is.
+    return str(snapshot) if snapshot is not None else str(root)
 
 
 class InferencePipeline:
@@ -75,9 +59,7 @@ class InferencePipeline:
             n_threads=n_threads,
             llama_cpp_dir=llama_cpp_dir,
         )
-        self._strategy = (
-            "mtp" if self.backend._resolved_spec_type(self.backend.capabilities()) else "none"
-        )
+        self._strategy = "mtp" if self.backend._resolved_spec_type(self.backend.capabilities()) else "none"
 
     def _discover_gguf(self) -> str:
         if not self.model_dir:

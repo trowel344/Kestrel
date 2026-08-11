@@ -101,6 +101,30 @@ def test_f32_expansion_warning():
     assert any(f.code == "F32_EXPANSION" and f.severity == "warning" for f in findings)
 
 
+def test_primary_qwen_moe_requires_canonical_expert_tensors():
+    fields = _fields(**{"qwen35moe.expert_count": 256})
+    tensors = []
+    for i in range(48):
+        tensors.append((f"blk.{i}.ffn_gate_up_exps_lp.weight", 41))
+        tensors.append((f"blk.{i}.ffn_down_exps_lp.weight", 41))
+
+    findings = audit_snapshot(fields, tensors)
+
+    assert any(f.code == "PRIMARY_EXPERTS_MISSING" for f in _errors(findings))
+
+
+def test_primary_qwen_moe_accepts_quantized_canonical_expert_tensors():
+    fields = _fields(**{"qwen35moe.expert_count": 256})
+    tensors = []
+    for i in range(48):
+        tensors.append((f"blk.{i}.ffn_gate_up_exps.weight", 41))
+        tensors.append((f"blk.{i}.ffn_down_exps.weight", 10 if i in (0, 47) else 41))
+
+    findings = audit_snapshot(fields, tensors)
+
+    assert not any(f.code == "PRIMARY_EXPERTS_MISSING" for f in findings)
+
+
 def test_cold_sidecar_arch_check():
     fields = _fields(**{"general.architecture": "llama"})
     findings = audit_cold_sidecar_snapshot(fields, [])
@@ -136,6 +160,7 @@ def test_cold_sidecar_extra_tensor():
     ]
     findings = audit_cold_sidecar_snapshot(fields, tensors)
     assert any(f.code == "SIDECAR_EXTRA_TENSOR" for f in findings)
+
 
 def test_unparseable_gguf_returns_report(tmp_path):
     p = tmp_path / "bad.gguf"

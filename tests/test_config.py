@@ -1,4 +1,3 @@
-
 import pytest
 
 from kestrel.config import KestrelConfig, config_path, load_config, save_config
@@ -36,9 +35,11 @@ def test_save_config_creates_parent_dir(tmp_path):
 
 
 def test_invalid_config_raises(tmp_path, monkeypatch):
+    from kestrel.errors import ConfigError
+
     path = tmp_path / "bad.toml"
     path.write_text("not [valid toml")
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError):
         load_config(path)
 
 

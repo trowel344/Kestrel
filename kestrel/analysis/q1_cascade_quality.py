@@ -15,13 +15,16 @@ from dataclasses import asdict, dataclass
 import numpy as np
 
 from kestrel.gguf.converter import (
-    GGML_TYPE_Q4_0,
     MODEL_DIR,
     NVFP4Converter,
+)
+from kestrel.gguf.quants import (
+    GGML_TYPE_Q4_0,
     _quantize_q1_0_buffer,
     dequantize_nvfp4,
     dequantize_q4_0,
 )
+from kestrel.util import write_atomic
 
 
 def q1_0_cosine(first: bytes, second: bytes) -> float:
@@ -42,9 +45,7 @@ def q1_0_cosine(first: bytes, second: bytes) -> float:
     db = np.ascontiguousarray(b[:, :2]).view(np.float16).astype(np.float64).reshape(-1)
 
     # XOR sign bytes contain one bit for each weight whose signs disagree.
-    differing = np.unpackbits(
-        np.bitwise_xor(a[:, 2:], b[:, 2:]), axis=1, bitorder="little"
-    ).sum(axis=1)
+    differing = np.unpackbits(np.bitwise_xor(a[:, 2:], b[:, 2:]), axis=1, bitorder="little").sum(axis=1)
     signed_agreement = 128.0 - 2.0 * differing.astype(np.float64)
     dot = np.sum(da * db * signed_agreement)
     norm_a = np.sqrt(np.sum(da * da * 128.0))
@@ -103,9 +104,7 @@ def audit_cascade(
     results = []
 
     for layer in range(converter.n_layer):
-        experts = np.sort(
-            rng.choice(converter.n_exp, size=min(experts_per_layer, converter.n_exp), replace=False)
-        )
+        experts = np.sort(rng.choice(converter.n_exp, size=min(experts_per_layer, converter.n_exp), replace=False))
         for tensor_name, suffix in (
             ("gate_up", "ffn_gate_up_exps.weight"),
             ("down", "ffn_down_exps.weight"),
@@ -120,16 +119,17 @@ def audit_cascade(
             for expert in experts:
                 direct = _source_q1(converter, layer, int(expert), tensor_name)
                 cascade = _quantize_q1_0_buffer(dequantize_q4_0(data[int(expert)]))
-                results.append(CascadeSample(
-                    layer=layer,
-                    expert=int(expert),
-                    tensor=tensor_name,
-                    cosine=q1_0_cosine(direct, cascade),
-                ))
+                results.append(
+                    CascadeSample(
+                        layer=layer,
+                        expert=int(expert),
+                        tensor=tensor_name,
+                        cosine=q1_0_cosine(direct, cascade),
+                    )
+                )
         layer_scores = [item.cosine for item in results if item.layer == layer]
         print(
-            f"layer {layer + 1:02d}/{converter.n_layer}: "
-            f"min={min(layer_scores):.6f} mean={np.mean(layer_scores):.6f}",
+            f"layer {layer + 1:02d}/{converter.n_layer}: min={min(layer_scores):.6f} mean={np.mean(layer_scores):.6f}",
             flush=True,
         )
     return results
@@ -167,13 +167,18 @@ def main() -> None:
     report = summarize(samples)
     encoded = json.dumps(report, indent=2, sort_keys=True)
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            handle.write(encoded + "\n")
-        print(json.dumps({
-            "by_tensor": report["by_tensor"],
-            "sample_count": len(report["samples"]),
-            "output": os.path.abspath(args.output),
-        }, indent=2, sort_keys=True))
+        write_atomic(args.output, encoded + "\n")
+        print(
+            json.dumps(
+                {
+                    "by_tensor": report["by_tensor"],
+                    "sample_count": len(report["samples"]),
+                    "output": os.path.abspath(args.output),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
     else:
         print(encoded)
 

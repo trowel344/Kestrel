@@ -34,9 +34,7 @@ def test_discover_gguf_prefers_model_gguf_inside(tmp_path):
 def test_discover_gguf_beside_directory_wins_over_other_ggufs(tmp_path):
     # An exact "<dir>.gguf" next to the directory outranks arbitrary gguFs inside.
     (tmp_path / "other.gguf").write_bytes(b"GGUF" + b"\x00" * 8)
-    (str(tmp_path) + ".gguf") and Path(str(tmp_path) + ".gguf").write_bytes(
-        b"GGUF" + b"\x00" * 8
-    )
+    (str(tmp_path) + ".gguf") and Path(str(tmp_path) + ".gguf").write_bytes(b"GGUF" + b"\x00" * 8)
     pipeline = _make_pipeline(str(tmp_path))
     assert pipeline._discover_gguf() == str(tmp_path) + ".gguf"
 

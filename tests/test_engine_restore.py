@@ -13,9 +13,7 @@ GOOD = b"GOOD_BINARY"
 
 
 def _git(repo, *args, check=True):
-    subprocess.run(
-        ["git", "-C", str(repo), *args], check=check, capture_output=True
-    )
+    subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True)
 
 
 @pytest.fixture
@@ -104,6 +102,65 @@ def test_rebuild_build_failure_rolls_back(upstream, monkeypatch):
 
     assert exc.value.restored_from_previous is True
     assert "restored last-good binaries" in str(exc.value)
+    assert (build_bin / "llama-cli").read_bytes() == GOOD
+
+
+def test_rollback_recreates_deleted_binary_as_executable(upstream):
+    import kestrel.engine as engine
+
+    engine_dir = str(upstream["engine"])
+    engine.adopt(engine_dir)
+    build_bin = _install_binary(engine_dir)
+    binary = build_bin / "llama-cli"
+    binary.chmod(0o755)
+    engine._snapshot_previous(
+        engine_dir,
+        ["llama-cli"],
+        commit=engine.git_head(engine_dir),
+        last_good=engine.git_head(engine_dir),
+    )
+    binary.unlink()
+
+    result = engine._rollback(engine_dir, ["llama-cli"])
+
+    assert result["restored"] is True
+    assert binary.read_bytes() == GOOD
+    assert binary.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        subprocess.TimeoutExpired(["cmake"], 1),
+        PermissionError("cmake is not executable"),
+    ],
+)
+def test_rebuild_spawn_failure_rolls_back(upstream, monkeypatch, failure):
+    import kestrel.engine as engine
+
+    engine_dir = str(upstream["engine"])
+    engine.adopt(engine_dir)
+    build_bin = _install_binary(engine_dir)
+    engine._snapshot_previous(
+        engine_dir,
+        ["llama-cli"],
+        commit=engine.git_head(engine_dir),
+        last_good=engine.git_head(engine_dir),
+    )
+    real_run = subprocess.run
+
+    def fail_cmake(command, **kwargs):
+        if command and command[0] == "cmake":
+            (build_bin / "llama-cli").write_bytes(b"damaged")
+            raise failure
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(engine.subprocess, "run", fail_cmake)
+
+    with pytest.raises(engine.EngineError) as exc:
+        engine.rebuild(engine_dir)
+
+    assert exc.value.restored_from_previous is True
     assert (build_bin / "llama-cli").read_bytes() == GOOD
 
 

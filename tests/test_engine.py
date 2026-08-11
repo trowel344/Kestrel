@@ -9,9 +9,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 def _git(repo, *args, check=True):
-    subprocess.run(
-        ["git", "-C", str(repo), *args], check=check, capture_output=True
-    )
+    subprocess.run(["git", "-C", str(repo), *args], check=check, capture_output=True)
 
 
 @pytest.fixture
@@ -92,6 +90,40 @@ def test_update_reports_and_applies_when_behind(upstream, monkeypatch):
     assert (upstream["engine"] / "model.txt").read_text() == "two"
 
 
+def test_status_fetches_remote_object_and_reports_behind(upstream):
+    import kestrel.engine as engine
+
+    engine.adopt(str(upstream["engine"]))
+    _advance(upstream)
+
+    status = engine.engine_status(str(upstream["engine"]), check_remote=True)
+
+    assert status["behind"] == 1
+    assert status["ahead"] == 0
+    assert status["stale"] is True
+    assert status["remote_head"] != status["commit"]
+
+
+def test_ls_remote_head_does_not_treat_url_as_working_directory(monkeypatch):
+    import kestrel.engine as engine
+
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="abc123\trefs/heads/main\n", stderr="")
+
+    monkeypatch.setattr(engine.subprocess, "run", fake_run)
+
+    assert engine.ls_remote_head("https://example.invalid/repo.git", "main") == "abc123"
+    assert seen[0][0] == [
+        "git",
+        "ls-remote",
+        "https://example.invalid/repo.git",
+        "refs/heads/main",
+    ]
+
+
 def test_update_refuses_dirty_without_force(upstream, monkeypatch):
     import kestrel.engine as engine
 
@@ -129,6 +161,21 @@ def test_update_up_to_date(upstream, monkeypatch):
     _mock_cmake(monkeypatch)
     result = engine.update(str(upstream["engine"]))
     assert result["status"] == "up_to_date"
+
+
+def test_update_does_not_claim_current_when_revision_compare_fails(upstream, monkeypatch):
+    import kestrel.engine as engine
+
+    engine.adopt(str(upstream["engine"]))
+    monkeypatch.setattr(
+        engine,
+        "_resolve_target",
+        lambda *args: ("main", "f" * 40),
+    )
+    monkeypatch.setattr(engine, "_rev_counts", lambda *args, **kwargs: None)
+
+    with pytest.raises(engine.EngineError, match="cannot compare"):
+        engine.update(str(upstream["engine"]))
 
 
 def test_rebuild_writes_artifacts(upstream, monkeypatch):
@@ -175,9 +222,30 @@ def test_cmd_engine_status_json(capsys, monkeypatch, upstream):
     engine.adopt(str(upstream["engine"]))
     args = SimpleNamespace(engine_command="status", dir=str(upstream["engine"]), json=True, no_remote=True)
     cli.cmd_engine(args)
-    payload = json.loads(capsys.readouterr().out)
+    output = capsys.readouterr().out
+    assert output.count("\n") == 1
+    payload = json.loads(output)
     assert payload["git"] is True
     assert payload["manifest"] is not None
+
+
+def test_cmd_build_uses_transactional_rebuild_json(capsys, monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import kestrel.cli as cli
+    import kestrel.engine as engine
+
+    monkeypatch.setattr(
+        engine,
+        "rebuild",
+        lambda directory, dry_run: {"status": "dry_run", "directory": directory},
+    )
+
+    cli.cmd_build(SimpleNamespace(dir=str(tmp_path), dry_run=True, json=True))
+
+    output = capsys.readouterr().out
+    assert output.count("\n") == 1
+    assert json.loads(output) == {"status": "dry_run", "directory": str(tmp_path)}
 
 
 def test_self_update_dry_run_reports(capsys, monkeypatch):
@@ -185,7 +253,9 @@ def test_self_update_dry_run_reports(capsys, monkeypatch):
 
     import kestrel.cli as cli
 
-    args = SimpleNamespace(repo=str(Path(__file__).resolve().parents[1]), dry_run=True, json=False, yes=False, wheel=None, sha256=None)
+    args = SimpleNamespace(
+        repo=str(Path(__file__).resolve().parents[1]), dry_run=True, json=False, yes=False, wheel=None, sha256=None
+    )
     cli.cmd_self_update(args)
     out = capsys.readouterr().out
     assert "Would install Kestrel" in out

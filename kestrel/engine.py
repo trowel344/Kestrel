@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import util
-from .errors import KestrelError
+from .errors import EngineError
 
 DEFAULT_CMAKE_FLAGS = [
     "-DLLAMA_CUDA=ON",
@@ -27,6 +27,8 @@ DEFAULT_CMAKE_FLAGS = [
     "-DCMAKE_BUILD_TYPE=Release",
 ]
 BUILD_TARGETS = ["llama-cli", "llama-server", "llama-bench"]
+CONFIGURE_TIMEOUT_SECONDS = 10 * 60
+BUILD_TIMEOUT_SECONDS = 2 * 60 * 60
 MANIFEST_NAME = ".kestrel-engine.json"
 
 # "Last-good" snapshot/rollback storage, kept next to the manifest.
@@ -40,12 +42,6 @@ ENGINE_TOO_OLD_SIGNATURES = (
     "error loading model hyperparameters",
     "unknown architecture",
 )
-
-
-class EngineError(KestrelError):
-    """An engine checkout could not be updated or rebuilt safely."""
-
-    code = "engine_error"
 
 
 @dataclass
@@ -97,11 +93,7 @@ def load_manifest(directory: str) -> EngineManifest | None:
 def save_manifest(directory: str, manifest: EngineManifest) -> Path:
     path = manifest_path(directory)
     try:
-        os.makedirs(directory, exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as handle:
-            json.dump(manifest.as_dict(), handle, indent=2)
-        os.replace(tmp, path)
+        util.write_atomic(path, json.dumps(manifest.as_dict(), indent=2), backup=False)
     except OSError as exc:
         raise EngineError(f"cannot write engine manifest: {exc}") from exc
     return path
@@ -112,18 +104,37 @@ def _git(
 ) -> subprocess.CompletedProcess:
     cmd = ["git", "-C", directory, *args]
     try:
-        result = subprocess.run(
-            cmd, capture_output=capture, text=True, timeout=timeout
-        )
+        result = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
     except FileNotFoundError as exc:
         raise EngineError("git is not installed") from exc
     except subprocess.TimeoutExpired as exc:
         raise EngineError(f"git {args[0]} timed out in {directory}") from exc
+    except OSError as exc:
+        raise EngineError(f"cannot run git {args[0]} in {directory}: {exc}") from exc
     if check and result.returncode != 0:
-        raise EngineError(
-            f"git {args[0]} failed in {directory}: {result.stderr.strip()}"
-        )
+        raise EngineError(f"git {args[0]} failed in {directory}: {result.stderr.strip()}")
     return result
+
+
+def _rev_counts(directory: str, *, head: str, remote_head: str) -> tuple[int, int] | None:
+    """Return ``(behind, ahead)`` commit counts; ``None`` when git can't answer.
+
+    Both ``engine_status`` and ``update`` compute the same ``git rev-list
+    --count`` pair to decide staleness; one helper keeps the two in lock-step.
+    """
+    behind = _git(directory, ["rev-list", "--count", f"{head}..{remote_head}"], check=False)
+    ahead = _git(directory, ["rev-list", "--count", f"{remote_head}..{head}"], check=False)
+    if behind.returncode != 0 or ahead.returncode != 0:
+        return None
+    return int(behind.stdout.strip() or 0), int(ahead.stdout.strip() or 0)
+
+
+def _binary_stat(binary: Path) -> dict[str, bool | int | float | None]:
+    """``(exists, size, mtime)`` report for a build artifact."""
+    if not binary.is_file():
+        return {"exists": False, "size": 0, "mtime": None}
+    st = binary.stat()
+    return {"exists": True, "size": st.st_size, "mtime": st.st_mtime}
 
 
 def is_git(directory: str) -> bool:
@@ -164,7 +175,15 @@ def git_dirty(directory: str) -> bool:
 
 def ls_remote_head(remote: str, branch: str | None, timeout: int = 15) -> str | None:
     ref = f"refs/heads/{branch}" if branch else "HEAD"
-    result = _git(remote, ["ls-remote", remote, ref], timeout=timeout, check=False)
+    command = ["git", "ls-remote", remote, ref]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError as exc:
+        raise EngineError("git is not installed") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise EngineError(f"git ls-remote timed out for {remote}") from exc
+    except OSError as exc:
+        raise EngineError(f"cannot query remote {remote}: {exc}") from exc
     if result.returncode != 0:
         return None
     for line in result.stdout.splitlines():
@@ -174,9 +193,7 @@ def ls_remote_head(remote: str, branch: str | None, timeout: int = 15) -> str | 
     return None
 
 
-def _resolve_target(
-    directory: str, remote: str, branch: str | None
-) -> tuple[str | None, str | None]:
+def _resolve_target(directory: str, remote: str, branch: str | None) -> tuple[str | None, str | None]:
     """Return ``(branch, remote_head_commit)`` for the tracked revision.
 
     Fetches the upstream (which may be a bare URL) into a stable
@@ -208,15 +225,15 @@ def engine_status(directory: str, *, check_remote: bool = True) -> dict:
         try:
             remote_head = ls_remote_head(remote, manifest.branch if manifest else branch)
             if remote_head and head:
-                behind_result = _git(
-                    directory, ["rev-list", "--count", f"{head}..{remote_head}"], check=False
-                )
-                ahead_result = _git(
-                    directory, ["rev-list", "--count", f"{remote_head}..{head}"], check=False
-                )
-                if behind_result.returncode == 0 and ahead_result.returncode == 0:
-                    behind = int(behind_result.stdout.strip() or 0)
-                    ahead = int(ahead_result.stdout.strip() or 0)
+                if remote_head != head:
+                    _target_branch, remote_head = _resolve_target(
+                        directory,
+                        remote,
+                        manifest.branch if manifest else branch,
+                    )
+                counts = _rev_counts(directory, head=head, remote_head=remote_head)
+                if counts is not None:
+                    behind, ahead = counts
                     stale = bool(behind) and not ahead
         except EngineError:
             remote_head = None
@@ -224,14 +241,7 @@ def engine_status(directory: str, *, check_remote: bool = True) -> dict:
     artifacts = None
     if manifest and manifest.targets:
         build_bin = Path(directory) / "build" / "bin"
-        artifacts = {}
-        for name in manifest.targets:
-            binary = build_bin / name
-            artifacts[name] = {
-                "exists": binary.is_file(),
-                "size": binary.stat().st_size if binary.is_file() else 0,
-                "mtime": binary.stat().st_mtime if binary.is_file() else None,
-            }
+        artifacts = {name: _binary_stat(build_bin / name) for name in manifest.targets}
 
     return {
         "directory": str(Path(directory).resolve()),
@@ -258,9 +268,7 @@ def adopt(directory: str, remote: str | None = None) -> EngineManifest:
         raise EngineError(f"{directory} has no commits")
     resolved = remote or git_remote(directory)
     if not resolved:
-        raise EngineError(
-            f"{directory} has no remote; pass --remote <url> to adopt it"
-        )
+        raise EngineError(f"{directory} has no remote; pass --remote <url> to adopt it")
     manifest = EngineManifest(
         remote=resolved,
         branch=git_branch(directory),
@@ -275,12 +283,9 @@ def _artifact_report(directory: str, targets: list[str]) -> dict[str, dict]:
     build_bin = Path(directory) / "build" / "bin"
     report = {}
     for name in targets:
-        binary = build_bin / name
-        if binary.is_file():
-            report[name] = {
-                "size": binary.stat().st_size,
-                "mtime": binary.stat().st_mtime,
-            }
+        info = _binary_stat(build_bin / name)
+        if info["exists"]:
+            report[name] = {"size": info["size"], "mtime": info["mtime"]}
     return report
 
 
@@ -300,9 +305,7 @@ def _load_previous(directory: str) -> dict | None:
         return None
 
 
-def _snapshot_previous(
-    directory: str, targets: list[str], *, commit: str | None, last_good: str | None
-) -> dict | None:
+def _snapshot_previous(directory: str, targets: list[str], *, commit: str | None, last_good: str | None) -> dict | None:
     """Copy currently-installed binaries into the side dir + write a sidebar.
 
     Only binaries that actually exist are snapshotted; if none exist this is a
@@ -314,14 +317,11 @@ def _snapshot_previous(
     snap = {"git": commit, "last_good": last_good, "artifacts": {}}
     wrote = False
     for name in targets:
-        binary = build_bin / name
-        if not binary.is_file():
+        info = _binary_stat(build_bin / name)
+        if not info["exists"]:
             continue
-        util.copy_file(binary, prev / name)
-        snap["artifacts"][name] = {
-            "size": binary.stat().st_size,
-            "mtime": binary.stat().st_mtime,
-        }
+        util.copy_file(build_bin / name, prev / name)
+        snap["artifacts"][name] = {"size": info["size"], "mtime": info["mtime"]}
         wrote = True
     if not wrote:
         return None
@@ -369,9 +369,7 @@ def _smoke_test(directory: str) -> tuple[bool | None, str | None]:
         if not binary.is_file() or not os.access(binary, os.X_OK):
             continue
         try:
-            result = subprocess.run(
-                [str(binary), "--version"], capture_output=True, text=True, timeout=60
-            )
+            result = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=60)
         except (OSError, subprocess.SubprocessError):
             continue
         output = ((result.stdout or "") + (result.stderr or "")).strip()
@@ -405,6 +403,27 @@ def _raise_with_rollback(directory: str, targets: list[str], cause: str) -> None
     raise err
 
 
+def _run_build_step(
+    command: list[str],
+    *,
+    directory: str,
+    targets: list[str],
+    phase: str,
+    timeout: int,
+) -> subprocess.CompletedProcess:
+    """Run one bounded CMake phase and roll artifacts back on any failure."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _raise_with_rollback(directory, targets, f"cmake {phase} timed out after {timeout}s in {directory}")
+    except OSError as exc:
+        _raise_with_rollback(directory, targets, f"cannot start cmake {phase} in {directory}: {exc}")
+    if result.returncode != 0:
+        detail = util.truncate(result.stderr or result.stdout)
+        _raise_with_rollback(directory, targets, f"cmake {phase} failed in {directory}:\n{detail}")
+    return result
+
+
 def rebuild(directory: str, *, dry_run: bool = False, flags: list[str] | None = None) -> dict:
     """Rebuild the engine from its checked-out source using recorded flags.
 
@@ -432,18 +451,14 @@ def rebuild(directory: str, *, dry_run: bool = False, flags: list[str] | None = 
 
     os.makedirs(build_dir, exist_ok=True)
     _snapshot_previous(directory, manifest.targets, commit=commit, last_good=manifest.commit)
-    configure = subprocess.run(
+    _run_build_step(
         ["cmake", "-S", str(Path(directory)), "-B", str(build_dir), *chosen],
-        capture_output=True,
-        text=True,
+        directory=directory,
+        targets=manifest.targets,
+        phase="configure",
+        timeout=CONFIGURE_TIMEOUT_SECONDS,
     )
-    if configure.returncode != 0:
-        _raise_with_rollback(
-            directory,
-            manifest.targets,
-            f"cmake configure failed in {directory}:\n{configure.stderr[-2000:]}",
-        )
-    build = subprocess.run(
+    _run_build_step(
         [
             "cmake",
             "--build",
@@ -453,21 +468,15 @@ def rebuild(directory: str, *, dry_run: bool = False, flags: list[str] | None = 
             "-j",
             str(os.cpu_count() or 4),
         ],
-        capture_output=True,
-        text=True,
+        directory=directory,
+        targets=manifest.targets,
+        phase="build",
+        timeout=BUILD_TIMEOUT_SECONDS,
     )
-    if build.returncode != 0:
-        _raise_with_rollback(
-            directory,
-            manifest.targets,
-            f"cmake build failed in {directory}:\n{build.stderr[-2000:]}",
-        )
 
     smoke_ok, smoke_detail = _smoke_test(directory)
     if smoke_ok is False:
-        _raise_with_rollback(
-            directory, manifest.targets, f"smoke test failed: {smoke_detail}"
-        )
+        _raise_with_rollback(directory, manifest.targets, f"smoke test failed: {smoke_detail}")
 
     # Rotate the last-good snapshot to the freshly verified artifacts.
     _snapshot_previous(directory, manifest.targets, commit=commit, last_good=commit)
@@ -486,9 +495,7 @@ def rebuild(directory: str, *, dry_run: bool = False, flags: list[str] | None = 
     }
 
 
-def update(
-    directory: str, *, dry_run: bool = False, force: bool = False, remote: str | None = None
-) -> dict:
+def update(directory: str, *, dry_run: bool = False, force: bool = False, remote: str | None = None) -> dict:
     """Fetch upstream, fast-forward to a newer revision, and rebuild.
 
     Refuses to destroy uncommitted work or a diverged history unless
@@ -504,12 +511,10 @@ def update(
 
     behind = ahead = 0
     if remote_head and head:
-        behind_result = _git(directory, ["rev-list", "--count", f"{head}..{remote_head}"], check=False)
-        ahead_result = _git(directory, ["rev-list", "--count", f"{remote_head}..{head}"], check=False)
-        if behind_result.returncode == 0:
-            behind = int(behind_result.stdout.strip() or 0)
-        if ahead_result.returncode == 0:
-            ahead = int(ahead_result.stdout.strip() or 0)
+        counts = _rev_counts(directory, head=head, remote_head=remote_head)
+        if counts is None:
+            raise EngineError(f"cannot compare local commit {head} with fetched upstream {remote_head}")
+        behind, ahead = counts
 
     if behind == 0:
         return {
@@ -527,9 +532,7 @@ def update(
             "(local work); pass --force to hard-reset and rebuild"
         )
     if git_dirty(directory) and not force:
-        raise EngineError(
-            f"{directory} has uncommitted changes; commit or stash them, or pass --force"
-        )
+        raise EngineError(f"{directory} has uncommitted changes; commit or stash them, or pass --force")
 
     if dry_run:
         return {

@@ -24,6 +24,15 @@ Out of scope:
 - Third-party dependencies (report those to their own projects)
 - The llama.cpp binaries Kestrel invokes (report those upstream)
 
+## Local binary trust
+
+Kestrel only auto-discovers llama.cpp executables and GGML shared libraries
+under the current user's home directory. Temporary or system-wide builds must
+be selected explicitly with `KESTREL_LLAMA_CPP_DIR` or
+`KESTREL_GGML_BASE_LIB`; Kestrel does not implicitly execute or load artifacts
+from world-writable `/tmp` paths. Model aliases follow the same rule and can be
+overridden explicitly with their documented environment variable.
+
 ## Supported versions
 
 Security fixes are applied to the latest release on the `main` branch.

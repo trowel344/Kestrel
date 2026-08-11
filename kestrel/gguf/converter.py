@@ -1,413 +1,85 @@
-import ctypes
 import json
+import math
 import os
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 
 import numpy as np
-import torch
-from safetensors import safe_open
 
-MODEL_DIR = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--nvidia--Qwen3.5-122B-A10B-NVFP4"
+from .. import util
+from .quants import (
+    GGML_TYPE_BF16,
+    GGML_TYPE_F16,
+    GGML_TYPE_F32,
+    GGML_TYPE_IQ1_S,
+    GGML_TYPE_Q1_0,
+    GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0,
+    GGUF_SCALAR_FORMATS,
+    ImportanceMatrix,
+    _quantize_q1_0_buffer,
+    _quantize_q4_0_buffer,
+    dequantize_nvfp4,
+    dequantize_q4_0,
+    ggml_type_block_size,
+    ggml_type_size,
+    quantize_iq1_s,
+    quantize_q2_k,
+    quantize_q3_k,
+    quantize_q4_0,
+    round_up,
 )
-
-# llama.cpp stores a half-sized UE4M3 block scale and compensates with this
-# doubled E2M1 lookup.  NVIDIA ModelOpt source tensors do not: their E2M1
-# codebook is the ordinary [0, .5, 1, ..., 6] range.
-KVALUES = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
-SOURCE_E2M1_VALUES = KVALUES * np.float32(0.5)
-
-FP8_LUT = np.array([((i & 0x7F) << 1 | (i >> 7 & 1)) for i in range(256)], dtype=np.uint8)
-
-
-def dequantize_nvfp4(packed: np.ndarray, scales: np.ndarray, scale_2: float) -> np.ndarray:
-    n_rows, n_packed = packed.shape
-    n_cols = n_packed * 2
-    out = np.empty((n_rows, n_cols), dtype=np.float32)
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    # NVIDIA ModelOpt stores ordinary E2M1 code points, not signed linear
-    # INT4 and not llama.cpp's doubled internal lookup values.
-    out[:, 0::2] = SOURCE_E2M1_VALUES[low]
-    out[:, 1::2] = SOURCE_E2M1_VALUES[high]
-    gs_actual = scales.shape[1]
-    if gs_actual == 0 or n_cols % gs_actual:
-        raise ValueError(
-            f"NVFP4 scale width {gs_actual} must evenly divide {n_cols} columns"
-        )
-    gs = n_cols // gs_actual
-    # Apply every group scale in one vectorized broadcast. The former Python
-    # loop ran 64-192 iterations for every projection of every expert, making
-    # full-model conversion needlessly CPU-bound.
-    out.reshape(n_rows, gs_actual, gs)[:] *= (
-        np.asarray(scales, dtype=np.float32) * np.float32(scale_2)
-    )[:, :, np.newaxis]
-    return out
-
-
-def round_up(x, m):
-    return ((x + m - 1) // m) * m
-
 
 GGUF_MAGIC = b"GGUF"
 GGUF_VERSION = 3
-GGML_TYPE_F32 = 0
-GGML_TYPE_F16 = 1
-GGML_TYPE_Q4_0 = 2
-GGML_TYPE_Q2_K = 10
-GGML_TYPE_IQ1_S = 19
-GGML_TYPE_BF16 = 30
-GGML_TYPE_NVFP4 = 40
-GGML_TYPE_Q1_0 = 41
+
+# torch and safetensors are the optional [convert] extra. A bare ``pip
+# install kestrel`` must still be able to ``import kestrel.gguf.converter``
+# (cli.py imports this module for the generic/doctor paths), so the two heavy
+# imports live inside a guarded module-level block. Anything that actually
+# opens a shard fails with a clear message via ``_require_convert_deps``.
+try:
+    import torch
+    from safetensors import safe_open
+except ImportError:  # pragma: no cover - exercised only on a bare install
+    torch = None
+    safe_open = None
 
 
-def ggml_type_size(t):
-    return {0: 4, 1: 2, 2: 18, 10: 84, 19: 50, 30: 2, 40: 9, 41: 18}[t]
+def _require_convert_deps() -> None:
+    """Raise a clear error when the optional torch/safetensors imports are gone."""
+    if torch is None or safe_open is None:
+        raise ImportError("NVFP4 model conversion requires torch and safetensors; install the 'kestrel[convert]' extra")
 
 
-def ggml_type_block_size(t):
-    return {0: 1, 1: 1, 2: 32, 10: 256, 19: 256, 30: 1, 40: 64, 41: 128}[t]
-
-
-def _quantize_q1_0_buffer(buf: np.ndarray) -> bytes:
-    """Pack Q1_0 rows from a private float32 buffer, consuming it.
-
-    ``buf`` must be float32, C-contiguous, shape ``(n_rows, n_cols)`` with
-    ``n_cols % 128 == 0``. The buffer is mutated in place (sign bits are read
-    first, then ``|x|`` is computed in place for the mean). Byte-identical to
-    ``quantize_q1_0``; callers must not reuse ``buf`` afterwards.
-    """
-    n_rows, n_cols = buf.shape
-    blocks = buf.reshape(n_rows, n_cols // 128, 128)
-    # Sign bits must be captured before the in-place absolute value, and
-    # packbits in the numpy LUT-free bit path is what ``quantize_q1_0`` emits.
-    signs = np.packbits(blocks >= 0.0, axis=2, bitorder="little")
-    np.absolute(blocks, out=blocks)
-    d = (blocks.sum(axis=2) / np.float32(128.0)).astype(np.float16)
-    output = np.empty((n_rows, n_cols // 128, 18), dtype=np.uint8)
-    output[:, :, :2] = d.view(np.uint8).reshape(n_rows, n_cols // 128, 2)
-    output[:, :, 2:] = signs
-    return output.tobytes()
-
-
-def quantize_q1_0(mat: np.ndarray) -> bytes:
-    """Quantize rows to llama.cpp's deterministic Q1_0 layout.
-
-    Each block covers 128 weights: an FP16 scale equal to the mean absolute
-    value, followed by 128 sign bits (bit j of byte j//8 set when the value is
-    non-negative). 18 bytes per 128 weights.
-    """
-
-    n_rows, n_cols = mat.shape
-    if n_cols % 128:
-        raise ValueError(f"Q1_0 row width must be divisible by 128, got {n_cols}")
-    # Copy so the caller's input is never mutated.
-    blocks = np.array(mat, dtype=np.float32, copy=True)
-    return _quantize_q1_0_buffer(blocks)
-
-
-@lru_cache(maxsize=1)
-def _load_ggml_base():
-    """Load the ggml base library used for native K-quant conversion."""
-
-    candidates = []
-    explicit = os.environ.get("KESTREL_GGML_BASE_LIB")
-    if explicit:
-        candidates.append(explicit)
-    llama_dir = os.environ.get("KESTREL_LLAMA_CPP_DIR")
-    if llama_dir:
-        candidates.append(os.path.join(llama_dir, "build", "bin", "libggml-base.so"))
-    candidates.extend(
-        os.path.join(root, "build", "bin", "libggml-base.so")
-        for root in (
-            "/tmp/llama.cpp-moe-cache",
-            os.path.expanduser("~/llama.cpp-moe-cache"),
-            os.path.expanduser("~/llama.cpp"),
-        )
-    )
-    errors = []
-    for candidate in candidates:
-        if not os.path.isfile(candidate):
-            continue
-        try:
-            return ctypes.CDLL(candidate)
-        except OSError as exc:
-            errors.append(f"{candidate}: {exc}")
-    detail = f" ({'; '.join(errors)})" if errors else ""
-    raise RuntimeError(
-        "Q2_K conversion requires a built llama.cpp libggml-base.so; set "
-        f"KESTREL_GGML_BASE_LIB to its path{detail}"
-    )
-
-
-def quantize_q2_k(mat: np.ndarray) -> bytes:
-    """Quantize a row-major F32 matrix with llama.cpp's Q2_K reference code."""
-
-    source = np.ascontiguousarray(mat, dtype=np.float32)
-    if source.ndim != 2:
-        raise ValueError(f"Q2_K input must be a matrix, got {source.shape}")
-    n_rows, n_cols = source.shape
-    if n_cols % 256:
-        raise ValueError(f"Q2_K row width must be divisible by 256, got {n_cols}")
-    output_size = n_rows * (n_cols // 256) * 84
-    output = np.empty(output_size, dtype=np.uint8)
-    library = _load_ggml_base()
-    quantize = library.quantize_q2_K
-    quantize.argtypes = (
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_void_p,
-        ctypes.c_int64,
-        ctypes.c_int64,
-        ctypes.POINTER(ctypes.c_float),
-    )
-    quantize.restype = ctypes.c_size_t
-    written = quantize(
-        source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        output.ctypes.data_as(ctypes.c_void_p),
-        n_rows,
-        n_cols,
-        None,
-    )
-    if written != output_size:
-        raise RuntimeError(f"Q2_K quantizer wrote {written} bytes, expected {output_size}")
-    return output.tobytes()
-
-
-def quantize_iq1_s(mat: np.ndarray, importance: np.ndarray | None = None) -> bytes:
-    """Quantize an F32 matrix with IQ1_S and explicit column importance."""
-
-    source = np.ascontiguousarray(mat, dtype=np.float32)
-    if source.ndim != 2:
-        raise ValueError(f"IQ1_S input must be a matrix, got {source.shape}")
-    n_rows, n_cols = source.shape
-    if n_cols % 256:
-        raise ValueError(f"IQ1_S row width must be divisible by 256, got {n_cols}")
-    output_size = n_rows * (n_cols // 256) * 50
-    output = np.empty(output_size, dtype=np.uint8)
-    library = _load_ggml_base()
-    library.ggml_quantize_init.argtypes = (ctypes.c_int,)
-    library.ggml_quantize_init.restype = None
-    library.ggml_quantize_init(GGML_TYPE_IQ1_S)
-    if importance is None:
-        weights = np.ones(n_cols, dtype=np.float32)
-    else:
-        weights = np.ascontiguousarray(importance, dtype=np.float32)
-        if weights.shape != (n_cols,):
-            raise ValueError(
-                f"IQ1_S importance must have shape ({n_cols},), got {weights.shape}"
-            )
-    quantize = library.quantize_iq1_s
-    quantize.argtypes = (
-        ctypes.POINTER(ctypes.c_float),
-        ctypes.c_void_p,
-        ctypes.c_int64,
-        ctypes.c_int64,
-        ctypes.POINTER(ctypes.c_float),
-    )
-    quantize.restype = ctypes.c_size_t
-    written = quantize(
-        source.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-        output.ctypes.data_as(ctypes.c_void_p),
-        n_rows,
-        n_cols,
-        weights.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-    )
-    if written != output_size:
-        raise RuntimeError(f"IQ1_S quantizer wrote {written} bytes, expected {output_size}")
-    return output.tobytes()
-
-
-class ImportanceMatrix:
-    """Normalized per-expert activation weights from llama-imatrix GGUF."""
-
-    # Short calibration runs leave many MoE expert inputs completely unseen.
-    # Pure zero importance lets IQ1_S spend no error budget on those columns,
-    # which can produce extreme weights once a different prompt activates them.
-    # A small uniform prior retains the measured activation preference while
-    # making the artifact robust outside the calibration prompt.
-    UNIFORM_PRIOR = np.float32(0.10)
-
-    def __init__(self, path: str):
-        import gguf
-
-        resolved = os.path.abspath(os.path.expanduser(path))
-        if not os.path.isfile(resolved):
-            raise FileNotFoundError(f"importance matrix does not exist: {resolved}")
-        reader = gguf.GGUFReader(resolved)
-        tensors = {tensor.name: tensor for tensor in reader.tensors}
-        self.path = resolved
-        self.entries: dict[str, np.ndarray] = {}
-        for name, tensor in tensors.items():
-            if not name.endswith(".in_sum2"):
-                continue
-            base = name.removesuffix(".in_sum2")
-            counts_tensor = tensors.get(f"{base}.counts")
-            if counts_tensor is None:
-                raise ValueError(f"importance matrix is missing counts for {base}")
-            sums = np.asarray(tensor.data, dtype=np.float32).reshape(-1)
-            counts = np.asarray(counts_tensor.data, dtype=np.float32).reshape(-1)
-            if not len(counts) or len(sums) % len(counts):
-                raise ValueError(
-                    f"invalid importance dimensions for {base}: "
-                    f"{len(sums)} values, {len(counts)} counts"
-                )
-            width = len(sums) // len(counts)
-            normalized = sums.reshape(len(counts), width).copy()
-            populated = counts > 0
-            normalized[populated] /= counts[populated, np.newaxis]
-            normalized[~populated] = 1.0
-            row_means = normalized.mean(axis=1, keepdims=True)
-            normalized = (
-                (np.float32(1.0) - self.UNIFORM_PRIOR) * normalized
-                + self.UNIFORM_PRIOR * row_means
-            )
-            self.entries[base] = normalized
-        if not self.entries:
-            raise ValueError(f"importance matrix contains no activation entries: {resolved}")
-
-    def expert(self, tensor_name: str, expert: int, width: int) -> np.ndarray:
-        values = self.entries.get(tensor_name)
-        if values is None:
-            raise KeyError(f"importance matrix is missing tensor: {tensor_name}")
-        row = expert if values.shape[0] > 1 else 0
-        if row >= values.shape[0]:
-            raise ValueError(
-                f"importance matrix has {values.shape[0]} expert rows for "
-                f"{tensor_name}, requested {expert}"
-            )
-        result = np.ascontiguousarray(values[row], dtype=np.float32)
-        if result.shape != (width,):
-            raise ValueError(
-                f"importance width for {tensor_name} is {result.shape}, expected ({width},)"
-            )
-        return result
-
-
-def _quantize_q4_0_buffer(buf: np.ndarray) -> bytes:
-    """Pack Q4_0 rows from a private float32 buffer, consuming it.
-
-    ``buf`` must be float32, C-contiguous, shape ``(n_rows, n_cols)`` with
-    ``n_cols % 32 == 0``. The buffer is mutated in place (normalization runs
-    on the private storage). Byte-identical to ``quantize_q4_0``; callers must
-    not reuse ``buf`` afterwards.
-    """
-    n_rows, n_cols = buf.shape
-    blocks = buf.reshape(n_rows, n_cols // 32, 32)
-    max_indices = np.argmax(np.abs(blocks), axis=2)
-    signed_max = np.take_along_axis(
-        blocks,
-        max_indices[:, :, np.newaxis],
-        axis=2,
-    )[:, :, 0]
-    scales = signed_max / np.float32(-8.0)
-    inverse = np.zeros_like(scales)
-    with np.errstate(over="ignore"):
-        np.divide(1.0, scales, out=inverse, where=scales != 0)
-    # In-place normalize/round/clip reuses the single private buffer instead of
-    # allocating a ~full-size float32 temporary for every op.
-    np.multiply(blocks, inverse[:, :, np.newaxis], out=blocks)
-    np.add(blocks, np.float32(8.5), out=blocks)
-    np.trunc(blocks, out=blocks)
-    np.clip(blocks, 0, 15, out=blocks)
-    quants = blocks.astype(np.uint8)
-
-    output = np.empty((n_rows, n_cols // 32, 18), dtype=np.uint8)
-    output[:, :, :2] = (
-        scales.astype(np.float16)
-        .view(np.uint8)
-        .reshape(n_rows, n_cols // 32, 2)
-    )
-    # Pack two 16-weight nibble halves in place on the private buffer, leaving
-    # one small temporary for the final OR.
-    high = quants[:, :, 16:]
-    np.left_shift(high, 4, out=high)
-    output[:, :, 2:] = quants[:, :, :16] | high
-    return output.tobytes()
-
-
-def quantize_q4_0(mat: np.ndarray) -> bytes:
-    """Quantize rows using llama.cpp's deterministic Q4_0 reference layout."""
-
-    n_rows, n_cols = mat.shape
-    if n_cols % 32:
-        raise ValueError(f"Q4_0 row width must be divisible by 32, got {n_cols}")
-    # Copy into a private buffer (even when ``mat`` is already float32 and
-    # C-contiguous) so every normalization step can run in place without the
-    # caller's input being mutated and without intermediate temporaries.
-    blocks = np.array(mat, dtype=np.float32, copy=True)
-    return _quantize_q4_0_buffer(blocks)
-
-
-def dequantize_q4_0(raw: np.ndarray) -> np.ndarray:
-    """Decode llama.cpp Q4_0 rows without materializing a whole tensor.
-
-    ``raw`` may be shaped ``[rows, row_bytes]`` (as exposed by GGUFReader) or
-    ``[rows, blocks, 18]``. The returned F32 matrix has 32 columns per block.
-    """
-
-    data = np.asarray(raw, dtype=np.uint8)
-    if data.ndim == 2:
-        if data.shape[1] % 18:
-            raise ValueError(f"Q4_0 row bytes must be divisible by 18, got {data.shape[1]}")
-        data = data.reshape(data.shape[0], data.shape[1] // 18, 18)
-    if data.ndim != 3 or data.shape[2] != 18:
-        raise ValueError(f"Q4_0 data must have shape [rows, blocks, 18], got {data.shape}")
-
-    scales = (
-        np.ascontiguousarray(data[:, :, :2])
-        .view(np.float16)
-        .reshape(data.shape[0], data.shape[1])
-        .astype(np.float32)
-    )
-    packed = data[:, :, 2:]
-    values = np.empty((data.shape[0], data.shape[1], 32), dtype=np.float32)
-    values[:, :, :16] = (packed & 0x0F).astype(np.float32) - np.float32(8.0)
-    values[:, :, 16:] = (packed >> 4).astype(np.float32) - np.float32(8.0)
-    values *= scales[:, :, np.newaxis]
-    return values.reshape(data.shape[0], data.shape[1] * 32)
-
-
-def quant_shape_from_byte(byte_shape, qt):
-    if qt == GGML_TYPE_NVFP4:
-        return [byte_shape[0], byte_shape[1] * 2]
-    return byte_shape
+MODEL_DIR = os.path.expanduser("~/.cache/huggingface/hub/models--nvidia--Qwen3.5-122B-A10B-NVFP4")
 
 
 def write_gguf_string(f, s):
     data = s.encode("utf-8")
-    import struct
     f.write(struct.pack("<Q", len(data)))
     f.write(data)
 
 
 def write_gguf_kv(f, key, vtype, val):
-    import struct
     write_gguf_string(f, key)
     f.write(struct.pack("<I", vtype))
-    if vtype == 0:  # uint8
-        f.write(struct.pack("<B", val))
-    elif vtype == 1:  # int8
-        f.write(struct.pack("<b", val))
-    elif vtype == 2:  # uint16
-        f.write(struct.pack("<H", val))
-    elif vtype == 3:  # int16
-        f.write(struct.pack("<h", val))
-    elif vtype == 4:  # uint32
-        f.write(struct.pack("<I", val))
-    elif vtype == 5:  # int32
-        f.write(struct.pack("<i", val))
-    elif vtype == 6:  # float32
-        f.write(struct.pack("<f", val))
-    elif vtype == 7:  # bool
-        f.write(struct.pack("<?", val))
-    elif vtype == 8:  # string
+    fmt = GGUF_SCALAR_FORMATS.get(vtype)
+    if fmt is not None:
+        # The shared scalar table is byte-order-free; the writer is fixed little-endian.
+        f.write(struct.pack("<" + fmt, val))
+        return
+    if vtype == 8:  # string
         write_gguf_string(f, val)
-    elif vtype == 9:  # array
+        return
+    if vtype == 9:  # array
         f.write(struct.pack("<I", val[0]))
         f.write(struct.pack("<Q", len(val[1])))
         for item in val[1]:
@@ -415,12 +87,9 @@ def write_gguf_kv(f, key, vtype, val):
                 write_gguf_string(f, item)
             elif val[0] == 4:
                 f.write(struct.pack("<I", item))
-    elif vtype == 12:  # uint64
-        f.write(struct.pack("<Q", val))
 
 
 def write_tensor_info(f, name, n_dims, dims, dtype, offset):
-    import struct
     write_gguf_string(f, name)
     f.write(struct.pack("<I", n_dims))
     for d in dims:
@@ -429,24 +98,45 @@ def write_tensor_info(f, name, n_dims, dims, dtype, offset):
     f.write(struct.pack("<Q", offset))
 
 
-def pack_gguf_kv_str(f, key, value):
-    write_gguf_kv(f, key, 8, value)
+def tensor_data_layout(tensor_infos, alignment=32):
+    """Return validated ``(tensor_info, data_offset)`` entries for a GGUF catalog.
 
-
-def pack_gguf_kv_int(f, key, value):
-    write_gguf_kv(f, key, 4, value)
-
-
-def pack_gguf_kv_bool(f, key, value):
-    write_gguf_kv(f, key, 7, value)
-
-
-def pack_gguf_kv_array_int(f, key, items):
-    write_gguf_kv(f, key, 9, (4, items))
-
-
-def pack_gguf_kv_array_str(f, key, items):
-    write_gguf_kv(f, key, 9, (8, items))
+    Tensor-info records carry their payload offset relative to the start of the
+    data section.  Keeping that calculation in a pure helper makes the on-disk
+    layout easy to verify without opening a model, and rejects malformed
+    catalogs before a partially written artifact can be produced.
+    """
+    if alignment <= 0 or alignment & (alignment - 1):
+        raise ValueError("tensor alignment must be a positive power of two")
+    offset = 0
+    layout = []
+    for name, n_dims, dims, dtype, nbytes in tensor_infos:
+        if n_dims != len(dims):
+            raise ValueError(f"tensor {name} declares {n_dims} dimensions but has {len(dims)}")
+        if any(dim < 0 for dim in dims):
+            raise ValueError(f"tensor {name} has a negative dimension")
+        if nbytes < 0:
+            raise ValueError(f"tensor {name} has a negative payload size")
+        element_count = math.prod(dims)
+        try:
+            block_size = ggml_type_block_size(dtype)
+            block_bytes = ggml_type_size(dtype)
+        except KeyError as exc:
+            raise ValueError(f"tensor {name} has unsupported GGML type {dtype}") from exc
+        if dims and dims[0] % block_size:
+            raise ValueError(
+                f"tensor {name} has row width {dims[0]}, which is not divisible by "
+                f"the {block_size}-element GGML type-{dtype} block"
+            )
+        expected_nbytes = element_count // block_size * block_bytes
+        if nbytes != expected_nbytes:
+            raise ValueError(
+                f"tensor {name} has payload size {nbytes}, expected {expected_nbytes} for its shape and type"
+            )
+        data_offset = round_up(offset, alignment)
+        layout.append((name, n_dims, dims, dtype, data_offset))
+        offset = data_offset + nbytes
+    return layout, offset
 
 
 LAYER_MAP_FULL = {
@@ -516,9 +206,7 @@ MTP_NEXTN_HF = {
 _ROUTER_SUFFIX = "mlp.gate.weight"
 
 
-def _select_kept_experts(
-    n_exp: int, keep: int, importance: object = None
-) -> list[int]:
+def _select_kept_experts(n_exp: int, keep: int, importance: object = None) -> list[int]:
     """Return the source expert indices to emit when pruning to ``keep``.
 
     With ``importance`` (a length-``n_exp`` sequence of per-expert values, e.g.
@@ -529,9 +217,7 @@ def _select_kept_experts(
     if importance is None:
         return list(range(keep))
     if len(importance) != n_exp:
-        raise ValueError(
-            f"expert importance has {len(importance)} entries, expected {n_exp}"
-        )
+        raise ValueError(f"expert importance has {len(importance)} entries, expected {n_exp}")
     picked = sorted(range(n_exp), key=lambda e: (-float(importance[e]), e))[:keep]
     return sorted(picked)
 
@@ -547,30 +233,31 @@ def _resolve_pruning(
     if experts_keep is None:
         return None, n_exp
     if experts_keep < n_used:
-        raise ValueError(
-            f"experts_keep ({experts_keep}) cannot be smaller than "
-            f"experts used per token ({n_used})"
-        )
+        raise ValueError(f"experts_keep ({experts_keep}) cannot be smaller than experts used per token ({n_used})")
     if experts_keep >= n_exp:
-        raise ValueError(
-            f"experts_keep ({experts_keep}) must be smaller than "
-            f"the model's expert count ({n_exp})"
-        )
+        raise ValueError(f"experts_keep ({experts_keep}) must be smaller than the model's expert count ({n_exp})")
     kept = _select_kept_experts(n_exp, experts_keep, importance)
     return kept, len(kept)
 
 
 class NVFP4Converter:
-    def __init__(self, model_dir: str = MODEL_DIR, *, include_mtp: bool = False,
-                 dense_q4: bool = False, cold_tier: str = "off",
-                 q4_sidecar_source: str | None = None,
-                 experts_only: bool = False,
-                 q2_edge_layers: int = 0,
-                 compact_expert_type: str = "q1_0",
-                 imatrix_path: str | None = None,
-                 conversion_workers: int | None = None,
-                 experts_keep: int | None = None,
-                 expert_importance: str | None = None):
+    def __init__(
+        self,
+        model_dir: str = MODEL_DIR,
+        *,
+        include_mtp: bool = False,
+        dense_q4: bool = False,
+        cold_tier: str = "off",
+        q4_sidecar_source: str | None = None,
+        experts_only: bool = False,
+        q2_edge_layers: int = 0,
+        compact_expert_type: str = "q1_0",
+        all_q2: bool = False,
+        imatrix_path: str | None = None,
+        conversion_workers: int | None = None,
+        experts_keep: int | None = None,
+        expert_importance: str | None = None,
+    ):
         self.model_dir = model_dir
         # dense_q4: quantize dense matrices (attention/FFN/embedding) to Q4_0.
         # cold_tier: per-expert low-precision twin emitted alongside the Q4_0
@@ -585,11 +272,25 @@ class NVFP4Converter:
         # importance values used to choose which experts are kept (highest
         # kept). Absent, the first experts_keep are kept.
         self.dense_q4 = dense_q4
-        self.cold_tier = cold_tier
         self.q4_sidecar_source = q4_sidecar_source
         self.experts_only = experts_only
         self.q2_edge_layers = q2_edge_layers
-        compact_types = {"q1_0": GGML_TYPE_Q1_0, "iq1_s": GGML_TYPE_IQ1_S}
+        if all_q2:
+            if q2_edge_layers:
+                raise ValueError("all_q2 cannot be combined with q2_edge_layers")
+            if compact_expert_type not in ("q1_0", "q2_k"):
+                raise ValueError("all_q2 cannot be combined with another compact_expert_type")
+            if cold_tier not in ("off", "q1_only"):
+                raise ValueError("all_q2 requires cold_tier='q1_only'")
+            cold_tier = "q1_only"
+            compact_expert_type = "q2_k"
+        self.cold_tier = cold_tier
+        compact_types = {
+            "q1_0": GGML_TYPE_Q1_0,
+            "q2_k": GGML_TYPE_Q2_K,
+            "q3_k": GGML_TYPE_Q3_K,
+            "iq1_s": GGML_TYPE_IQ1_S,
+        }
         if compact_expert_type not in compact_types:
             raise ValueError(f"unsupported compact_expert_type: {compact_expert_type}")
         self.compact_expert_type = compact_expert_type
@@ -604,17 +305,15 @@ class NVFP4Converter:
         if expert_importance and experts_keep is None:
             raise ValueError("expert_importance requires experts_keep")
         if expert_importance and not os.path.isfile(expert_importance):
-            raise FileNotFoundError(
-                f"expert importance file does not exist: {expert_importance}"
-            )
+            raise FileNotFoundError(f"expert importance file does not exist: {expert_importance}")
         self.conversion_workers = conversion_workers or min(8, os.cpu_count() or 1)
         if self.conversion_workers < 1:
             raise ValueError("conversion_workers must be at least 1")
         self.imatrix = None
         if compact_expert_type == "iq1_s" and not imatrix_path:
             raise ValueError("IQ1_S compact experts require an activation --imatrix")
-        if compact_expert_type != "iq1_s" and imatrix_path:
-            raise ValueError("imatrix_path is currently supported only for IQ1_S experts")
+        if compact_expert_type not in {"iq1_s", "q2_k", "q3_k"} and not q2_edge_layers and imatrix_path:
+            raise ValueError("imatrix_path is supported for IQ1_S, Q2_K, and Q3_K experts")
         if compact_expert_type != "q1_0" and cold_tier != "q1_only":
             raise ValueError("non-Q1 compact experts require cold_tier='q1_only'")
         if compact_expert_type != "q1_0" and q4_sidecar_source:
@@ -642,9 +341,7 @@ class NVFP4Converter:
         self.wm = self.idx["weight_map"]
         self.n_layer = self.tcfg["num_hidden_layers"]
         if self.q2_edge_layers * 2 > self.n_layer:
-            raise ValueError(
-                "q2_edge_layers cannot cover more than half of the trunk layers"
-            )
+            raise ValueError("q2_edge_layers cannot cover more than half of the trunk layers")
         self.n_exp = self.tcfg["num_experts"]
         self.n_used = self.tcfg["num_experts_per_tok"]
         self._kept = None
@@ -654,9 +351,7 @@ class NVFP4Converter:
             if self.expert_importance:
                 with open(self.expert_importance) as f:
                     importance = json.load(f)
-            self._kept, self._emitted_exp = _resolve_pruning(
-                self.n_exp, self.n_used, self.experts_keep, importance
-            )
+            self._kept, self._emitted_exp = _resolve_pruning(self.n_exp, self.n_used, self.experts_keep, importance)
         self.hidden = self.tcfg["hidden_size"]
         self.n_ff = self.tcfg["moe_intermediate_size"]
         self.head_dim = self.tcfg["head_dim"]
@@ -726,6 +421,7 @@ class NVFP4Converter:
         the lock so concurrent workers do not serialize their big memcpys.
         """
         with self._shard_lock:
+            _require_convert_deps()
             handle = self._shard_handles.get(shard)
             if handle is None:
                 handle = safe_open(path, framework="pt")
@@ -764,8 +460,8 @@ class NVFP4Converter:
             return None
         return w.numpy(), ws.float().numpy(), float(ws2)
 
-    def _gguf_shape(self, hf_tensor):
-        shape = list(hf_tensor.shape)
+    def _gguf_shape(self, hf_shape):
+        shape = list(hf_shape)
         if len(shape) == 2:
             shape.reverse()
         elif len(shape) == 3:
@@ -778,11 +474,7 @@ class NVFP4Converter:
         shape = list(tensor.shape)
         if dim < 0:
             dim += len(shape)
-        expanded = (
-            shape[:dim]
-            + [num_k_heads, num_v_per_k, head_dim]
-            + shape[dim + 1 :]
-        )
+        expanded = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1 :]
         tensor = tensor.reshape(*expanded)
         permutation = list(range(len(expanded)))
         permutation[dim], permutation[dim + 1] = (
@@ -816,19 +508,13 @@ class NVFP4Converter:
             )
             return torch.cat((q, k, v), dim=0)
         if ".in_proj_z." in hf_key:
-            return self._reorder_v_heads(
-                tensor, 0, self.linear_n_k, n_per_k, self.linear_v_dim
-            )
+            return self._reorder_v_heads(tensor, 0, self.linear_n_k, n_per_k, self.linear_v_dim)
         if ".in_proj_a." in hf_key or ".in_proj_b." in hf_key:
             return self._reorder_v_heads(tensor, 0, self.linear_n_k, n_per_k, 1)
         if ".A_log" in hf_key or ".dt_bias" in hf_key or ".dt_proj" in hf_key:
             if tensor.dim() == 1:
-                return self._reorder_v_heads(
-                    tensor.unsqueeze(-1), 0, self.linear_n_k, n_per_k, 1
-                ).squeeze(-1)
-            return self._reorder_v_heads(
-                tensor, -1, self.linear_n_k, n_per_k, 1
-            )
+                return self._reorder_v_heads(tensor.unsqueeze(-1), 0, self.linear_n_k, n_per_k, 1).squeeze(-1)
+            return self._reorder_v_heads(tensor, -1, self.linear_n_k, n_per_k, 1)
         if ".conv1d" in hf_key:
             data = tensor.squeeze()
             qk_channels = self.linear_k_dim * self.linear_n_k * 2
@@ -842,9 +528,7 @@ class NVFP4Converter:
             )
             return torch.cat((qk, v), dim=0)
         if ".out_proj." in hf_key:
-            return self._reorder_v_heads(
-                tensor, 1, self.linear_n_k, n_per_k, self.linear_v_dim
-            )
+            return self._reorder_v_heads(tensor, 1, self.linear_n_k, n_per_k, self.linear_v_dim)
         return tensor
 
     def _pruned_router(self, tensor, hf_key):
@@ -861,10 +545,7 @@ class NVFP4Converter:
         if self._kept is None or not hf_key.endswith(_ROUTER_SUFFIX):
             return tensor
         if tensor.dim() < 2 or tensor.shape[0] != self.n_exp:
-            raise ValueError(
-                f"router {hf_key} has shape {tuple(tensor.shape)}, "
-                f"expected ({self.n_exp}, ...)"
-            )
+            raise ValueError(f"router {hf_key} has shape {tuple(tensor.shape)}, expected ({self.n_exp}, ...)")
         return tensor[self._kept]
 
     def _transform_source_tensor(self, tensor, hf_key):
@@ -874,21 +555,11 @@ class NVFP4Converter:
             tensor = -torch.exp(tensor)
         elif "conv1d" in hf_key:
             tensor = tensor.squeeze()
-        elif hf_key.endswith("norm.weight") and not hf_key.endswith(
-            "linear_attn.norm.weight"
-        ):
+        elif hf_key.endswith("norm.weight") and not hf_key.endswith("linear_attn.norm.weight"):
             # Qwen3.5 stores RMSNorm offsets around zero and applies 1 + weight.
             # GGML RMSNorm expects the effective multiplicative weight.
             tensor = tensor + 1
         return self._transform_linear_attention(tensor, hf_key)
-
-    def _gguf_shape_from_dims(self, hf_shape):
-        shape = list(hf_shape)
-        if len(shape) == 2:
-            shape.reverse()
-        elif len(shape) == 3:
-            shape = [shape[2], shape[0]]
-        return shape
 
     def _emit_experts(self):
         """Iterate the source expert indices this conversion emits.
@@ -900,9 +571,9 @@ class NVFP4Converter:
         return self._kept if self._kept is not None else range(self.n_exp)
 
     def _write_data_f16_experts(self, f, prefix, i):
-        import time
         t0 = time.time()
         print(f"  Converting layer {i} F16 experts ({self.n_exp} experts)...")
+
         # MTP expert reads and fp16 casting are torch/NumPy ops that release
         # the GIL, so overlap them across workers like the Q4/Q1 kernels.
         def read_up_down(e):
@@ -928,6 +599,7 @@ class NVFP4Converter:
         with ThreadPoolExecutor(max_workers=self.conversion_workers) as executor:
             self._write_windowed_map(f, executor, read_up_down)
             print(f"    gate/up {self.n_exp}/{self.n_exp} done", flush=True)
+            self._pad_to_tensor(f, f"blk.{i}.ffn_down_exps.weight")
             self._write_windowed_map(f, executor, read_down)
             print(f"    down  {self.n_exp}/{self.n_exp} done ({time.time() - t0:.1f}s)", flush=True)
 
@@ -935,7 +607,7 @@ class NVFP4Converter:
         sl = self._read_torch_slice(hf_key)
         if sl is None:
             return None
-        shape = self._gguf_shape_from_dims(sl.get_shape())
+        shape = self._gguf_shape(sl.get_shape())
         if self._kept is not None and hf_key.endswith(_ROUTER_SUFFIX):
             if len(shape) != 2 or shape[1] != self.n_exp:
                 raise ValueError(
@@ -951,7 +623,6 @@ class NVFP4Converter:
         cfg_path = os.path.join(self.model_dir, "tokenizer_config.json")
         if not os.path.exists(tok_path):
             return None
-        import json
         with open(tok_path) as f:
             tj = json.load(f)
         vocab = tj["model"]["vocab"]
@@ -1006,7 +677,6 @@ class NVFP4Converter:
         )
 
     def _init_gguf(self, f):
-        self.f = f
         cold_tier = getattr(self, "cold_tier", "off")
         emitted_exp = getattr(self, "_emitted_exp", getattr(self, "n_exp", 0))
 
@@ -1017,8 +687,10 @@ class NVFP4Converter:
         full_attn_interval = self.tcfg.get("full_attention_interval", 4)
 
         kvs = {}
+
         def kv(key, vtype, val):
             kvs[key] = (vtype, val)
+
         kv("general.architecture", 8, "qwen35moe")
         total_blocks = self.n_layer + self.mtp_layers
         kv("qwen35moe.block_count", 4, total_blocks)
@@ -1142,39 +814,57 @@ class NVFP4Converter:
             if i < self.n_layer:
                 if cold_tier != "q1_only":
                     q4_up = (self.hidden * self.n_ff * 2 * emitted_exp // 32) * 18
-                    add_ti(f"blk.{i}.ffn_gate_up_exps.weight",
-                           [self.hidden, self.n_ff * 2, emitted_exp],
-                           GGML_TYPE_Q4_0, q4_up)
+                    add_ti(
+                        f"blk.{i}.ffn_gate_up_exps.weight",
+                        [self.hidden, self.n_ff * 2, emitted_exp],
+                        GGML_TYPE_Q4_0,
+                        q4_up,
+                    )
                     q4_down = (self.n_ff * self.hidden * emitted_exp // 32) * 18
-                    add_ti(f"blk.{i}.ffn_down_exps.weight",
-                           [self.n_ff, self.hidden, emitted_exp],
-                           GGML_TYPE_Q4_0, q4_down)
+                    add_ti(
+                        f"blk.{i}.ffn_down_exps.weight", [self.n_ff, self.hidden, emitted_exp], GGML_TYPE_Q4_0, q4_down
+                    )
                 if cold_tier in ("q1_0", "q1_only"):
+                    # A compact primary model must use llama.cpp's canonical
+                    # routed-expert tensor names.  The ``_lp`` names are only
+                    # meaningful for a supplementary experts-only sidecar;
+                    # llama.cpp does not discover them when loading a normal
+                    # model and otherwise reports the canonical tensors as
+                    # missing.
+                    compact_suffix = "_lp" if self.experts_only or cold_tier == "q1_0" else ""
                     lp_type = (
                         GGML_TYPE_Q2_K
-                        if self.q2_edge_layers
-                        and (i < self.q2_edge_layers or i >= self.n_layer - self.q2_edge_layers)
+                        if self.q2_edge_layers and (i < self.q2_edge_layers or i >= self.n_layer - self.q2_edge_layers)
                         else self.compact_expert_ggml_type
                     )
                     lp_block = ggml_type_block_size(lp_type)
                     lp_size = ggml_type_size(lp_type)
                     lp_up = (self.hidden * self.n_ff * 2 * emitted_exp // lp_block) * lp_size
-                    add_ti(f"blk.{i}.ffn_gate_up_exps_lp.weight",
-                           [self.hidden, self.n_ff * 2, emitted_exp],
-                           lp_type, lp_up)
+                    add_ti(
+                        f"blk.{i}.ffn_gate_up_exps{compact_suffix}.weight",
+                        [self.hidden, self.n_ff * 2, emitted_exp],
+                        lp_type,
+                        lp_up,
+                    )
                     lp_down = (self.n_ff * self.hidden * emitted_exp // lp_block) * lp_size
-                    add_ti(f"blk.{i}.ffn_down_exps_lp.weight",
-                           [self.n_ff, self.hidden, emitted_exp],
-                           lp_type, lp_down)
+                    add_ti(
+                        f"blk.{i}.ffn_down_exps{compact_suffix}.weight",
+                        [self.n_ff, self.hidden, emitted_exp],
+                        lp_type,
+                        lp_down,
+                    )
             else:
                 n_f16_up = self.hidden * self.n_ff * 2 * emitted_exp * 2
-                add_ti(f"blk.{i}.ffn_gate_up_exps.weight",
-                       [self.hidden, self.n_ff * 2, emitted_exp],
-                       GGML_TYPE_F16, n_f16_up)
+                add_ti(
+                    f"blk.{i}.ffn_gate_up_exps.weight",
+                    [self.hidden, self.n_ff * 2, emitted_exp],
+                    GGML_TYPE_F16,
+                    n_f16_up,
+                )
                 n_f16_down = self.n_ff * self.hidden * emitted_exp * 2
-                add_ti(f"blk.{i}.ffn_down_exps.weight",
-                       [self.n_ff, self.hidden, emitted_exp],
-                       GGML_TYPE_F16, n_f16_down)
+                add_ti(
+                    f"blk.{i}.ffn_down_exps.weight", [self.n_ff, self.hidden, emitted_exp], GGML_TYPE_F16, n_f16_down
+                )
 
         if self.mtp_layers > 0:
             kv("qwen35moe.nextn_predict_layers", 4, self.mtp_layers)
@@ -1183,7 +873,6 @@ class NVFP4Converter:
         self._tensor_infos = tensor_infos
 
     def _write_header(self, f):
-        import struct
         f.write(GGUF_MAGIC)
         f.write(struct.pack("<I", GGUF_VERSION))
         f.write(struct.pack("<Q", len(self._tensor_infos)))
@@ -1195,28 +884,27 @@ class NVFP4Converter:
 
     def _write_ti(self, f):
         ti_start = f.tell()
+        layout, total_data_bytes = tensor_data_layout(self._tensor_infos)
         # Compute total TI section size
-        ti_size = sum(8 + len(n.encode("utf-8")) + 4 + nd * 8 + 4 + 8
-                      for n, nd, _, _, _ in self._tensor_infos)
+        ti_size = sum(8 + len(n.encode("utf-8")) + 4 + nd * 8 + 4 + 8 for n, nd, _, _, _ in layout)
         data_start = round_up(ti_start + ti_size, 32)
-        data_off = 0
-        for name, n_dims, dims, dtype, nbytes in self._tensor_infos:
+        self._data_start = data_start
+        self._data_end = data_start + total_data_bytes
+        self._tensor_offsets = {name: data_off for name, _nd, _dims, _dtype, data_off in layout}
+        for name, n_dims, dims, dtype, data_off in layout:
             write_tensor_info(f, name, n_dims, dims, dtype, data_off)
-            data_off += nbytes
         return data_start
 
-    def _write_data_bf16(self, f, name, hf_key):
-        t = self._read_torch(hf_key)
-        if t is not None:
-            if t.dim() == 2:
-                t = t.T.contiguous()
-            elif t.dim() == 3:
-                t = t.permute(2, 0, 1).contiguous().reshape(t.shape[2], -1)
-            arr = t.to(torch.float16).numpy().tobytes()
-            f.write(arr)
+    def _pad_to_tensor(self, f, name):
+        """Pad the payload stream to the catalog offset for ``name``."""
+        target = self._data_start + self._tensor_offsets[name]
+        current = f.tell()
+        if current > target:
+            raise ValueError(f"tensor payload for {name} started {current - target} bytes past its catalog offset")
+        if current < target:
+            f.write(b"\x00" * (target - current))
 
     def _write_data_nvfp4(self, f, prefix, i):
-        import time
         t0 = time.time()
         print(f"  Converting layer {i} experts ({self.n_exp} experts)...")
 
@@ -1255,13 +943,11 @@ class NVFP4Converter:
             self._write_windowed_map(f, executor, quantize_gate_up)
             gate_elapsed = time.time() - gate_start
             print(f"    gate/up {self.n_exp}/{self.n_exp} ({gate_elapsed:.1f}s)")
+            self._pad_to_tensor(f, f"blk.{i}.ffn_down_exps.weight")
             down_started = time.time()
             self._write_windowed_map(f, executor, quantize_down)
             down_elapsed = time.time() - down_started
-            print(
-                f"    down    {self.n_exp}/{self.n_exp} ({down_elapsed:.1f}s); "
-                f"layer total {time.time() - t0:.1f}s"
-            )
+            print(f"    down    {self.n_exp}/{self.n_exp} ({down_elapsed:.1f}s); layer total {time.time() - t0:.1f}s")
 
     def _write_windowed_map(self, f, executor, fn):
         """Apply ``fn`` to every emitted expert, writing results in order.
@@ -1289,6 +975,7 @@ class NVFP4Converter:
         after the Q4_0 halves, matching the tensor-info layout.
         """
         print(f"  Converting layer {i} experts (Q4_0 hot + Q1_0 cold, {self.n_exp} experts)...")
+
         # Two passes over the experts. The file's tensor-info order is
         # gate_up Q4, down Q4, gate_up_lp Q1, down_lp Q1, but each pass below
         # produces one Q4 tensor in the right position so only its Q1 twin is
@@ -1318,6 +1005,7 @@ class NVFP4Converter:
         # while streaming each Q4 half to disk in order; only the Q1 cold twins
         # stay buffered, keeping peak memory near the Q1-twin size.
         with ThreadPoolExecutor(max_workers=self.conversion_workers) as executor:
+
             def write_twin_pass(fn, projections):
                 q1_chunks = []
                 indices = list(self._emit_experts())
@@ -1334,27 +1022,28 @@ class NVFP4Converter:
 
             q1_up_chunks = write_twin_pass(quantize_twin, ("gate_proj", "up_proj"))
             print(f"    gate/up {self.n_exp}/{self.n_exp} done", flush=True)
+            self._pad_to_tensor(f, f"blk.{i}.ffn_down_exps.weight")
             q1_down_chunks = write_twin_pass(quantize_twin, ("down_proj",))
             print(f"    down  {self.n_exp}/{self.n_exp} done", flush=True)
+        self._pad_to_tensor(f, f"blk.{i}.ffn_gate_up_exps_lp.weight")
         f.write(b"".join(q1_up_chunks))
         del q1_up_chunks
+        self._pad_to_tensor(f, f"blk.{i}.ffn_down_exps_lp.weight")
         f.write(b"".join(q1_down_chunks))
         del q1_down_chunks
 
     def _write_data_compact_experts(self, f, prefix, i, tensor_type):
         """Write one layer's routed experts in the requested compact format."""
-        import time
         t0 = time.time()
         quantizers = {
             GGML_TYPE_Q1_0: ("Q1_0", _quantize_q1_0_buffer),
             GGML_TYPE_Q2_K: ("Q2_K", quantize_q2_k),
+            GGML_TYPE_Q3_K: ("Q3_K", quantize_q3_k),
             GGML_TYPE_IQ1_S: ("IQ1_S", quantize_iq1_s),
         }
         label, quantizer = quantizers[tensor_type]
-        print(
-            f"  Converting layer {i + 1}/{self.n_layer} experts "
-            f"({label} only, {self.n_exp} experts)..."
-        )
+        print(f"  Converting layer {i + 1}/{self.n_layer} experts ({label} only, {self.n_exp} experts)...")
+
         def quantize_gate_up(e):
             ep = f"{prefix}.mlp.experts.{e}"
             chunks = []
@@ -1366,13 +1055,12 @@ class NVFP4Converter:
                 f32 = dequantize_nvfp4(packed, scales, s2)
                 importance = None
                 if tensor_type == GGML_TYPE_IQ1_S:
-                    assert self.imatrix is not None
-                    importance = self.imatrix.expert(
-                        f"blk.{i}.ffn_gate_up_exps.weight", e, f32.shape[1]
-                    )
-                chunks.append(
-                    quantizer(f32, importance) if importance is not None else quantizer(f32)
-                )
+                    if self.imatrix is None:
+                        raise ValueError(f"{label} expert conversion requires an importance matrix")
+                    importance = self.imatrix.expert(f"blk.{i}.ffn_gate_up_exps.weight", e, f32.shape[1])
+                elif tensor_type in (GGML_TYPE_Q2_K, GGML_TYPE_Q3_K) and self.imatrix is not None:
+                    importance = self.imatrix.expert(f"blk.{i}.ffn_gate_up_exps.weight", e, f32.shape[1])
+                chunks.append(quantizer(f32, importance) if importance is not None else quantizer(f32))
                 del packed, scales, f32
             return b"".join(chunks)
 
@@ -1385,41 +1073,30 @@ class NVFP4Converter:
             f32 = dequantize_nvfp4(packed, scales, s2)
             importance = None
             if tensor_type == GGML_TYPE_IQ1_S:
-                assert self.imatrix is not None
-                importance = self.imatrix.expert(
-                    f"blk.{i}.ffn_down_exps.weight", e, f32.shape[1]
-                )
+                if self.imatrix is None:
+                    raise ValueError(f"{label} expert conversion requires an importance matrix")
+                importance = self.imatrix.expert(f"blk.{i}.ffn_down_exps.weight", e, f32.shape[1])
+            elif tensor_type in (GGML_TYPE_Q2_K, GGML_TYPE_Q3_K) and self.imatrix is not None:
+                importance = self.imatrix.expert(f"blk.{i}.ffn_down_exps.weight", e, f32.shape[1])
             return quantizer(f32, importance) if importance is not None else quantizer(f32)
 
         # Bound in-flight expert work to the worker pool size. Submitting the
         # whole layer's experts to executor.map at once can buffer a layer's
         # worth of quantized payloads in memory; windowed submission keeps
         # peak usage proportional to the worker count while preserving order.
-        window = max(1, self.conversion_workers)
-
-        def write_map(fn, iterable):
-            indices = list(self._emit_experts())
-            for start in range(0, len(indices), window):
-                stop = min(start + window, len(indices))
-                for payload in executor.map(fn, indices[start:stop]):
-                    f.write(payload)
-
         with ThreadPoolExecutor(max_workers=self.conversion_workers) as executor:
-            write_map(quantize_gate_up, self._emit_experts())
+            compact_suffix = "_lp" if self.experts_only else ""
+            self._write_windowed_map(f, executor, quantize_gate_up)
             gate_elapsed = time.time() - t0
             print(f"    gate/up {self.n_exp}/{self.n_exp} ({gate_elapsed:.1f}s)")
+            self._pad_to_tensor(f, f"blk.{i}.ffn_down_exps{compact_suffix}.weight")
             down_started = time.time()
-            write_map(quantize_down, self._emit_experts())
+            self._write_windowed_map(f, executor, quantize_down)
             down_elapsed = time.time() - down_started
-            print(
-                f"    down    {self.n_exp}/{self.n_exp} ({down_elapsed:.1f}s); "
-                f"layer total {time.time() - t0:.1f}s"
-            )
+            print(f"    down    {self.n_exp}/{self.n_exp} ({down_elapsed:.1f}s); layer total {time.time() - t0:.1f}s")
 
     def _write_data_q1_experts_from_q4(self, f, reader, i):
         """Derive compact experts directly from an existing Q4 GGUF mmap."""
-
-        import time
 
         # Build the tensor-name index once per sidecar and reuse it across
         # layers instead of rescanning the entire tensor list for every layer.
@@ -1434,6 +1111,7 @@ class NVFP4Converter:
             f"blk.{i}.ffn_down_exps.weight",
         )
         print(f"  Compacting layer {i} Q4_0 experts to Q1_0 ({self.n_exp} experts)...")
+
         def quantize_from_q4(e):
             # The Q4 decode buffer is private to this thread; consume it in
             # place rather than copying a fresh f32 matrix for the Q1 pass.
@@ -1444,16 +1122,13 @@ class NVFP4Converter:
             if tensor is None:
                 raise KeyError(f"Q4 sidecar is missing tensor: {name}")
             if int(tensor.tensor_type) != GGML_TYPE_Q4_0:
-                raise ValueError(
-                    f"Q4 sidecar tensor {name} has type {tensor.tensor_type}, expected Q4_0"
-                )
+                raise ValueError(f"Q4 sidecar tensor {name} has type {tensor.tensor_type}, expected Q4_0")
             data = np.asarray(tensor.data)
             if data.shape[0] != self.n_exp:
-                raise ValueError(
-                    f"Q4 sidecar tensor {name} has {data.shape[0]} experts, expected {self.n_exp}"
-                )
+                raise ValueError(f"Q4 sidecar tensor {name} has {data.shape[0]} experts, expected {self.n_exp}")
             # The mmap'd sidecar rows are read-only and shared across worker
             # threads; only the decoded/quantized payloads are per-thread.
+            self._pad_to_tensor(f, name.replace(".weight", "_lp.weight"))
             with ThreadPoolExecutor(max_workers=self.conversion_workers) as executor:
                 gate_start = time.time()
                 self._write_windowed_map(f, executor, quantize_from_q4)
@@ -1476,7 +1151,7 @@ class NVFP4Converter:
             shape = source.get_shape() if hasattr(source, "get_shape") else source.shape
             written = 0
             for start in range(0, shape[0], row_chunk):
-                rows = source[start:min(start + row_chunk, shape[0])]
+                rows = source[start : min(start + row_chunk, shape[0])]
                 data = quantize_q4_0(rows.to(torch.float32).numpy())
                 f.write(data)
                 written += len(data)
@@ -1539,18 +1214,13 @@ class NVFP4Converter:
         elif dtype == GGML_TYPE_BF16:
             # NumPy has no portable bfloat16 dtype; preserve the raw 16-bit
             # representation expected by GGML_TYPE_BF16.
-            return (
-                t.to(torch.bfloat16)
-                .contiguous()
-                .view(torch.uint16)
-                .numpy()
-                .tobytes()
-            )
+            return t.to(torch.bfloat16).contiguous().view(torch.uint16).numpy().tobytes()
         else:
             return t.to(torch.float16).numpy().tobytes()
 
     def convert(self, output_path: str):
         import gc
+
         print(f"Converting {self.model_dir} \u2192 {output_path}")
         self._init_gguf(None)
         if self._kept is not None:
@@ -1577,10 +1247,7 @@ class NVFP4Converter:
                 f"{self.n_exp} experts per layer (quality may drop)"
             )
         if self.experts_only:
-            self._tensor_infos = [
-                info for info in self._tensor_infos
-                if info[0].endswith("_exps_lp.weight")
-            ]
+            self._tensor_infos = [info for info in self._tensor_infos if info[0].endswith("_exps_lp.weight")]
             sidecar_keys = {
                 "general.architecture",
                 "qwen35moe.block_count",
@@ -1593,8 +1260,7 @@ class NVFP4Converter:
             expected = self.n_layer * 2
             if len(self._tensor_infos) != expected:
                 raise ValueError(
-                    f"experts-only conversion expected {expected} compact tensors, "
-                    f"found {len(self._tensor_infos)}"
+                    f"experts-only conversion expected {expected} compact tensors, found {len(self._tensor_infos)}"
                 )
         output = os.path.abspath(output_path)
         output_dir = os.path.dirname(output)
@@ -1607,8 +1273,6 @@ class NVFP4Converter:
                 f"{estimated_bytes / 1024**3:.1f} GiB, have "
                 f"{free_bytes / 1024**3:.1f} GiB"
             )
-        partial = output + ".partial"
-
         q4_reader = None
         if self.q4_sidecar_source:
             import gguf
@@ -1625,8 +1289,13 @@ class NVFP4Converter:
                     f"reader reversed them and failed: {exc}"
                 ) from exc
 
+        partial_fd, partial = tempfile.mkstemp(
+            dir=output_dir,
+            prefix=f".{os.path.basename(output)}.",
+            suffix=".partial",
+        )
         try:
-            with open(partial, "wb") as f:
+            with os.fdopen(partial_fd, "wb") as f:
                 self._write_header(f)
                 self._write_kv(f)
                 data_start = self._write_ti(f)
@@ -1638,22 +1307,25 @@ class NVFP4Converter:
                 expert_done = set()
                 f16_exp_done = set()
                 for name, _n_dims, _dims, dtype, nbytes in self._tensor_infos:
-                    is_exps = (
-                        "ffn_gate_up_exps" in name or "ffn_down_exps" in name
-                    ) and "_lp" not in name
+                    is_exps = ("ffn_gate_up_exps" in name or "ffn_down_exps" in name) and "_lp" not in name
                     if is_exps and dtype == GGML_TYPE_Q4_0:
                         i = int(name.split(".")[1])
                         if i not in expert_done:
+                            self._pad_to_tensor(f, name)
                             prefix = f"model.language_model.layers.{i}"
                             if self.cold_tier == "q1_0":
                                 self._write_data_dual_experts(f, prefix, i)
                             else:
                                 self._write_data_nvfp4(f, prefix, i)
                             expert_done.add(i)
-                    elif dtype in (GGML_TYPE_Q1_0, GGML_TYPE_Q2_K, GGML_TYPE_IQ1_S) and "_exps_lp" in name:
+                    elif dtype in (GGML_TYPE_Q1_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_IQ1_S) and (
+                        "_exps_lp" in name
+                        or (self.cold_tier == "q1_only" and ("ffn_gate_up_exps" in name or "ffn_down_exps" in name))
+                    ):
                         if self.cold_tier == "q1_only":
                             i = int(name.split(".")[1])
                             if i not in expert_done:
+                                self._pad_to_tensor(f, name)
                                 if q4_reader is not None:
                                     self._write_data_q1_experts_from_q4(f, q4_reader, i)
                                 else:
@@ -1667,30 +1339,37 @@ class NVFP4Converter:
                             i = int(name.split(".")[1])
                             mtp_idx = i - self.n_layer
                             prefix = f"mtp.layers.{mtp_idx}"
+                            self._pad_to_tensor(f, name)
                             self._write_data_f16_experts(f, prefix, i)
                             f16_exp_done.add(name)
                     elif dtype == GGML_TYPE_Q4_0:
+                        self._pad_to_tensor(f, name)
                         self._write_q4_dense(f, name, nbytes)
                         if nbytes >= 256 * 1024**2:
                             gc.collect()
                     elif dtype in (GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32):
                         if "ffn_gate_up_exps" in name or "ffn_down_exps" in name:
                             continue
+                        self._pad_to_tensor(f, name)
                         data = self._load_bf16_tensor_bytes(name, dtype, nbytes)
                         if len(data) != nbytes:
-                            raise ValueError(
-                                f"Tensor {name} wrote {len(data)} bytes; expected {nbytes}"
-                            )
+                            raise ValueError(f"Tensor {name} wrote {len(data)} bytes; expected {nbytes}")
                         f.write(data)
                         del data
                         # Freed arrays return to the allocator by refcount; only
                         # the large weights justify a cycle-collector sweep.
                         if nbytes >= 256 * 1024**2:
                             gc.collect()
+                expected_end = getattr(self, "_data_end", f.tell())
+                if f.tell() != expected_end:
+                    raise ValueError(
+                        f"GGUF payload ended at byte {f.tell()}, expected {expected_end} from the tensor catalog"
+                    )
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(partial, output)
-        except Exception:
+            util.sync_directory(output_dir)
+        except BaseException:
             if os.path.exists(partial):
                 os.unlink(partial)
             raise
@@ -1700,9 +1379,13 @@ class NVFP4Converter:
 
 def main():
     import argparse
+
     parser = argparse.ArgumentParser(description="Convert Qwen3.5-122B-A10B NVFP4 to GGUF")
     parser.add_argument("--model-dir", default=MODEL_DIR)
-    parser.add_argument("--output", default="/tmp/qwen3.5-122b-a10b-nvfp4.gguf")
+    parser.add_argument(
+        "--output",
+        default=os.path.expanduser("~/.local/share/kestrel/models/qwen3.5-122b-a10b-nvfp4.gguf"),
+    )
     parser.add_argument("--test-single-layer", action="store_true")
     parser.add_argument(
         "--test-layers",
@@ -1746,14 +1429,19 @@ def main():
         help="use Q2_K experts for the first and last N layers of a direct q1_only conversion",
     )
     parser.add_argument(
+        "--all-q2",
+        action="store_true",
+        help="use Q2_K for every routed expert in a direct compact conversion",
+    )
+    parser.add_argument(
         "--compact-expert-type",
-        choices=["q1_0", "iq1_s"],
+        choices=["q1_0", "q2_k", "q3_k", "iq1_s"],
         default="q1_0",
-        help="expert format used by a direct q1_only compact-primary conversion",
+        help="expert format used by a direct q1_only compact-primary conversion; q2_k is the all-Q2 mode",
     )
     parser.add_argument(
         "--imatrix",
-        help="llama-imatrix GGUF used to calibrate IQ1_S experts",
+        help="llama-imatrix GGUF used to calibrate IQ1_S, Q2_K, or Q3_K experts",
     )
     parser.add_argument(
         "--conversion-workers",
@@ -1771,6 +1459,7 @@ def main():
         experts_only=args.experts_only,
         q2_edge_layers=args.q2_edge_layers,
         compact_expert_type=args.compact_expert_type,
+        all_q2=args.all_q2,
         imatrix_path=args.imatrix,
         conversion_workers=args.conversion_workers,
     )
@@ -1836,8 +1525,7 @@ def generic_convert_hf_to_gguf(
     script = find_convert_script(llama_cpp_dir)
     if not script:
         raise FileNotFoundError(
-            "convert_hf_to_gguf.py not found; clone llama.cpp and (optional) set "
-            "KESTREL_LLAMA_CPP_DIR to its checkout"
+            "convert_hf_to_gguf.py not found; clone llama.cpp and (optional) set KESTREL_LLAMA_CPP_DIR to its checkout"
         )
     command = [
         sys.executable,
@@ -1848,11 +1536,15 @@ def generic_convert_hf_to_gguf(
         "--outtype",
         outtype,
     ]
-    result = subprocess.run(command, capture_output=True, text=True)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=24 * 60 * 60)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("convert_hf_to_gguf.py exceeded its 24-hour time budget") from exc
+    except OSError as exc:
+        raise RuntimeError(f"could not start convert_hf_to_gguf.py: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(
-            f"convert_hf_to_gguf.py failed (exit {result.returncode}): "
-            + (result.stderr or result.stdout).strip()
+            f"convert_hf_to_gguf.py failed (exit {result.returncode}): " + (result.stderr or result.stdout).strip()
         )
     return " ".join(command), result.returncode
 

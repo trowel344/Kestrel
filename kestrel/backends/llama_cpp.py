@@ -10,8 +10,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .. import util
+from ..errors import BackendError
+
 NATIVE_LLAMA_CPP_DIRS = (
-    "/tmp/llama.cpp-moe-cache",
     os.path.expanduser("~/llama.cpp-moe-cache"),
     os.path.expanduser("~/llama.cpp"),
 )
@@ -55,9 +57,7 @@ def default_llama_cpp_dir(dirs: tuple[str, ...] | None = None) -> str:
     if override and ordered and ordered[0] == override:
         return override
     for directory in ordered:
-        if _find_binary(directory, "llama-server") or _find_binary(
-            directory, "llama-cli"
-        ):
+        if _find_binary(directory, "llama-server") or _find_binary(directory, "llama-cli"):
             return directory
     return os.path.expanduser("~/llama.cpp")
 
@@ -101,9 +101,7 @@ class RunMetrics:
 
 
 def _capability_cache_path() -> str:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
-        os.path.expanduser("~"), ".cache"
-    )
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
     return os.path.join(base, "kestrel", "llama-cli-capabilities.json")
 
 
@@ -120,7 +118,7 @@ def _capability_cache_read(binary: str) -> tuple[str, str] | None:
         key = f"{binary}\0{stat.st_mtime_ns}\0{stat.st_size}"
         with open(_capability_cache_path()) as f:
             data = json.load(f)
-        if data.get("key") == key:
+        if data.get("key") == key and isinstance(data.get("help"), str) and isinstance(data.get("version"), str):
             return data["help"], data["version"]
     except (OSError, ValueError, KeyError):
         pass
@@ -132,11 +130,7 @@ def _capability_cache_write(binary: str, help_text: str, version: str) -> None:
         stat = os.stat(binary)
         key = f"{binary}\0{stat.st_mtime_ns}\0{stat.st_size}"
         path = _capability_cache_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump({"key": key, "help": help_text, "version": version}, f)
-        os.replace(tmp, path)
+        util.write_atomic(path, json.dumps({"key": key, "help": help_text, "version": version}), backup=False)
     except OSError:
         pass
 
@@ -152,14 +146,17 @@ def _load_capabilities(binary: str, refresh: bool) -> LlamaCppCapabilities:
     if cached is not None:
         help_text, version = cached
     else:
-        help_result = subprocess.run(
-            [binary, "--help"], capture_output=True, text=True, timeout=15
-        )
-        version_result = subprocess.run(
-            [binary, "--version"], capture_output=True, text=True, timeout=15
-        )
+        try:
+            help_result = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=15)
+            version_result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired as exc:
+            raise BackendError(f"llama.cpp capability probe timed out: {binary}") from exc
+        except OSError as exc:
+            raise BackendError(f"could not probe llama.cpp binary {binary}: {exc}") from exc
         help_text = help_result.stdout + help_result.stderr
         version = (version_result.stdout or version_result.stderr).strip()
+        if not help_text.strip():
+            raise BackendError(f"llama.cpp capability probe produced no help output: {binary}")
         _capability_cache_write(binary, help_text, version)
     return LlamaCppCapabilities(help_text=help_text, version=version)
 
@@ -220,11 +217,7 @@ class LlamaCppBackend:
 
     def _search_dirs(self) -> list[str]:
         """The selected build first, then the other native builds as fallback."""
-        return [self.llama_cpp_dir] + [
-            directory
-            for directory in _candidate_dirs()
-            if directory != self.llama_cpp_dir
-        ]
+        return [self.llama_cpp_dir] + [directory for directory in _candidate_dirs() if directory != self.llama_cpp_dir]
 
     def _find_bin(self, name: str) -> str | None:
         for directory in self._search_dirs():
@@ -237,7 +230,7 @@ class LlamaCppBackend:
     def binary(self) -> str:
         binary = self._find_bin("llama-cli") or self._find_bin("main")
         if not binary:
-            raise RuntimeError(
+            raise BackendError(
                 f"llama-cli was not found under {self.llama_cpp_dir} "
                 "or any native llama.cpp build. Run 'kestrel build' or set "
                 "KESTREL_LLAMA_CPP_DIR."
@@ -248,7 +241,7 @@ class LlamaCppBackend:
     def server_binary(self) -> str:
         binary = self._find_bin("llama-server")
         if not binary:
-            raise RuntimeError(
+            raise BackendError(
                 f"llama-server was not found under {self.llama_cpp_dir} "
                 "or any native llama.cpp build. Run 'kestrel build' or set "
                 "KESTREL_LLAMA_CPP_DIR."
@@ -283,10 +276,14 @@ class LlamaCppBackend:
         ``--fit``, letting serve OOM where run would not).
         """
         args = [
-            "-ngl", str(self.n_gpu_layers),
-            "-c", str(self.n_ctx),
-            "-b", str(self.n_batch),
-            "-ub", str(self.n_ubatch),
+            "-ngl",
+            str(self.n_gpu_layers),
+            "-c",
+            str(self.n_ctx),
+            "-b",
+            str(self.n_batch),
+            "-ub",
+            str(self.n_ubatch),
         ]
         if self.n_threads and caps.supports("--threads"):
             args += ["--threads", str(self.n_threads)]
@@ -338,9 +335,12 @@ class LlamaCppBackend:
 
         cmd = [
             self.binary,
-            "-m", self.model_path,
-            "--temp", str(self.temp),
-            "--seed", str(self.seed),
+            "-m",
+            self.model_path,
+            "--temp",
+            str(self.temp),
+            "--seed",
+            str(self.seed),
         ]
         cmd += self._common_engine_args(caps)
         return cmd
@@ -356,9 +356,12 @@ class LlamaCppBackend:
         caps = self.server_capabilities()
         cmd = [
             self.server_binary,
-            "-m", self.model_path,
-            "--host", host,
-            "--port", str(port),
+            "-m",
+            self.model_path,
+            "--host",
+            host,
+            "--port",
+            str(port),
         ]
         if alias:
             cmd += ["--alias", alias]
@@ -384,9 +387,11 @@ class LlamaCppBackend:
         if caps.supports("--perf"):
             cmd.append("--perf")
         cmd += [
-            "-n", str(max_tokens),
+            "-n",
+            str(max_tokens),
             "--no-display-prompt",
-            "-p", prompt,
+            "-p",
+            prompt,
         ]
         return cmd
 
@@ -396,12 +401,8 @@ class LlamaCppBackend:
         patterns = {
             "prompt_tokens": r"^\S+:\s+prompt eval time\s*=.*?/\s*(\d+) tokens",
             "output_tokens": r"^\S+:\s+eval time\s*=.*?/\s*(\d+) runs",
-            "prompt_tokens_per_second": (
-                r"^\S+:\s+prompt eval time\s*=.*?([\d.]+) tokens per second"
-            ),
-            "output_tokens_per_second": (
-                r"^\S+:\s+eval time\s*=.*?([\d.]+) tokens per second"
-            ),
+            "prompt_tokens_per_second": (r"^\S+:\s+prompt eval time\s*=.*?([\d.]+) tokens per second"),
+            "output_tokens_per_second": (r"^\S+:\s+eval time\s*=.*?([\d.]+) tokens per second"),
         }
         for field, pattern in patterns.items():
             match = re.search(pattern, stderr, flags=re.MULTILINE)
@@ -416,17 +417,17 @@ class LlamaCppBackend:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                "llama.cpp generation exceeded 30 minutes and was stopped"
-            ) from exc
+            raise BackendError("llama.cpp generation exceeded 30 minutes and was stopped") from exc
+        except OSError as exc:
+            raise BackendError(f"could not start llama.cpp generation: {exc}") from exc
         elapsed = time.perf_counter() - started
         self.last_metrics = self._parse_metrics(result.stderr, elapsed, result.returncode)
         if result.returncode != 0:
-            detail = result.stderr.strip()[-2000:]
-            raise RuntimeError(f"llama.cpp failed with exit {result.returncode}:\n{detail}")
+            detail = util.truncate(result.stderr.strip())
+            raise BackendError(f"llama.cpp failed with exit {result.returncode}:\n{detail}")
         return result.stdout.strip()
 
-    def _finalize_stream(self, started: float, *, suppress_error: bool = False) -> None:
+    def _finalize_stream(self, started: float, *, suppress_error: bool = False, terminate: bool = False) -> None:
         """Collect metrics and tear down the streaming subprocess exactly once.
 
         Runs even when a consumer abandons the generator early (GeneratorExit),
@@ -437,16 +438,28 @@ class LlamaCppBackend:
             return
         err = None
         try:
-            returncode = self._proc.wait()
+            try:
+                if terminate and self._proc.poll() is None:
+                    self._proc.terminate()
+                    try:
+                        returncode = self._proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+                        returncode = self._proc.wait()
+                else:
+                    returncode = self._proc.wait()
+            except OSError as exc:
+                returncode = 1
+                err = BackendError(f"could not finalize llama.cpp stream: {exc}")
             elapsed = time.perf_counter() - started
             self._stderr_file.seek(0)
             stderr = self._stderr_file.read()
             self.last_metrics = self._parse_metrics(stderr, elapsed, returncode)
-            if returncode != 0:
-                err = RuntimeError(
-                    f"llama.cpp failed with exit {returncode}:\n{stderr[-2000:]}"
-                )
+            if returncode != 0 and err is None:
+                err = BackendError(f"llama.cpp failed with exit {returncode}:\n{stderr[-2000:]}")
         finally:
+            if self._proc.stdout is not None:
+                self._proc.stdout.close()
             self._stderr_file.close()
             self._stderr_file = None
             self._proc = None
@@ -457,16 +470,22 @@ class LlamaCppBackend:
         cmd = self._build_cmd(prompt, max_tokens)
         self._stderr_file = tempfile.TemporaryFile(mode="w+")
         started = time.perf_counter()
-        self._proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=self._stderr_file,
-            text=True,
-            bufsize=1,
-        )
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=self._stderr_file,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            self._stderr_file.close()
+            self._stderr_file = None
+            raise BackendError(f"could not start llama.cpp stream: {exc}") from exc
         terminating = False
         try:
-            assert self._proc.stdout is not None
+            if self._proc.stdout is None:
+                raise BackendError("llama.cpp stream has no stdout pipe")
             while True:
                 chunk = self._proc.stdout.readline()
                 if chunk == "":
@@ -476,7 +495,7 @@ class LlamaCppBackend:
             # Consumer stopped early: still clean up, but don't replace the
             # GeneratorExit with a failure raised from the cleanup path.
             terminating = True
-            self._finalize_stream(started, suppress_error=True)
+            self._finalize_stream(started, suppress_error=True, terminate=True)
             raise
         finally:
             if not terminating:
