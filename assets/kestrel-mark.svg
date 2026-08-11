@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 224 224" role="img" aria-labelledby="title desc">
   <title id="title">Kestrel pixel K</title>
-  <desc id="desc">A centered block-pixel letter K in warm amber on a deep navy square.</desc>
+  <desc id="desc">A centered off-white block-pixel letter K with amber side depth on a deep navy square.</desc>
   <rect width="224" height="224" rx="32" fill="#0c1826"/>
 
   <defs>
@@ -19,12 +19,21 @@
       <rect x="126" y="140" width="28" height="28"/>
       <rect x="140" y="154" width="28" height="28"/>
     </g>
+    <g id="pixel-k-arms">
+      <rect x="140" y="42" width="28" height="28"/>
+      <rect x="126" y="56" width="28" height="28"/>
+      <rect x="112" y="70" width="28" height="28"/>
+      <rect x="98" y="84" width="28" height="28"/>
+      <rect x="84" y="98" width="42" height="28"/>
+
+      <rect x="98" y="112" width="28" height="28"/>
+      <rect x="112" y="126" width="28" height="28"/>
+      <rect x="126" y="140" width="28" height="28"/>
+      <rect x="140" y="154" width="28" height="28"/>
+    </g>
   </defs>
 
-  <!-- A small hard-edged shadow keeps the ASCII/pixel character intact. -->
-  <use href="#pixel-k" fill="#02060b" opacity="0.46" transform="translate(6 7)"/>
-  <use href="#pixel-k" fill="#f2a33a"/>
-
-  <!-- One hot pixel gives the terminal-like mark a sharp focal point. -->
-  <rect x="154" y="42" width="14" height="14" fill="#f26b38"/>
+  <!-- The warm underlay appears only on the two arms, like side-lit block depth. -->
+  <use href="#pixel-k-arms" fill="#c77b30" opacity="0.9" transform="translate(5 6)"/>
+  <use href="#pixel-k" fill="#f2efe6"/>
 </svg>
