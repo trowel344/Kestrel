@@ -1,188 +1,157 @@
 <div align="center">
 
+<img src="assets/kestrel-mark.svg" width="132" alt="Kestrel block-pixel K logo">
+
 # Kestrel
 
-**Run frontier-scale GGUF models on the edge hardware you already own.**
+**Run models larger than your memory.**
 
-Hardware-aware orchestration, conversion, evaluation, and model management for
-llama.cpp—without requiring a cloud account or hiding the real memory plan.
+Hardware-aware local inference for GGUF models across VRAM, RAM, NVMe, and
+trusted edge machines—without hiding the plan or requiring a cloud account.
 
 [![Tests](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/test.yml?branch=main&label=tests&logo=github)](https://github.com/trowel344/Kestrel/actions/workflows/test.yml)
 [![Lint](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/lint.yml?branch=main&label=lint&logo=ruff)](https://github.com/trowel344/Kestrel/actions/workflows/lint.yml)
 [![Distribution](https://img.shields.io/github/actions/workflow/status/trowel344/Kestrel/distribution.yml?branch=main&label=wheel&logo=github)](https://github.com/trowel344/Kestrel/actions/workflows/distribution.yml)
 [![Python](https://img.shields.io/badge/python-3.11--3.13-3776ab?logo=python&logoColor=white)](pyproject.toml)
 [![License](https://img.shields.io/github/license/trowel344/Kestrel)](LICENSE)
-[![Status](https://img.shields.io/badge/status-beta-2f81f7)](CHANGELOG.md)
+[![Status](https://img.shields.io/badge/status-beta-f2a33a)](CHANGELOG.md)
 
-[Quick start](#quick-start) · [Commands](#command-reference) ·
-[How it works](#why-kestrel) · [Contributing](CONTRIBUTING.md) ·
+[Start](#start-in-two-commands) · [How it works](#how-kestrel-works) ·
+[Commands](#command-line) · [Trusted nodes](docs/TRUSTED_NODES.md) ·
 [Security](SECURITY.md)
 
 </div>
 
-Kestrel profiles the host, inspects the model, and enables only capabilities
-the installed llama.cpp binary actually supports. It plans a layout across
-VRAM, RAM, and disk; handles split GGUFs and sparse MoE models; and keeps its
-decisions visible through human and machine-readable CLI output.
-
-> [!NOTE]
-> Kestrel is beta software. It is designed to make oversized local models
-> runnable and measurable; it does not promise that every model will be fast
-> or capable on every machine. Use `kestrel benchmark` and `kestrel evaluate`
-> to record what a specific artifact can actually do on your hardware.
+Kestrel turns an oversized model from **cannot load** into **runs locally**. It
+inspects the real GGUF and the installed llama.cpp binary, measures available
+hardware, then builds a visible placement plan before launching anything.
 
 > [!IMPORTANT]
 > This project is not affiliated with the unrelated `kestrel` distribution on
-> PyPI. Until Kestrel has a distinct distribution name, install it from this
-> repository or from an attached GitHub Release artifact—not with
-> `pip install kestrel`.
+> PyPI. Install from this repository or a Kestrel GitHub Release artifact—not
+> with `pip install kestrel` from PyPI.
 
-## Why Kestrel
+## Proven beyond memory
 
-- **Plans before it runs.** VRAM, free RAM, and the llama.cpp binary's real
-  capability set are measured first, so Kestrel picks a memory layout that
-  fits — CPU-MoE placement, quantized KV caches, VRAM margins, and an automatic
-  CUDA-OOM retry ladder.
-- **Loads at disk speed.** `--direct-io` bypasses the page cache for cold NVMe
-  loads (opt-in; warm mmap reloads stay the default).
-- **Uses every GPU.** Multi-GPU rigs are detected and `--tensor-split` balances
-  tensors across all of them; planning fits against combined VRAM.
-- **Can pool trusted machines (experimental).** Named llama.cpp RPC workers
-  extend the device list over loopback or authenticated SSH tunnels. Kestrel
-  verifies the RPC protocol, device count, live memory, and pinned engine
-  commit before it sends model data.
-- **Handles 100 GB+ models.** Split-GGUF shards are discovered as one model and
-  sized across all shards; NVFP4 conversion compacts MoE experts to Q1/IQ1_S
-  with optional MTP drafts.
-- **Dependency-light.** `import kestrel` pulls only `numpy` and `gguf`;
-  conversion dependencies stay behind `kestrel[convert]`.
+A reference development run on one consumer laptop:
 
-## Quick start
+| | Measured configuration |
+| --- | --- |
+| **Host** | Intel i7-13620H · RTX 4060 Laptop GPU, 8 GiB · 15 GiB system RAM |
+| **Model** | Qwen3.5-122B-A10B · sparse MoE |
+| **Artifact** | 24.33 GiB IQ1_S GGUF · out of core |
+| **Result** | 6.2–6.33 tokens/s sustained decode · stable · 8/8 deterministic capability gate |
+
+The artifact could not fit conventionally in the machine's RAM or VRAM. Sparse
+CPU-MoE placement and disk-backed mmap made it runnable without silently
+shrinking the model. This is a measured reference, not a universal speed claim:
+hardware, quantization, context, storage, and model architecture all matter.
+
+## Start in two commands
 
 ```bash
-# one-command install (isolated virtual environment)
 ./install.sh
-.venv/bin/kestrel                     # open the simple interactive menu
+.venv/bin/kestrel
 ```
 
-Choose **Models → Add a model** the first time, then **Start chat**. Kestrel
-uses automatic hardware and memory settings so technical placement questions
-do not block the first conversation.
+Choose **Models → Add a model** once, then **Start chat**. Kestrel automatically
+chooses conservative memory and hardware settings for the first run.
 
-Or install with pip: `pip install '.[convert]'`. For a scriptable setup, run
-`kestrel setup --model /path/to/model.gguf`, followed by `kestrel chat`.
-You can also skip setup with `kestrel chat /path/to/model.gguf`.
+Already have a GGUF and prefer the scriptable path?
 
-> No llama.cpp binary yet? `kestrel build` builds the CUDA-enabled MoE-native
-> build, or set `KESTREL_LLAMA_CPP_DIR` to an existing llama.cpp checkout.
+```bash
+.venv/bin/kestrel setup --model /models/model.gguf
+.venv/bin/kestrel chat
+```
 
-## Command reference
+No llama.cpp binary yet? `kestrel build` creates the CUDA-enabled MoE build, or
+set `KESTREL_LLAMA_CPP_DIR` to an existing checkout.
+
+## How Kestrel works
 
 ```text
-kestrel menu        interactive menu
-kestrel doctor      check hardware and llama.cpp capabilities
-kestrel status      active model, hardware plan, benchmark state
-kestrel setup       save safe local defaults (never API keys)
-kestrel run         plan and run a local model
-kestrel chat        chat with the configured local model
-kestrel serve       serve a GGUF over an OpenAI-compatible HTTP endpoint
-kestrel benchmark   reproduce prompt/decode measurements
-kestrel evaluate    deterministic capability tests against llama-server
-kestrel optimize    create and optionally benchmark a hardware profile
-kestrel models      search, list, recommend, info, pull, import
-kestrel nodes       manage and preflight experimental trusted RPC workers
-kestrel convert     convert safetensors to GGUF (NVFP4 or --generic)
-kestrel audit       validate a GGUF against its source
-kestrel build       transactionally build llama.cpp with CUDA and rollback
-kestrel self-update install a verified local checkout or checksummed wheel
+GGUF + host + llama.cpp
+          │
+          ▼
+  inspect capabilities
+          │
+          ▼
+  plan the working set
+          │
+          ├── VRAM
+          ├── system RAM
+          ├── NVMe / mmap
+          └── trusted RPC devices
+          │
+          ▼
+ launch · measure · report
 ```
 
-## Run-time controls
+1. **Inspect.** Read the complete split-GGUF set, model metadata, free memory,
+   accelerator inventory, and the selected engine's actual flags.
+2. **Plan.** Choose GPU layers, CPU-MoE placement, KV quantization, mmap/direct
+   I/O, tensor splits, and safety margins from live capacity.
+3. **Run.** Launch llama.cpp with a bounded CUDA-OOM retry ladder. Kestrel never
+   silently changes a distributed run into a local one.
+4. **Prove.** Keep projected plans separate from measured benchmark and
+   deterministic capability reports.
 
-| Flag | What it does |
+## Built for oversized local models
+
+- **100 GB+ and split GGUFs** — discover a shard set as one model and cache
+  metadata instead of repeatedly reading giant headers.
+- **Sparse MoE placement** — keep dense work on the GPU while routing experts
+  through CPU and disk-backed memory.
+- **Fast cold and warm loading** — opt-in direct I/O for cold NVMe reads; mmap
+  remains the warm-reload path.
+- **Multiple GPUs and trusted machines** — balance across local accelerators or
+  authenticated, protocol-checked llama.cpp RPC workers.
+- **Conversion and pruning** — convert NVFP4 Qwen3.5-MoE safetensors to GGUF,
+  compact experts to Q1/IQ1_S tiers, prune experts, and carry optional MTP
+  drafts.
+- **Agent-safe output** — every JSON-mode command emits one machine-readable
+  document on stdout while human diagnostics stay on stderr.
+- **Dependency-light runtime** — Torch and safetensors are conversion-only
+  extras, not an inference requirement.
+
+## Command line
+
+```text
+kestrel                 open the minimal interactive menu
+kestrel doctor          inspect hardware, storage, models, and llama.cpp
+kestrel run             plan and run a local model
+kestrel chat            chat with the configured model
+kestrel serve           expose an OpenAI-compatible local endpoint
+kestrel benchmark       measure prompt and decode throughput
+kestrel evaluate        run deterministic capability checks
+kestrel models          find, inspect, pull, and import models
+kestrel nodes           manage experimental trusted RPC workers
+kestrel convert         convert or prune a model into GGUF
+kestrel audit           compare a GGUF with its source
+kestrel build           build the pinned llama.cpp engine safely
+```
+
+<details>
+<summary><strong>Runtime controls</strong></summary>
+
+| Flag | Purpose |
 | --- | --- |
-| `--direct-io` | Uncached direct I/O for fast cold loads from NVMe; disables `--warm-cache`. |
-| `--mlock` | Pin CPU-offloaded/MoE weights in RAM; removes page-in latency jitter. |
-| `--tensor-split 60,40` | Multi-GPU split ratios; auto-derived from detected VRAM. |
-| `--extra "--temp 0.4 --top-p 0.9"` | Pass arbitrary llama.cpp flags through (repeatable). |
-| `--kv-cache-type q8_0` | Quantized KV cache to stretch context under VRAM pressure. |
-| `--cpu-moe on` | Route MoE experts through CPU to keep the GPU dense-only. |
-| `--warm-cache` | Pre-read the model into the OS page cache before launch. |
-| `--node NAME` | Add a preconfigured, protocol-checked RPC worker to this run (repeatable). |
-| `--nodes all` | Use every enabled node in the local inventory. |
+| `--direct-io` | Bypass the page cache for a cold NVMe load. |
+| `--mlock` | Pin CPU-offloaded weights when enough RAM exists. |
+| `--tensor-split 60,40` | Override multi-GPU split ratios. |
+| `--kv-cache-type q8_0` | Stretch context with a quantized KV cache. |
+| `--cpu-moe on` | Keep sparse experts on CPU. |
+| `--warm-cache` | Pre-read the model before launch. |
+| `--node NAME` | Include a configured, verified RPC worker. |
+| `--extra "--temp 0.4"` | Pass an advanced llama.cpp flag through. |
 
-`serve --embeddings` enables the `/v1/embeddings` endpoint for RAG workloads.
-`convert --generic` wraps llama.cpp's `convert_hf_to_gguf.py` so any Hugging
-Face safetensors model can become GGUF, not just the NVFP4 Qwen3.5 layout.
+`kestrel run --json --dry-run MODEL` prints the validated plan and complete
+command without launching the model. `serve --embeddings` enables the local
+OpenAI-compatible embeddings endpoint.
 
-## Experimental trusted nodes
-
-Nodes let one Kestrel coordinator use accelerator devices exposed by
-llama.cpp RPC workers. This is useful for fitting a model that is too large
-for one machine; it is not a general cluster scheduler and does not make raw
-RPC safe. llama.cpp still owns the final tensor, KV-cache, host-RAM, and disk
-placement.
-
-Build the same pinned llama.cpp revision on the coordinator and worker with
-`GGML_RPC=ON`. Start the worker bound to loopback, then carry that port through
-an authenticated SSH tunnel:
-
-```bash
-# Worker: never bind this unauthenticated service to 0.0.0.0.
-./build/bin/ggml-rpc-server --host 127.0.0.1 --port 50052
-# From a trusted console, copy the key type and base64 data (not the comment)
-# from /etc/ssh/ssh_host_ed25519_key.pub for --host-key below.
-
-# Record the worker's exact llama.cpp commit, inspect it, then register a
-# managed tunnel. Kestrel launches and supervises the SSH forward for the
-# complete run/serve lifetime; the llama.cpp child receives only a temporary
-# loopback RPC endpoint and never receives the key path or host-key material.
-kestrel nodes add worker --endpoint 127.0.0.1:50052 \
-  --memory-mib 8192 --engine-commit "$(git -C /path/to/llama.cpp rev-parse HEAD)" \
-  --ssh-host worker --ssh-user kestrel \
-  --identity-file /absolute/path/.ssh/kestrel_worker \
-  --host-key "ssh-ed25519 AAAA..." \
-  --remote-rpc-port 50052
-kestrel nodes doctor worker
-kestrel nodes plan /models/model.gguf --node worker --json
-kestrel run /models/model.gguf --node worker
-```
-
-Managed SSH requires an absolute private-key file owned by the current user
-with mode `0600` or stricter and a pinned public host key. Kestrel writes a
-short-lived restricted `known_hosts` file, uses `BatchMode=yes`,
-`IdentitiesOnly=yes`, `StrictHostKeyChecking=yes`, and `ExitOnForwardFailure=yes`,
-then tears down the whole SSH process group on normal exit, failure, or
-Ctrl-C. Verify the host key out of band before recording it. A node's
-`ssh_host`, user, and port are safe status metadata; private-key paths and key
-material are deliberately omitted from JSON reports.
-
-Managed tunnel supervision currently requires a Linux coordinator because it
-uses `/proc` socket ownership checks to ensure the forwarded loopback listener
-actually belongs to the SSH child it launched.
-
-For disposable manual tunnels, the older `ssh -N -L ...` workflow still works
-with a direct loopback node entry, but Kestrel cannot supervise that external
-process. Prefer managed SSH for `run`, `chat`, and `serve`.
-
-For managed nodes, SSH authenticates the pinned worker host before `nodes
-doctor` proves that the forwarded endpoint speaks a compatible RPC protocol
-and reports its live devices/memory. A direct/manual node has no equivalent
-Kestrel-managed transport authentication.
-Kestrel also fails closed when the configured worker commit differs from the
-coordinator engine. `nodes plan` reports a coarse weights-only accelerator fit;
-it is evidence, not a guarantee that the full inference working set fits.
-
-Direct non-loopback RPC requires the loud `--allow-insecure-rpc` acknowledgement
-on both inventory and run commands. That escape hatch provides no encryption,
-authentication, or hostile-node isolation and is not recommended.
+</details>
 
 ## Measure capability, not just speed
-
-`benchmark` measures prompt processing and decode throughput. `evaluate`
-checks whether a running OpenAI-compatible llama-server can complete a small,
-deterministic capability manifest and records the model and artifact evidence
-in JSON:
 
 ```bash
 kestrel benchmark /models/model.gguf --repetitions 3 --json
@@ -191,119 +160,40 @@ kestrel evaluate --endpoint http://127.0.0.1:8080 \
   --artifact /models/model.gguf --sha256 --output evaluation.json
 ```
 
-These reports are deliberately separate. A model can fit and run reliably yet
-remain slow, or generate quickly while failing capability checks. Kestrel does
-not collapse those outcomes into a projected score.
+Benchmark and evaluation reports are deliberately separate. A model can fit
+and run reliably while remaining slow, or generate quickly while failing a
+capability check. Kestrel does not collapse those outcomes into a projected
+score.
 
-## Agent-friendly output
+## Install and develop
 
-Kestrel is a runner *for* agents, so every run/serve command speaks machine
-readable too:
-
-| Invocation | What you get on stdout |
-| --- | --- |
-| `kestrel run --json --dry-run MODEL` | The validated launch plan as one JSON object (`command`, `model`, `dry_run`). |
-| `kestrel run --json --prompt "..." MODEL` | One-shot generation: `output`, token counts, tok/s, `duration_s`, `command`. |
-| `kestrel serve --json --wait 120 MODEL` | `status: ready|timeout`, `url`, `port`, and `ready_after_s` once `/health` answers. |
-| `kestrel serve --json --dry-run MODEL` | Connection info + the full `llama-server` command. |
-
-With `--json`, human-readable output is redirected to stderr so stdout stays a
-single parseable JSON document (the contract agents rely on). `--prompt`
-accepts an inline one-shot prompt; `--max-tokens` caps its budget.
-
-## Features
-
-- **Hardware-aware planning** — measures VRAM, RAM, and llama.cpp support, then
-  picks a conservative layout (CPU-MoE placement, mmap/direct-IO, Q8 KV
-  caches, VRAM margins, startup CUDA OOM retry).
-- **Multi-GPU and fast loading** — aggregate-VRAM planning, `--tensor-split`,
-  `--direct-io`, `--mlock`, and persistent metadata caching so repeated runs
-  skip re-reading 100 GB headers.
-- **Local + remote models** — discover, inspect, rank, pull, and import models
-  from disk, Hugging Face (GGUF-filtered), and Ollama; split-GGUF shard sets
-  are treated as one complete model.
-- **NVFP4 conversion** — Qwen3.5-MoE safetensors to GGUF with dense Q4, compact
-  Q1/IQ1_S expert tiers, expert pruning, and optional MTP drafts.
-- **GGUF auditing** — validates an artifact against its source model.
-- **Reproducible benchmark** — separates measured results from projections.
-- **Deterministic evaluation** — records capability results, generation
-  metadata, and artifact provenance without silently treating a partial run as
-  a full pass.
-
-## Install
+Kestrel targets Linux for native CUDA and llama.cpp operation. The Python
+package and offline suite are continuously checked on Linux and macOS with
+Python 3.11–3.13.
 
 ```bash
-./install.sh                  # isolated .venv install (recommended)
-pip install .                 # runtime only (numpy + gguf)
-pip install '.[convert]'      # + NVFP4 conversion (torch, safetensors)
-pip install '.[dev]'          # + pytest, ruff (for contributors)
-```
-
-See `./install.sh --help` for options (`--convert`, `--dir`).
-
-## Supported platform
-
-Kestrel targets Linux for native CUDA/llama.cpp operation. The dependency-light
-Python package and offline test suite are continuously checked on Linux and
-macOS with Python 3.11, 3.12, and 3.13. GPU behavior still depends on the
-selected llama.cpp build and driver stack; `kestrel doctor` is the authoritative
-compatibility report for a host.
-
-## Development
-
-```bash
+./install.sh                  # isolated .venv, recommended
+pip install .                 # runtime only: NumPy + gguf
+pip install '.[convert]'      # add Torch + safetensors conversion
 pip install -e '.[dev,convert]'
-python -m pytest              # hermetic suite; caches are per-test isolated
+python -m pytest
 ruff check kestrel/ tests/
 ```
 
-Tests never touch a real user config, model directory, or cache — `tests/`
-runs fully offline. CI runs the same suite on Python 3.11, 3.12, and 3.13.
+Tests run offline and do not touch the real user configuration, model store,
+or cache. GPU behavior still depends on the selected llama.cpp build and
+driver stack; `kestrel doctor` is authoritative for a host.
 
-## Repository layout
+## Documentation
 
-```text
-kestrel/                 installable package (the product)
-  cli/                   command-line entry point (main), parser, and command families
-    main.py              dispatch + entry point
-    parser.py            argument parser
-    probes.py            hardware probes (GPU, RAM, power)
-    model_source.py      model/GGUF/safetensors resolution
-    planning.py          memory-placement planning glue
-    runtime.py           llama.cpp launch glue, JSON contracts
-    run.py               run / serve / chat
-    health.py            doctor / status / setup
-    models.py            models subcommands
-    nodes.py             experimental RPC node inventory / doctor / planning
-    bench.py             benchmark / optimize
-    menu.py              interactive menu
-    engine.py            engine build / status
-    updater.py           self-update
-    convert.py           convert / audit
-  config.py              config/env loading
-  ui.py                  std library terminal UI
-  model_store.py         model discovery, HF/Ollama stores, snapshot resolution
-  nodes.py               strict node persistence, RPC probing, device placement
-  core/planner.py        memory placement planning
-  core/pipeline.py       llama.cpp wrapper
-  backends/llama_cpp.py  process launch, capability probe, metrics
-  gguf/converter.py      NVFP4 -> GGUF conversion
-  gguf/quants.py         low-level quant/dequant primitives
-  gguf/metadata.py       GGUF metadata parsing
-  gguf/audit.py          audit
-  evals/model_eval.py    deterministic model capability evaluation
-  providers/             Ollama adapter
-```
+- [Trusted-node setup and threat boundary](docs/TRUSTED_NODES.md)
+- [Security policy](SECURITY.md)
+- [Contributing and issue reports](CONTRIBUTING.md)
+- [Release history](CHANGELOG.md)
 
-The public API is `kestrel.__version__`, `kestrel.InferencePipeline`,
-`kestrel.LlamaCppBackend`, and `kestrel.NVFP4Converter`.
-
-## Getting help
-
-- `kestrel --help`, `kestrel <command> --help`
-- Report issues: see [CONTRIBUTING.md](CONTRIBUTING.md#reporting-an-issue)
-- Contact: trowel344@gmail.com
+The public Python API is `kestrel.__version__`, `InferencePipeline`,
+`LlamaCppBackend`, and `NVFP4Converter`.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).

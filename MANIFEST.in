@@ -1,3 +1,5 @@
 include CHANGELOG.md
 include SECURITY.md
+include assets/kestrel-mark.svg
+include docs/TRUSTED_NODES.md
 include contrib/kestrel-rpc-worker.service

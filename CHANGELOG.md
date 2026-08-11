@@ -23,6 +23,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The GitHub landing page now leads with Kestrel's measured out-of-core result,
+  a two-command start, and a compact explanation of the memory planner. A new
+  amber block-pixel K gives the project a terminal-native visual identity, and
+  the detailed trusted-node guide has moved into focused documentation.
 - The interactive front door is reduced to Start chat, Models, Tools, and Exit.
   Chat launches with automatic settings; model onboarding groups local GGUF,
   Ollama, and Hugging Face sources under one plain-language path. Selection
