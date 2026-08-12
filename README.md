@@ -56,7 +56,7 @@ hardware, quantization, context, storage, and model architecture all matter.
 
 Choose **Models → Add a model** once, then **Start chat**. Kestrel automatically
 chooses conservative memory and hardware settings for the first run. Use
-**Models → Model settings** to keep context automatic or select a fixed window,
+**Settings** to keep context automatic or select a fixed window,
 and to set reasoning to automatic, off, low, medium, high, or maximum.
 
 Already have a GGUF and prefer the scriptable path?

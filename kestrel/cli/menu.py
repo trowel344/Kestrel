@@ -7,8 +7,8 @@ loop in the same process, so it reloads the config snapshot through
 The menu deliberately keeps its interaction layer separate from the command
 entry point.  ``_MenuSession`` owns the small amount of menu state and turns
 each selection into an ordinary CLI argument vector. The first screen exposes
-only chat, models, and tools; technical placement controls remain available in
-the scriptable CLI instead of blocking a first conversation.
+chat, models, model settings, and tools; technical placement controls remain
+available in the scriptable CLI instead of blocking a first conversation.
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ class _MenuSession:
         actions = (
             self._chat,
             self._models,
+            self._model_settings,
             self._tools,
         )
         while True:
@@ -76,12 +77,16 @@ class _MenuSession:
             actions[chosen]()
 
     def _main_selection(self, version: str) -> int:
-        default_model = load_config().default_model
+        config = load_config()
+        default_model = config.default_model
         default_display = ui._truncate(_model_label(default_model), max(12, ui.width() - 9))
+        context = getattr(config, "context_size", "auto")
+        reasoning = getattr(config, "reasoning_level", "auto")
         header = "\n".join(
             [
                 ui.bold("Kestrel") + (ui.dim(f"  v{version}") if ui.USE_ANSI else f"  v{version}"),
                 ui.dim(f"Default  {default_display}"),
+                ui.dim(f"Context  {context}  ·  Reasoning  {reasoning}"),
                 _menu_status_compact(),
             ]
         )
@@ -89,6 +94,7 @@ class _MenuSession:
             [
                 ("Start chat", "automatic settings" if default_model else "choose a model first"),
                 ("Models", "choose, add, or organize models"),
+                ("Settings", "context window and reasoning level"),
                 ("Tools", "system check, benchmark, and conversion"),
                 ("Exit", ""),
             ],
@@ -243,7 +249,6 @@ class _MenuSession:
         index = self._pick(
             [
                 ("Choose default model", "used when chat starts"),
-                ("Model settings", "context window and reasoning level"),
                 ("Installed models", "show local and provider models"),
                 ("Add a model", "local GGUF, Ollama, or Hugging Face"),
                 ("Find models online", "search the GGUF model market"),
@@ -255,14 +260,12 @@ class _MenuSession:
         if index == 0:
             self._select_model()
         elif index == 1:
-            self._model_settings()
-        elif index == 2:
             self._launch("models", "list", "--resolve")
-        elif index == 3:
+        elif index == 2:
             self._import_models()
-        elif index == 4:
+        elif index == 3:
             self._search_models()
-        elif index == 5:
+        elif index == 4:
             self._configure_models_dir()
 
     def _model_settings(self) -> None:

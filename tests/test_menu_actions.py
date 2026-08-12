@@ -85,7 +85,7 @@ def test_cmd_menu_requires_a_terminal(monkeypatch):
 
 
 def test_chat_action_builds_the_same_dispatch_vector_and_exit_returns(monkeypatch):
-    fake_ui = FakeUI(selections=[0, 3])
+    fake_ui = FakeUI(selections=[0, 4])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -97,7 +97,7 @@ def test_chat_action_builds_the_same_dispatch_vector_and_exit_returns(monkeypatc
 
 
 def test_submenu_back_is_a_noop_and_returns_to_main(monkeypatch):
-    fake_ui = FakeUI(selections=[1, 6, 3])
+    fake_ui = FakeUI(selections=[1, 5, 4])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -109,7 +109,7 @@ def test_submenu_back_is_a_noop_and_returns_to_main(monkeypatch):
 
 
 def test_cancelled_prompt_does_not_dispatch(monkeypatch):
-    fake_ui = FakeUI(selections=[1, 4, 3], answers=[KeyboardInterrupt()])
+    fake_ui = FakeUI(selections=[1, 3, 4], answers=[KeyboardInterrupt()])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -178,23 +178,48 @@ def test_model_label_hides_provider_and_long_path_noise(model, expected):
     assert menu._model_label(model) == expected
 
 
-def test_main_menu_has_four_clear_top_level_choices(monkeypatch):
+def test_main_menu_has_visible_settings_and_current_values(monkeypatch):
     fake_ui = FakeUI()
     captured = {}
 
     def select(options, **kwargs):
         captured["options"] = options
         captured["header"] = kwargs["header"]
-        return 3
+        return 4
 
     fake_ui.select = select
     monkeypatch.setattr(menu, "ui", fake_ui)
-    monkeypatch.setattr(menu, "load_config", lambda: _config("/models/qwen.gguf"))
+    monkeypatch.setattr(
+        menu,
+        "load_config",
+        lambda: _config("/models/qwen.gguf", context_size=8192, reasoning_level="high"),
+    )
     monkeypatch.setattr(menu, "_menu_status_compact", lambda: "hardware")
 
-    assert menu._MenuSession()._main_selection("1.6.0") == 3
-    assert [label for label, _description in captured["options"]] == ["Start chat", "Models", "Tools", "Exit"]
+    assert menu._MenuSession()._main_selection("1.6.0") == 4
+    assert [label for label, _description in captured["options"]] == [
+        "Start chat",
+        "Models",
+        "Settings",
+        "Tools",
+        "Exit",
+    ]
     assert "Default  qwen.gguf" in captured["header"]
+    assert "Context  8192  ·  Reasoning  high" in captured["header"]
+
+
+def test_top_level_settings_routes_to_settings_screen(monkeypatch):
+    fake_ui = FakeUI(selections=[2, 4])
+    routed = []
+    monkeypatch.setattr(menu, "ui", fake_ui)
+    monkeypatch.setattr(menu, "load_config", lambda: _config())
+    monkeypatch.setattr(menu, "_menu_status_compact", lambda: "status")
+    session = menu._MenuSession()
+    monkeypatch.setattr(session, "_model_settings", lambda: routed.append("settings"))
+
+    session.run()
+
+    assert routed == ["settings"]
 
 
 def test_model_options_include_configured_local_and_ollama_models(monkeypatch, tmp_path):
@@ -325,13 +350,12 @@ def test_submenu_dispatchers_route_models_tools_and_add_actions(monkeypatch):
     monkeypatch.setattr(session, "_convert_model", lambda: routed.append("convert"))
     monkeypatch.setattr(session, "_select_model", lambda: routed.append("default"))
     monkeypatch.setattr(session, "_configure_models_dir", lambda: routed.append("directory"))
-    monkeypatch.setattr(session, "_model_settings", lambda: routed.append("settings"))
     monkeypatch.setattr(session, "_use_local_model", lambda: routed.append("local"))
     monkeypatch.setattr(session, "_import_ollama", lambda: routed.append("ollama"))
     monkeypatch.setattr(session, "_pull_hugging_face", lambda: routed.append("huggingface"))
     monkeypatch.setattr(session, "_import_models", lambda: routed.append("add"))
 
-    for index in range(6):
+    for index in range(5):
         monkeypatch.setattr(session, "_pick", lambda _items, _title, index=index: index)
         session._models()
     monkeypatch.setattr(session, "_pick", lambda _items, _title: 0)
@@ -351,7 +375,6 @@ def test_submenu_dispatchers_route_models_tools_and_add_actions(monkeypatch):
     assert launches == [("models", "list", "--resolve"), ("doctor",), ("benchmark",)]
     assert routed == [
         "default",
-        "settings",
         "add",
         "search",
         "directory",
