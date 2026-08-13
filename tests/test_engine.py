@@ -229,6 +229,32 @@ def test_rebuild_dry_run_returns_planned(upstream):
     assert "llama-cli" in result["targets"]
 
 
+def test_parse_bench_speed_extracts_generation_rate():
+    import kestrel.engine as engine
+
+    sample = (
+        '[{"backend":"CPU","model":"m","n_prompt":16,"n_gen":32,"tg16":"12.34","tg32":"42.56 +- 0.90","pp16":"180.00"}]'
+    )
+    assert engine._parse_bench_speed(sample) == 42.56
+    assert engine._parse_bench_speed("no numbers here") is None
+
+
+def test_bench_engine_returns_none_when_binary_missing(tmp_path):
+    import kestrel.engine as engine
+
+    assert engine._bench_engine(str(tmp_path), "/models/model.gguf") is None
+
+
+def test_bench_delta_reports_regression():
+    import kestrel.engine as engine
+
+    delta = engine._bench_delta(100.0, 88.0, "/models/model.gguf")
+    assert delta["delta_pct"] == -12.0
+    assert delta["regressed"] is True
+    assert engine._bench_delta(88.0, 100.0, "/models/model.gguf")["regressed"] is False
+    assert engine._bench_delta(None, 100.0, "/models/model.gguf") is None
+
+
 def test_matches_too_old_signature():
     import kestrel.engine as engine
 

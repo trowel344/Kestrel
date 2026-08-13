@@ -363,6 +363,9 @@ class _GenStub:
         self.max_tokens = max_tokens
         return ["llama-cli", "-p", prompt]
 
+    def capabilities(self):
+        return SimpleNamespace(supports=lambda *_args: True)
+
     def generate(self, prompt, max_tokens):
         self.prompt = prompt
         self.max_tokens = max_tokens
@@ -398,7 +401,8 @@ def test_oneshot_run_plain_shows_output_on_stdout(capsys):
     assert rc == 0
     out = capsys.readouterr()
     assert out.out == "hello from kestrel\n"
-    assert out.err == ""
+    # A one-line completion summary goes to stderr; stdout stays clean.
+    assert "40.0 tok/s" in out.err
 
 
 def test_oneshot_run_generation_error_emits_error_json(capsys):
@@ -905,3 +909,56 @@ def test_dispatch_cloud_ollama_dry_run_json_keeps_stdout_machine_readable(capsys
         "engine": "ollama",
         "command": ["ollama", "run", "cloud-model"],
     }
+
+
+def test_with_session_flags_writes_cache_on_first_run(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    args = SimpleNamespace(json=False, model="m.gguf", prompt="hi", max_tokens=8, dry_run=False, session=None)
+    args.session = "work"
+
+    cmd = cli.runtime._with_session_flags(["llama-cli", "-m", "m.gguf"], "work", args.model, interactive=True)
+
+    cache = cli.runtime._session_cache_path("m.gguf", "work")
+    assert cache.parent.is_dir()
+    assert "--prompt-cache-ro" not in cmd
+    assert cmd[cmd.index("--prompt-cache") + 1] == str(cache)
+    assert "-f" not in cmd
+
+
+def test_with_session_flags_warm_starts_and_resumes_transcript(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    cache = cli.runtime._session_cache_path("m.gguf", "work")
+    transcript = cli.runtime._session_transcript_path("m.gguf", "work")
+    cache.parent.mkdir(parents=True)
+    cache.touch()
+    transcript.write_text("User: hi\nKestrel: hello\n")
+
+    cmd = cli.runtime._with_session_flags(["llama-cli"], "work", "m.gguf", interactive=True)
+
+    assert cmd[cmd.index("--prompt-cache-ro") + 1] == str(cache)
+    assert cmd[cmd.index("--prompt-cache") + 1] == str(cache)
+    assert cmd[cmd.index("-f") + 1] == str(transcript)
+
+
+def test_with_session_flags_skips_transcript_for_oneshot(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    transcript = cli.runtime._session_transcript_path("m.gguf", "work")
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("User: hi\nKestrel: hello\n")
+
+    cmd = cli.runtime._with_session_flags(["llama-cli"], "work", "m.gguf", interactive=False)
+
+    assert "-f" not in cmd
+    assert "--prompt-cache" in cmd
+
+
+def test_oneshot_run_with_session_persists_transcript(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    stub = _GenStub()
+    args = SimpleNamespace(json=False, model="m.gguf", prompt="hi", max_tokens=8, dry_run=False, session="work")
+
+    rc = cli.runtime._oneshot_run(stub, ["llama-cli"], args)
+
+    assert rc == 0
+    transcript = cli.runtime._session_transcript_path("m.gguf", "work")
+    assert transcript.read_text() == "User: hi\nKestrel: hello from kestrel\n"

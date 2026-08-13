@@ -562,3 +562,10 @@ def test_run_parser_uses_saved_settings_and_allows_one_launch_override(monkeypat
 
     assert (saved.ctx_size, saved.reasoning) == (8192, "high")
     assert (overridden.ctx_size, overridden.reasoning) == (4096, "off")
+
+
+def test_run_and_chat_accept_session_flag():
+    parsed = parser.build_parser().parse_args(["run", "model.gguf", "--session", "work"])
+    assert parsed.session == "work"
+    chat = parser.build_parser().parse_args(["chat", "--session", "work"])
+    assert chat.session == "work"

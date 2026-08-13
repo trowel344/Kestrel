@@ -459,6 +459,58 @@ def _smoke_test(directory: str) -> tuple[bool | None, str | None]:
     return None, None
 
 
+_BENCH_TPS_RE = re.compile(r'"tg\d+"\s*:\s*"([0-9]+(?:\.[0-9]+)?)')
+
+
+def _parse_bench_speed(text: str) -> float | None:
+    """Mean generation t/s from llama-bench ``--output json`` output.
+
+    Recent llama-bench emits a JSON array where each entry maps test sizes to
+    ``"tg128": "20.44 ± 0.29"`` strings. The maximum generation rate is the
+    headline number the guard compares across engine builds.
+    """
+    rates = [float(match) for match in _BENCH_TPS_RE.findall(text)]
+    return max(rates) if rates else None
+
+
+def _bench_engine(directory: str, model_path: str) -> float | None:
+    """Quick llama-bench decode rate (t/s) for the engine's llama-bench binary.
+
+    A tiny fixed workload keeps even a large model finishing in seconds.
+    Returns ``None`` when llama-bench is missing, the model cannot be loaded,
+    or the output cannot be parsed — the regression guard degrades gracefully
+    instead of blocking an update.
+    """
+    binary = Path(directory) / "build" / "bin" / "llama-bench"
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        return None
+    try:
+        result = subprocess.run(
+            [str(binary), "-m", model_path, "-p", "16", "-n", "32", "--output", "json"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_bench_speed((result.stdout or "") + (result.stderr or ""))
+
+
+def _bench_delta(before: float | None, after: float | None, model_path: str | None) -> dict | None:
+    """Compare pre-/post-update decode rates; ``None`` when either is missing."""
+    if not before or not after:
+        return None
+    return {
+        "model": model_path,
+        "before_tps": round(before, 2),
+        "after_tps": round(after, 2),
+        "delta_pct": round((after - before) / before * 100, 1),
+        "regressed": after < before * 0.95,
+    }
+
+
 def _raise_with_rollback(directory: str, targets: list[str], cause: str) -> None:
     """Roll back to the last-good snapshot (if any) and raise EngineError."""
     rb = _rollback(directory, targets)
@@ -573,11 +625,23 @@ def rebuild(directory: str, *, dry_run: bool = False, flags: list[str] | None = 
     }
 
 
-def update(directory: str, *, dry_run: bool = False, force: bool = False, remote: str | None = None) -> dict:
+def update(
+    directory: str,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    remote: str | None = None,
+    bench_model: str | None = None,
+) -> dict:
     """Fetch upstream, fast-forward to a newer revision, and rebuild.
 
     Refuses to destroy uncommitted work or a diverged history unless
     ``force=True`` (which then hard-resets the checkout to the remote).
+
+    When ``bench_model`` is a loadable GGUF, the old and rebuilt engines are
+    compared with a quick llama-bench run and the result dict carries a
+    ``bench`` sub-dict reporting the decode-rate delta (``None`` when the
+    benchmark is unavailable for either side).
     """
     manifest = load_manifest(directory)
     if manifest is None:
@@ -624,6 +688,8 @@ def update(directory: str, *, dry_run: bool = False, force: bool = False, remote
             "restored_from_previous": False,
         }
 
+    bench_before = _bench_engine(directory, bench_model) if bench_model else None
+
     reset = _git(
         directory,
         ["reset", "--hard", f"refs/remotes/kestrel-upstream/{branch}"],
@@ -660,7 +726,11 @@ def update(directory: str, *, dry_run: bool = False, force: bool = False, remote
     # came from (and can report that the tree is now ahead).
     updated_manifest.commit = manifest.commit or head
     save_manifest(directory, updated_manifest)
-    return rebuild(directory)
+    result = rebuild(directory)
+    if result.get("status") == "rebuilt":
+        bench_after = _bench_engine(directory, bench_model) if bench_model else None
+        result["bench"] = _bench_delta(bench_before, bench_after, bench_model)
+    return result
 
 
 def matches_too_old_signature(stderr: str) -> bool:

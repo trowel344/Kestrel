@@ -336,6 +336,12 @@ def build_parser():
     _add_local_run_options(run)
     chat = sub.add_parser("chat", help="Chat with the configured local model")
     _add_local_run_options(chat, model_optional=True)
+    for target in (run, chat):
+        target.add_argument(
+            "--session",
+            metavar="NAME",
+            help="resume a warm-start session: reuse a persisted KV cache (and saved transcript) for this model",
+        )
     serve = sub.add_parser(
         "serve",
         help="Serve a GGUF model through an OpenAI-compatible llama-server endpoint",
@@ -582,6 +588,10 @@ def build_parser():
     )
     es_update.add_argument("--dir", help="engine checkout (default: configured)")
     es_update.add_argument("--remote", help="override the tracked remote URL")
+    es_update.add_argument(
+        "--bench-model",
+        help="GGUF to A/B benchmark old vs rebuilt engine (default: configured model)",
+    )
     es_update.add_argument("--dry-run", action="store_true")
     es_update.add_argument(
         "--force",

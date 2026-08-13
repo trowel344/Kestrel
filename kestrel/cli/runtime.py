@@ -14,10 +14,11 @@ import sys
 import threading
 import time
 from contextlib import ExitStack
+from pathlib import Path
 from typing import TextIO
 from urllib.parse import urlsplit
 
-from .. import nodes
+from .. import nodes, ui
 from ..backends.llama_cpp import LlamaCppBackend
 from ..errors import BackendError, InputError
 from . import probes, state
@@ -537,6 +538,58 @@ def _print_failure(exc, *, json_output: bool) -> int:
     return getattr(exc, "exit_code", 1)
 
 
+def _session_root() -> Path:
+    """Directory for persisted per-model run sessions."""
+    base = os.environ.get("XDG_STATE_HOME")
+    return Path(base if base else os.path.join(Path.home(), ".local", "state")) / "kestrel" / "sessions"
+
+
+def _session_slug(model_key: str) -> str:
+    """Stable per-model session subdirectory from the user's model string."""
+    import re as _re
+
+    return _re.sub(r"[^A-Za-z0-9._-]+", "_", Path(model_key).stem or "model")
+
+
+def _session_cache_path(model_key: str, name: str) -> Path:
+    return _session_root() / _session_slug(model_key) / f"{name}.gguf.cache"
+
+
+def _session_transcript_path(model_key: str, name: str) -> Path:
+    return _session_root() / _session_slug(model_key) / f"{name}.txt"
+
+
+def _with_session_flags(cmd: list[str], name: str, model_key: str, *, interactive: bool) -> list[str]:
+    """Add llama-cli warm-start flags for a named session.
+
+    ``--prompt-cache`` writes the KV cache back on exit; ``--prompt-cache-ro``
+    (only when a cache already exists) warm-starts from the previous run. An
+    interactive resume also feeds the saved transcript with ``-f`` so the
+    conversation continues where it left off. All flags are appended at the
+    end, where llama-cli accepts them anywhere in the command line.
+    """
+    cache = _session_cache_path(model_key, name)
+    transcript = _session_transcript_path(model_key, name)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    if cache.exists():
+        cmd += ["--prompt-cache-ro", str(cache)]
+    cmd += ["--prompt-cache", str(cache)]
+    if interactive and transcript.exists():
+        cmd += ["-f", str(transcript)]
+    return cmd
+
+
+def _append_session_transcript(model_key: str, name: str, prompt: str, output: str) -> None:
+    """Persist one Q/A exchange so a later ``--session`` run can resume it."""
+    path = _session_transcript_path(model_key, name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"User: {prompt}\nKestrel: {output}\n")
+    except OSError:
+        pass
+
+
 def _oneshot_run(backend, cmd: list[str], args) -> int:
     """Run a one-shot generation and return its exit code.
 
@@ -545,6 +598,9 @@ def _oneshot_run(backend, cmd: list[str], args) -> int:
     only thing written to stdout.
     """
     oneshot = backend._build_cmd(args.prompt, int(args.max_tokens))
+    session_name = getattr(args, "session", None)
+    if session_name and backend.capabilities().supports("--prompt-cache"):
+        oneshot = _with_session_flags(oneshot, session_name, args.model, interactive=False)
     try:
         output = backend.generate(args.prompt, int(args.max_tokens))
     except (RuntimeError, FileNotFoundError) as exc:
@@ -559,8 +615,18 @@ def _oneshot_run(backend, cmd: list[str], args) -> int:
                 "nodes": _node_plan_payload(getattr(args, "_node_plan", None)),
             },
         )
+    if session_name:
+        _append_session_transcript(args.model, session_name, args.prompt, output)
     metrics = backend.last_metrics
     print(output, file=_human_stream(args))
+    if not getattr(args, "json", False) and metrics.output_tokens_per_second:
+        print(
+            ui.dim(
+                f"… {metrics.output_tokens_per_second:.1f} tok/s "
+                f"({metrics.output_tokens} tokens, {metrics.elapsed_seconds:.1f}s)"
+            ),
+            file=sys.stderr,
+        )
     return _finish_json(
         args,
         {

@@ -11,12 +11,13 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from .. import ui
 from ..errors import BackendError, InputError, ModelError, ServiceError
-from . import model_source, parser, planning, probes, runtime
+from . import model_source, parser, planning, probes, runtime, telemetry
 
 
 def _ollama_run_command(name: str, reasoning: str) -> list[str]:
@@ -251,6 +252,8 @@ def _cmd_run_live(args):
         run_env["LLAMA_MOE_COLD_GGUF"] = cold_model_path
     backend = runtime._configure_backend(model_info, config, args)
     cmd = backend._build_interactive_cmd()
+    if getattr(args, "session", None) and backend.capabilities().supports("--prompt-cache"):
+        cmd = runtime._with_session_flags(cmd, args.session, args.model, interactive=True)
     llama_cli_version = backend.capabilities().version
 
     _print_run_plan(
@@ -524,7 +527,23 @@ def _cmd_serve_live(args):
     result["status"] = "ready"
     result["ready_after_s"] = elapsed
     print(ui.green("Server is ready."), file=out)
-    returncode = _wait_server_process(proc)
+    stop_telemetry = threading.Event()
+    dashboard = None
+    if not getattr(args, "json", False):
+        dashboard = threading.Thread(
+            target=telemetry.live_dashboard,
+            args=(stop_telemetry,),
+            kwargs={"host": host, "port": port},
+            daemon=True,
+            name="kestrel-telemetry",
+        )
+        dashboard.start()
+    try:
+        returncode = _wait_server_process(proc)
+    finally:
+        if dashboard is not None:
+            stop_telemetry.set()
+            dashboard.join(timeout=1)
     if getattr(args, "json", False):
         result["exit_code"] = returncode
         return runtime._finish_json(args, result)

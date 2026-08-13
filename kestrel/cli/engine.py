@@ -30,6 +30,23 @@ def cmd_build(args):
         print(ui.kv("Engine", f"rebuilt {directory}", value_color=ui.green))
 
 
+def _default_bench_model() -> str | None:
+    """Resolve a loadable GGUF to benchmark against, or ``None``.
+
+    Prefers the configured default model; if it is not a local GGUF there is
+    no meaningful benchmark, so the regression guard simply skips.
+    """
+    default_model = getattr(state.USER_CONFIG, "default_model", None)
+    if not default_model:
+        return None
+    from . import model_source
+
+    info = model_source.detect_model(default_model)
+    if info and info.get("type") == "gguf" and info.get("path"):
+        return info["path"]
+    return None
+
+
 def _engine_dir(args) -> str:
     from ..backends.llama_cpp import default_llama_cpp_dir
 
@@ -88,11 +105,13 @@ def cmd_engine(args):
         return
 
     if command == "update":
+        bench_model = getattr(args, "bench_model", None) or _default_bench_model()
         result = engine.update(
             directory,
             dry_run=getattr(args, "dry_run", False),
             force=getattr(args, "force", False),
             remote=getattr(args, "remote", None),
+            bench_model=bench_model,
         )
     elif command == "rebuild":
         result = engine.rebuild(directory, dry_run=getattr(args, "dry_run", False))
