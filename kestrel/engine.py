@@ -250,12 +250,50 @@ def _resolve_target(directory: str, remote: str, branch: str | None) -> tuple[st
     return target_branch, probe.stdout.strip()
 
 
+def _git_state(directory: str) -> dict | None:
+    """Probe work-tree membership, branch, dirty set, and head in two spawns.
+
+    ``git status --porcelain --branch`` answers work-tree membership, the
+    branch name, and the dirty file set in a single spawn; ``rev-parse HEAD``
+    adds the current commit. Returns ``None`` when the directory is not a
+    git checkout, mirroring :func:`is_git`.
+    """
+    status = _git(directory, ["status", "--porcelain", "--branch"], check=False)
+    if status.returncode != 0:
+        return None
+    head = _git(directory, ["rev-parse", "HEAD"], check=False)
+    lines = status.stdout.splitlines()
+    header = lines[0] if lines else ""
+    branch = None
+    if header.startswith("## "):
+        branch = header[3:].split("...")[0]
+        if branch.startswith("No commits yet on "):
+            branch = branch[len("No commits yet on ") :]
+        elif branch == "HEAD (no branch)":
+            branch = None
+    ignored = {MANIFEST_NAME, PREVIOUS_DIR_NAME, PREVIOUS_JSON_NAME}
+    dirty = False
+    for line in lines[1:]:
+        path = line[3:].strip()
+        if path.split("/")[0] in ignored:
+            continue
+        dirty = True
+        break
+    return {
+        "git": True,
+        "head": head.stdout.strip() if head.returncode == 0 else None,
+        "branch": branch,
+        "dirty": dirty,
+    }
+
+
 def engine_status(directory: str, *, check_remote: bool = True) -> dict:
     """Report provenance, staleness, and build artifacts for an engine dir."""
     manifest = load_manifest(directory)
-    git_ok = is_git(directory)
-    head = git_head(directory) if git_ok else None
-    branch = git_branch(directory) if git_ok else None
+    state = _git_state(directory)
+    git_ok = bool(state)
+    head = state["head"] if state else None
+    branch = state["branch"] if state else None
     remote = manifest.remote if manifest else (git_remote(directory) if git_ok else None)
 
     behind = ahead = stale = None
@@ -292,7 +330,7 @@ def engine_status(directory: str, *, check_remote: bool = True) -> dict:
         "behind": behind,
         "ahead": ahead,
         "stale": stale,
-        "dirty": git_dirty(directory) if git_ok else True,
+        "dirty": state["dirty"] if state else True,
         "manifest": manifest.as_dict() if manifest else None,
         "artifacts": artifacts,
     }

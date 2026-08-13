@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ..util import ttl_cache
@@ -50,7 +51,7 @@ def detect_gpus() -> list[dict]:
             ],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=2,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []
@@ -132,6 +133,8 @@ def _warm_page_cache(paths: list[str]) -> None:
     A bounded pre-read (max 64 MiB from the start, which covers the GGUF
     header, metadata, and first tensors) plus a Linux ``WILLNEED`` hint for the
     rest. Bounded on purpose so a cold launch is never made meaningfully slower.
+    Split-GGUF shards are pre-read concurrently so the warm does not run
+    shard-by-shard.
     """
     if not paths:
         return
@@ -147,7 +150,8 @@ def _warm_page_cache(paths: list[str]) -> None:
                 pass
             finally:
                 os.close(fd)
-    for path in paths:
+
+    def pread(path: str) -> None:
         try:
             with open(path, "rb") as f:
                 remaining = 64 * 1024 * 1024
@@ -157,4 +161,7 @@ def _warm_page_cache(paths: list[str]) -> None:
                         break
                     remaining -= len(chunk)
         except OSError:
-            continue
+            return
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(paths)))) as pool:
+        list(pool.map(pread, paths))
