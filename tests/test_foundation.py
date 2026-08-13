@@ -97,6 +97,45 @@ def test_copy_file_preserves_executable_mode_and_replaces_symlink(tmp_path):
     assert unrelated.read_bytes() == b"keep"
 
 
+def test_clone_or_copy_preserves_content_and_mode(tmp_path):
+    from kestrel.util import clone_or_copy
+
+    source = tmp_path / "rpc-server"
+    source.write_bytes(b"blob-" * 2048)
+    source.chmod(0o750)
+
+    target = clone_or_copy(source, tmp_path / "snapshot" / "rpc-server")
+
+    assert target.read_bytes() == source.read_bytes()
+    assert target.stat().st_mode & 0o777 == 0o750
+
+
+def test_clone_or_copy_falls_back_to_byte_copy_when_reflink_unsupported(tmp_path, monkeypatch):
+    from kestrel import util
+
+    source = tmp_path / "llama-server"
+    source.write_bytes(b"fallback")
+    source.chmod(0o755)
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_bytes(b"keep")
+    target = tmp_path / "snap" / "llama-server"
+    target.parent.mkdir()
+    target.symlink_to(unrelated)
+
+    def no_reflink(src, dst):
+        raise OSError(95, "Operation not supported")
+
+    monkeypatch.setattr(util, "_reflink", no_reflink)
+    clone_or_copy = util.clone_or_copy
+
+    clone_or_copy(source, target)
+
+    assert target.read_bytes() == b"fallback"
+    assert not target.is_symlink()
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert unrelated.read_bytes() == b"keep"
+
+
 def test_available_disk_bytes_reports_number(tmp_path):
     from kestrel.util import available_disk_bytes
 

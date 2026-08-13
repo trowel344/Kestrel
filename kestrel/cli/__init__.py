@@ -13,6 +13,7 @@ import subprocess  # noqa: F401  (exposed as ``cli.subprocess`` for monkeypatchi
 
 from .. import __version__ as __version__  # noqa: F401
 from . import (  # module references (``cli.probes`` etc.) resolve here
+    agents,
     bench,
     convert,
     engine,
@@ -31,6 +32,7 @@ from . import (  # module references (``cli.probes`` etc.) resolve here
     updater,
 )
 from . import main as _main  # noqa: F401
+from .agents import cmd_agents
 from .bench import (
     _build_optimize_profile,
     _print_benchmark_summary,
@@ -126,6 +128,7 @@ from .updater import (
 )
 
 __all__ = [
+    "agents",
     "bench",
     "convert",
     "engine",
@@ -149,6 +152,7 @@ __all__ = [
     "_summarize_benchmark_rows",
     "cmd_benchmark",
     "cmd_optimize",
+    "cmd_agents",
     "cmd_audit",
     "cmd_convert",
     "_engine_dir",

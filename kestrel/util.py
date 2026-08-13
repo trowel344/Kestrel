@@ -114,6 +114,66 @@ def copy_file(src: str | Path, dst: str | Path) -> Path:
     return target
 
 
+def clone_or_copy(src: str | Path, dst: str | Path) -> Path:
+    """Copy ``src`` to ``dst`` via a copy-on-write reflink when possible.
+
+    ``copy_file`` re-writes every byte, which makes multi-GB engine binary
+    snapshots expensive.  Filesystems that support reflinks (btrfs/XFS via
+    FICLONE on Linux, APFS via clonefile on macOS) can instead share the
+    source's extents and only copy-on-write later, so a snapshot costs a
+    handful of syscalls regardless of file size.
+
+    Unlike a hard link, a reflink is safe for build artifacts: a later
+    in-place write to ``src`` (linkers truncate the output file in place)
+    copies on write and can never corrupt the snapshot.  The destination is
+    written to a same-directory temp file and atomically renamed into place,
+    mirroring ``copy_file``'s durability story.  Falls back to a byte copy
+    when the platform or filesystem cannot reflink.
+    """
+    source = Path(src)
+    target = Path(dst)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _reflink(source, target)
+    except OSError:
+        copy_file(source, target)
+    return target
+
+
+def _reflink(source: Path, target: Path) -> None:
+    """Clone ``source`` onto ``target`` as a copy-on-write reflink.
+
+    Raises :class:`OSError` when the platform or filesystem cannot reflink so
+    :func:`clone_or_copy` can fall back to a byte copy.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        os.close(fd)
+        os.unlink(tmp)
+        if hasattr(os, "clonefile"):  # macOS (APFS)
+            os.clonefile(source, tmp)
+        else:  # Linux: ioctl(FS_IOC_FICLONE)
+            _ficlone(source, tmp)
+        os.chmod(tmp, source.stat().st_mode & 0o7777)
+        os.replace(tmp, target)
+        sync_directory(target.parent)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _ficlone(source: Path, target: Path) -> None:
+    """Clone ``source``'s extents onto ``target`` using ``FS_IOC_FICLONE``."""
+    import fcntl
+
+    FICLONE = 0x40049409  # _IOW(0x94, 9, int), linux/fs.h
+    with source.open("rb") as src_handle, open(target, "wb") as dst_handle:
+        fcntl.ioctl(dst_handle.fileno(), FICLONE, src_handle.fileno())
+
+
 def available_disk_bytes(path: str | Path) -> int | None:
     """Free bytes on the filesystem holding ``path``, or ``None`` if unknown."""
     try:

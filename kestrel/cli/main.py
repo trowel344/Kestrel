@@ -11,6 +11,7 @@ import sys
 
 from ..errors import ConfigError, KestrelError
 from . import runtime, state
+from .agents import cmd_agents
 from .bench import cmd_benchmark, cmd_optimize
 from .convert import cmd_audit, cmd_convert
 from .engine import cmd_build, cmd_engine
@@ -37,6 +38,7 @@ _COMMAND_HANDLERS = {
     "optimize": cmd_optimize,
     "models": cmd_models,
     "nodes": cmd_nodes,
+    "agents": cmd_agents,
     "build": cmd_build,
     "engine": cmd_engine,
     "self-update": cmd_self_update,
@@ -64,7 +66,10 @@ def main() -> int:
 
 def _run_dispatched(parser, args) -> int:
     try:
-        if state.CONFIG_ERROR and not (args.command == "setup" and args.reset):
+        config_independent_agent_actions = {"token", "stop", "status", "doctor", "logs", "remove", "list"}
+        agent_action = getattr(args, "agents_action", None)
+        config_independent = args.command == "agents" and agent_action in config_independent_agent_actions
+        if state.CONFIG_ERROR and not config_independent and not (args.command == "setup" and args.reset):
             raise ConfigError(
                 state.CONFIG_ERROR,
                 hint="run `kestrel setup --reset` to repair it",

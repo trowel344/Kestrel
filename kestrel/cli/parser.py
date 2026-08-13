@@ -345,6 +345,11 @@ def build_parser():
     serve.add_argument("--port", type=_port, default=8080, help="listen port (default: 8080)")
     serve.add_argument("--alias", help="model alias reported by /v1/models")
     serve.add_argument(
+        "--api-key-file",
+        help="read API keys from a private file (required for non-loopback binds)",
+    )
+    serve.add_argument("--managed-token", help=argparse.SUPPRESS)
+    serve.add_argument(
         "--embeddings",
         action="store_true",
         help="enable the /v1/embeddings endpoint for RAG workloads (llama-server --embeddings)",
@@ -373,6 +378,64 @@ def build_parser():
     settings.add_argument("--context", type=planning._context_size_arg, help="auto or at least 512 tokens")
     settings.add_argument("--reasoning", choices=REASONING_LEVELS, help="auto, off, low, medium, high, or maximum")
     _add_json_flag(settings)
+
+    agents = sub.add_parser(
+        "agents",
+        help="Use Kestrel models from Pi, Claude Code, Codex, OpenCode, and other work tools",
+    )
+    agent_sub = agents.add_subparsers(dest="agents_action", required=True)
+    agent_list = agent_sub.add_parser("list", help="Detect supported coding agents and their Kestrel configuration")
+    _add_json_flag(agent_list)
+    agent_setup = agent_sub.add_parser("setup", help="Create reversible Kestrel-owned client configuration")
+    agent_setup.add_argument(
+        "client",
+        choices=("pi", "omp", "codex", "claude", "opencode", "all"),
+        nargs="?",
+        default="all",
+    )
+    agent_setup.add_argument("--alias", default="kestrel-local", help="model name exposed to the client")
+    agent_setup.add_argument("--port", type=_port, default=8080)
+    agent_setup.add_argument("--context", type=planning._context_size_arg)
+    agent_setup.add_argument("--reasoning", choices=REASONING_LEVELS)
+    agent_setup.add_argument("--max-tokens", type=_positive_int, default=8192)
+    agent_setup.add_argument("--dry-run", action="store_true")
+    _add_json_flag(agent_setup)
+    agent_remove = agent_sub.add_parser("remove", help="Remove only Kestrel-owned client configuration")
+    agent_remove.add_argument(
+        "client",
+        choices=("pi", "omp", "codex", "claude", "opencode", "all"),
+        nargs="?",
+        default="all",
+    )
+    _add_json_flag(agent_remove)
+    agent_start = agent_sub.add_parser("start", help="Start or reuse the private coding-agent model server")
+    agent_start.add_argument("model", nargs="?")
+    agent_start.add_argument("--alias", default="kestrel-local")
+    agent_start.add_argument("--port", type=_port, default=8080)
+    agent_start.add_argument("--context", type=planning._context_size_arg)
+    agent_start.add_argument("--reasoning", choices=REASONING_LEVELS)
+    agent_start.add_argument("--timeout", type=_positive_float, default=180.0)
+    _add_json_flag(agent_start)
+    agent_stop = agent_sub.add_parser("stop", help="Stop the managed coding-agent model server")
+    _add_json_flag(agent_stop)
+    agent_status = agent_sub.add_parser("status", help="Show server, protocol, and client configuration status")
+    _add_json_flag(agent_status)
+    agent_doctor = agent_sub.add_parser("doctor", help="Verify installed clients and live API compatibility")
+    _add_json_flag(agent_doctor)
+    agent_logs = agent_sub.add_parser("logs", help="Show recent managed-server logs")
+    agent_logs.add_argument("--lines", type=_positive_int, default=80)
+    _add_json_flag(agent_logs)
+    agent_launch = agent_sub.add_parser("launch", help="Start Kestrel if needed and launch a configured coding agent")
+    agent_launch.add_argument("client", choices=("pi", "omp", "codex", "claude", "opencode"))
+    agent_launch.add_argument("--model")
+    agent_launch.add_argument("--alias", default="kestrel-local")
+    agent_launch.add_argument("--port", type=_port, default=8080)
+    agent_launch.add_argument("--context", type=planning._context_size_arg)
+    agent_launch.add_argument("--reasoning", choices=REASONING_LEVELS)
+    agent_launch.add_argument("--dry-run", action="store_true")
+    _add_json_flag(agent_launch)
+    agent_token = agent_sub.add_parser("token", help=argparse.SUPPRESS)
+    agent_token.set_defaults(_agent_token=True)
 
     benchmark = sub.add_parser("benchmark", help="Measure prompt and decode rates reproducibly")
     benchmark.add_argument("model", nargs="?")

@@ -14,28 +14,47 @@ from pathlib import Path
 from ..core.planner import (
     HardwareProfile,
     estimate_parameters,
-    model_file_size,
     plan_runtime,
     predict_decode_tokens_per_second,
 )
+from ..model_store import model_total_size
 from . import model_source, probes
 
 
 def _plan_mode(model, requested: str) -> str:
-    """Resolve the adaptive placement target.
+    """Resolve the placement target.
 
-    ``auto`` adapts from free RAM to the model working set: ``speed`` when
-    there is real headroom, otherwise ``balanced``. The explicit targets are
-    honored verbatim and are never auto-selected, so an unstable faster
-    profile can't appear on its own.
+    ``auto`` resolves to ``balanced``. The explicit ``speed`` and ``quality``
+    profiles are never auto-selected: an experimental throughput bias must be
+    requested deliberately (see ``parser --target`` and ``plan_runtime``).
     """
     if requested in ("balanced", "quality", "speed"):
         return requested
-    size_mib = model.file_size_bytes / 1024**2 if model.file_size_bytes else 0
-    ram_mib = probes._available_ram_mib()
-    if ram_mib >= 4096 and ram_mib >= size_mib * 0.8:
-        return "speed"
     return "balanced"
+
+
+def _model_size_bytes(model_info: dict) -> int:
+    """Total on-disk model bytes, summing split-GGUF shards when applicable.
+
+    ``_select_context_size`` receives the raw ``model_info`` document (before
+    a :class:`ModelProfile` exists), so it re-derives the footprint here. A
+    split GGUF is several files; sizing from one shard undercounts the model.
+    """
+    path = model_info.get("path")
+    if not path:
+        return 0
+    candidate = Path(path)
+    if model_info.get("type") == "gguf":
+        if not candidate.is_file():
+            return 0
+        try:
+            return model_total_size(candidate)
+        except (OSError, ValueError):
+            return 0
+    try:
+        return sum(part.stat().st_size for part in candidate.glob("*.safetensors"))
+    except OSError:
+        return 0
 
 
 def _kv_cache_bytes_per_token(model_info: dict) -> float:
@@ -78,15 +97,22 @@ def _kv_cache_bytes_per_token(model_info: dict) -> float:
     return 2.0 * int(layers) * int(values_per_token) * 1.1
 
 
-def _select_context_size(model_info: dict, gpu_info: dict | None) -> tuple[int, str, bool]:
+def _select_context_size(
+    model_info: dict,
+    gpu_info: dict | None,
+    model_size: int | None = None,
+) -> tuple[int, str, bool]:
     """Choose a context tier that cannot push the host into an OOM crash.
 
     Returns ``(context, reason, overcommitted)``. ``overcommitted`` is True
     when the model file itself cannot fit alongside the launch overhead in
     free RAM + swap; in that case Kestrel picks the smallest context and the
     caller surfaces an explicit warning instead of silently paging the host.
+    ``model_size`` may be passed in when the caller already built a
+    :class:`ModelProfile`; otherwise it is derived from ``model_info``.
     """
-    model_size = model_file_size(model_info.get("path") or "")
+    if model_size is None:
+        model_size = _model_size_bytes(model_info)
     vram_free = (gpu_info or {}).get("vram_free_mb", 0) * 1024**2
     ram = probes._available_ram_mib() * 1024**2
     memory = probes._memory_snapshot()
@@ -199,7 +225,11 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
         requested_gpu_layers = args.gpu_layers
         context_size = args.ctx_size
         if context_size == "auto":
-            context_size, context_reason, overcommitted = _select_context_size(model_info, gpu_info)
+            context_size, context_reason, overcommitted = _select_context_size(
+                model_info,
+                gpu_info,
+                model_size=model.file_size_bytes,
+            )
         else:
             context_reason = "explicit user setting"
             overcommitted = False

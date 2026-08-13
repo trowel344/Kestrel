@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 
 import pytest
 
@@ -12,6 +14,7 @@ from kestrel.nodes import (
     RpcProbeResult,
     SshTunnel,
     SshTunnelError,
+    start_managed_tunnels,
 )
 
 HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -226,3 +229,68 @@ def test_managed_inventory_rejects_world_readable_existing_state(tmp_path):
     store = NodeStore(path)
     with pytest.raises(NodeSecurityError, match="readable"):
         store.save([_node(str(identity))])
+
+
+def test_start_managed_tunnels_runs_concurrently(tmp_path, monkeypatch):
+    """N managed tunnels must be established in parallel (max(T_i)), not
+    serially (sum(T_i)). A peak concurrency of N proves the parallel path."""
+    import kestrel.nodes as nodes_mod
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class FakeTunnel:
+        def __init__(self, node, *, timeout=10.0):
+            self.node = node
+            self.closed = False
+
+        def start(self):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.15)
+            with lock:
+                active -= 1
+            return self
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(nodes_mod, "SshTunnel", FakeTunnel)
+    identity = _identity(tmp_path)
+    items = [_node(str(identity), name=f"w{index}") for index in range(3)]
+    tunnels = start_managed_tunnels(items)
+    assert [tunnel.node.name for tunnel in tunnels] == ["w0", "w1", "w2"]
+    assert peak == 3
+
+
+def test_start_managed_tunnels_closes_started_tunnels_on_failure(tmp_path, monkeypatch):
+    """A failing tunnel must not leak the tunnels that already started."""
+    import kestrel.nodes as nodes_mod
+
+    started: list = []
+
+    class FailingTunnel:
+        def __init__(self, node, *, timeout=10.0):
+            self.node = node
+            self.closed = False
+
+        def start(self):
+            if self.node.name == "w0":
+                raise SshTunnelError("authentication rejected")
+            time.sleep(0.05)
+            started.append(self)
+            return self
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(nodes_mod, "SshTunnel", FailingTunnel)
+    identity = _identity(tmp_path)
+    items = [_node(str(identity), name=f"w{index}") for index in range(2)]
+    with pytest.raises(SshTunnelError, match="authentication rejected"):
+        start_managed_tunnels(items)
+    assert [tunnel.node.name for tunnel in started] == ["w1"]
+    assert started[0].closed is True

@@ -162,6 +162,79 @@ def test_select_context_oversized_model_is_overcommit(tmp_path, monkeypatch):
     assert ctx == 512
 
 
+def test_plan_mode_never_auto_selects_speed():
+    """auto resolves to balanced; speed/quality require an explicit request."""
+    assert cli._plan_mode(None, "auto") == "balanced"
+    assert cli._plan_mode(None, "balanced") == "balanced"
+    assert cli._plan_mode(None, "quality") == "quality"
+    assert cli._plan_mode(None, "speed") == "speed"
+
+
+def test_model_profile_sums_split_shard_siblings(tmp_path):
+    """A split GGUF's profile must size by all sibling shards, not one file."""
+    shard1 = write_gguf(tmp_path / "m-00001-of-00002.gguf", architecture="qwen35moe", n_layer=48)
+    shard2 = write_gguf(tmp_path / "m-00002-of-00002.gguf", architecture="qwen35moe", n_layer=48)
+    with open(shard1, "r+b") as f:
+        f.seek(3 * 1024**2 - 1)
+        f.write(b"\x00")
+    with open(shard2, "r+b") as f:
+        f.seek(2 * 1024**2 - 1)
+        f.write(b"\x00")
+    profile = cli._model_profile({"type": "gguf", "path": str(shard1)})
+    assert profile.file_size_bytes == 5 * 1024**2
+
+
+def test_select_context_split_model_sized_by_total_shards(tmp_path, monkeypatch):
+    """A split GGUF must be sized by the sum of its shards, matching the
+    equivalent single-file model instead of one under-sized shard."""
+    _no_swap(monkeypatch)
+    single = _sized_gguf(
+        tmp_path,
+        "whole.gguf",
+        4,
+        architecture="qwen35moe",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=128,
+    )
+    shard1 = _sized_gguf(
+        tmp_path,
+        "m-00001-of-00002.gguf",
+        2,
+        architecture="qwen35moe",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=128,
+    )
+    _sized_gguf(
+        tmp_path,
+        "m-00002-of-00002.gguf",
+        2,
+        architecture="qwen35moe",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=128,
+    )
+    ctx_single, _, _ = cli._select_context_size({"type": "gguf", "path": str(single)}, {"vram_free_mb": 6000})
+    ctx_split, _, _ = cli._select_context_size({"type": "gguf", "path": str(shard1)}, {"vram_free_mb": 6000})
+    assert ctx_split == ctx_single
+
+
 def test_configure_backend_maps_config_and_args(monkeypatch, tmp_path):
     model = write_gguf(tmp_path / "m.gguf", n_layer=48)
     monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
@@ -230,7 +303,8 @@ class _StubBackend:
 def test_build_server_cmd_passes_serve_args(monkeypatch, tmp_path):
     stub = _StubBackend()
     monkeypatch.setattr(cli.runtime, "_configure_backend", lambda *a, **k: stub)
-    args = SimpleNamespace(host="0.0.0.0", port=9000, alias="m", embeddings=True)
+    key_file = tmp_path / "api-key"
+    args = SimpleNamespace(host="0.0.0.0", port=9000, alias="m", embeddings=True, api_key_file=str(key_file))
     cmd = cli._build_server_cmd({}, {}, args)
     assert cmd == ["llama-server", "--sentinel"]
     assert stub.server_kwargs == {
@@ -238,6 +312,7 @@ def test_build_server_cmd_passes_serve_args(monkeypatch, tmp_path):
         "port": 9000,
         "alias": "m",
         "embeddings": True,
+        "api_key_file": str(key_file),
     }
 
 

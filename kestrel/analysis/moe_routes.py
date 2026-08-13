@@ -74,7 +74,9 @@ def _cache_simulate(
 
     LFU heap entries are ``(frequency, last_access, key)``; updates re-push the
     entry and stale copies are discarded lazily during eviction, matching the
-    runtime policy without an O(cache-size) scan on every miss.
+    runtime policy without an O(cache-size) scan on every miss. The heap is
+    rebuilt from live state once it balloons far past the live entry count, so
+    memory stays O(cache size) even when a large cache never evicts.
     """
     hits = 0
     accesses = 0
@@ -97,6 +99,7 @@ def _cache_simulate(
                     updated = (current[0] + 1, clock)
                     state[key] = updated
                     heapq.heappush(heap, (updated[0], updated[1], key))
+                    _compact_lfu_heap(heap, state, capacity)
                     continue
                 if capacity <= 0:
                     continue
@@ -108,6 +111,7 @@ def _cache_simulate(
                             break
                 state[key] = (1, clock)
                 heapq.heappush(heap, (1, clock, key))
+                _compact_lfu_heap(heap, state, capacity)
         return hits, accesses
 
     caches: dict = {group: OrderedDict() for group in capacities}
@@ -120,7 +124,6 @@ def _cache_simulate(
             key = cache_key(route, expert)
             if key in cache:
                 hits += 1
-                cache[key] += 1
                 cache.move_to_end(key)
                 continue
             if capacity <= 0:
@@ -129,6 +132,19 @@ def _cache_simulate(
                 cache.popitem(last=False)
             cache[key] = 1
     return hits, accesses
+
+
+def _compact_lfu_heap(heap: list, state: dict, capacity: int) -> None:
+    """Rebuild a stale LFU heap from live state once it grows far past it.
+
+    Hits and misses both push a fresh ``(frequency, last_access, key)`` entry
+    and stale copies are only popped during eviction. On a cache that rarely
+    evicts the heap would otherwise grow to one entry per access; rebuilding
+    from the live state keeps it bounded at a constant factor of the cache.
+    """
+    if capacity > 0 and len(heap) > max(1024, 8 * len(state) + 64):
+        heap[:] = [(frequency, last_access, key) for key, (frequency, last_access) in state.items()]
+        heapq.heapify(heap)
 
 
 def simulate(
@@ -147,8 +163,11 @@ def simulate(
 
 def simulate_partitioned(routes: list[Route], capacities: dict[tuple[int, str], int]) -> tuple[int, int]:
     tensors_by_pool: dict[tuple[int, str], list[int]] = defaultdict(list)
+    seen_tensors: dict[tuple[int, str], set[int]] = defaultdict(set)
     for route in routes:
-        if route.tensor not in tensors_by_pool[route.pool]:
+        seen = seen_tensors[route.pool]
+        if route.tensor not in seen:
+            seen.add(route.tensor)
             tensors_by_pool[route.pool].append(route.tensor)
     tensor_capacities: dict[tuple[tuple[int, str], int], int] = {}
     for pool, tensors in tensors_by_pool.items():
@@ -178,7 +197,12 @@ def analyze_temporal_reuse(routes: list[Route], windows: list[int]) -> list[dict
     for window in windows:
         if window <= 0:
             raise ValueError(f"temporal window must be positive, got {window}")
-        histories: dict[int, deque[set[int]]] = defaultdict(lambda window=window: deque(maxlen=window))
+        # Each tensor tracks how many of its last `window` routed sets contain
+        # each expert. Membership in that window is just a positive count, so
+        # every route costs O(experts) instead of O(window * experts): the
+        # union is never rebuilt per route.
+        histories: dict[int, deque[tuple[int, ...]]] = defaultdict(deque)
+        expert_counts: dict[int, dict[int, int]] = defaultdict(dict)
         tensor_bytes: dict[int, int] = {}
         resident_bytes = 0
         peak_bytes = 0
@@ -186,14 +210,22 @@ def analyze_temporal_reuse(routes: list[Route], windows: list[int]) -> list[dict
         accesses = 0
 
         for route in routes:
-            history = histories[route.tensor]
-            resident = set().union(*history) if history else set()
-            hits += sum(expert in resident for expert in route.experts)
+            counts = expert_counts[route.tensor]
+            hits += sum(expert in counts for expert in route.experts)
             accesses += len(route.experts)
 
             old_bytes = tensor_bytes.get(route.tensor, 0)
-            history.append(set(route.experts))
-            new_bytes = len(set().union(*history)) * route.expert_bytes
+            for expert in route.experts:
+                counts[expert] = counts.get(expert, 0) + 1
+            history = histories[route.tensor]
+            history.append(route.experts)
+            if len(history) > window:
+                for expert in history.popleft():
+                    if counts[expert] == 1:
+                        del counts[expert]
+                    else:
+                        counts[expert] -= 1
+            new_bytes = len(counts) * route.expert_bytes
             tensor_bytes[route.tensor] = new_bytes
             resident_bytes += new_bytes - old_bytes
             peak_bytes = max(peak_bytes, resident_bytes)

@@ -6,6 +6,7 @@ import re
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterator
@@ -190,6 +191,16 @@ def _capability_cache_write(binary: str, help_text: str, version: str) -> None:
         pass
 
 
+def _probe_capability(binary: str, flag: str) -> subprocess.CompletedProcess:
+    """Run one ``binary <flag>`` probe, mapping failures to :class:`BackendError`."""
+    try:
+        return subprocess.run([binary, flag], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired as exc:
+        raise BackendError(f"llama.cpp capability probe timed out: {binary}") from exc
+    except OSError as exc:
+        raise BackendError(f"could not probe llama.cpp binary {binary}: {exc}") from exc
+
+
 def _load_capabilities(binary: str, refresh: bool) -> LlamaCppCapabilities:
     """Probe ``binary``'s capabilities, using/populating the on-disk cache.
 
@@ -201,13 +212,16 @@ def _load_capabilities(binary: str, refresh: bool) -> LlamaCppCapabilities:
     if cached is not None:
         help_text, version = cached
     else:
+        # Both probes are read-only and independent, so run them concurrently:
+        # a cold cache then pays one 15s worst-case probe instead of two.
         try:
-            help_result = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=15)
-            version_result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=15)
-        except subprocess.TimeoutExpired as exc:
-            raise BackendError(f"llama.cpp capability probe timed out: {binary}") from exc
-        except OSError as exc:
-            raise BackendError(f"could not probe llama.cpp binary {binary}: {exc}") from exc
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="kestrel-cap") as pool:
+                help_future = pool.submit(_probe_capability, binary, "--help")
+                version_future = pool.submit(_probe_capability, binary, "--version")
+                help_result = help_future.result()
+                version_result = version_future.result()
+        except BackendError:
+            raise
         help_text = help_result.stdout + help_result.stderr
         version = (version_result.stdout or version_result.stderr).strip()
         if not help_text.strip():
@@ -431,6 +445,7 @@ class LlamaCppBackend:
         port: int = 8080,
         alias: str | None = None,
         embeddings: bool = False,
+        api_key_file: str | None = None,
     ) -> list[str]:
         caps = self.server_capabilities()
         cmd = [
@@ -444,6 +459,13 @@ class LlamaCppBackend:
         ]
         if alias:
             cmd += ["--alias", alias]
+        if api_key_file:
+            if not caps.supports("--api-key-file"):
+                raise BackendError(
+                    "selected llama-server does not support API key files",
+                    hint="run `kestrel build` to update the engine",
+                )
+            cmd += ["--api-key-file", api_key_file]
         cmd += self._common_engine_args(caps)
         if embeddings and caps.supports("--embeddings"):
             cmd.append("--embeddings")

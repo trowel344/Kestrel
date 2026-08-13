@@ -14,6 +14,10 @@
       <stop offset="0.58" stop-color="#18354b" stop-opacity="0.06"/>
       <stop offset="1" stop-color="#07131f" stop-opacity="0"/>
     </radialGradient>
+    <linearGradient id="k-face" gradientUnits="userSpaceOnUse" x1="0" y1="42" x2="0" y2="182">
+      <stop offset="0" stop-color="#ebe8df"/>
+      <stop offset="1" stop-color="#dedbd3"/>
+    </linearGradient>
 
     <!-- A literal 14 px grid keeps the mark crisp from favicon to banner. -->
     <g id="pixel-k">
@@ -35,8 +39,8 @@
   <rect width="224" height="224" rx="32" fill="url(#navy-depth)"/>
   <rect width="224" height="224" rx="32" fill="url(#navy-light)"/>
 
-  <!-- Two full underlays make the K read as a shallow, stacked pixel form. -->
-  <use href="#pixel-k" fill="#767a7b" transform="translate(8 9)"/>
-  <use href="#pixel-k" fill="#bbb8af" transform="translate(4 5)"/>
-  <use href="#pixel-k" fill="#e8e5dc"/>
+  <!-- Even diagonal offsets keep the shallow extrusion crisp on the pixel grid. -->
+  <use href="#pixel-k" fill="#70787b" transform="translate(7 7)"/>
+  <use href="#pixel-k" fill="#aaa9a3" transform="translate(3 3)"/>
+  <use href="#pixel-k" fill="url(#k-face)"/>
 </svg>

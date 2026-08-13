@@ -105,6 +105,12 @@ class ServiceError(KestrelError):
     code = "service_error"
 
 
+class IntegrationError(KestrelError):
+    """A coding-agent integration could not be configured or verified."""
+
+    code = "integration_error"
+
+
 __all__ = [
     "KestrelError",
     "ConfigError",
@@ -117,4 +123,5 @@ __all__ = [
     "BackendError",
     "EngineError",
     "ServiceError",
+    "IntegrationError",
 ]

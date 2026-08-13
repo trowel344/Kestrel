@@ -194,6 +194,32 @@ def test_rebuild_writes_artifacts(upstream, monkeypatch):
     assert manifest.built_at
 
 
+def test_snapshot_and_rollback_round_trip(upstream):
+    import kestrel.engine as engine
+
+    engine.adopt(str(upstream["engine"]))
+    build_bin = upstream["engine"] / "build" / "bin"
+    build_bin.mkdir(parents=True, exist_ok=True)
+    (build_bin / "llama-cli").write_bytes(b"old-good")
+    (build_bin / "llama-cli").chmod(0o755)
+
+    snap = engine._snapshot_previous(
+        str(upstream["engine"]), ["llama-cli", "rpc-server"], commit="a" * 40, last_good="b" * 40
+    )
+    assert snap is not None
+    assert "llama-cli" in snap["artifacts"]
+    assert snap["artifacts"]["llama-cli"]["size"] == len(b"old-good")
+
+    prev = upstream["engine"] / ".kestrel-engine.previous" / "llama-cli"
+    assert prev.read_bytes() == b"old-good"
+    assert prev.stat().st_mode & 0o777 == 0o755
+
+    (build_bin / "llama-cli").write_bytes(b"broken-build")
+    restored = engine._rollback(str(upstream["engine"]), ["llama-cli"])
+    assert restored["restored"] is True
+    assert (build_bin / "llama-cli").read_bytes() == b"old-good"
+
+
 def test_rebuild_dry_run_returns_planned(upstream):
     import kestrel.engine as engine
 

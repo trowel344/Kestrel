@@ -43,14 +43,15 @@ def _with_tunnels(entries, timeout: float):
     """Yield inventory entries with managed endpoints replaced by forwards."""
 
     stack = ExitStack()
-    replacements = []
+    to_start = [item for item in entries if item.managed and item.enabled]
     try:
-        for item in entries:
-            if item.managed and item.enabled:
-                tunnel = stack.enter_context(nodes.SshTunnel(item, timeout=timeout))
-                replacements.append(replace(item, endpoint=tunnel.endpoint))
-            else:
-                replacements.append(item)
+        started = nodes.start_managed_tunnels(to_start, timeout=timeout) if to_start else []
+        by_name = {item.name: tunnel for item, tunnel in zip(to_start, started, strict=True)}
+        replacements = [
+            replace(item, endpoint=by_name[item.name].endpoint) if item.name in by_name else item for item in entries
+        ]
+        for tunnel in by_name.values():
+            stack.callback(tunnel.close)
         yield tuple(replacements)
     finally:
         stack.close()

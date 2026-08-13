@@ -127,6 +127,39 @@ def test_capabilities_no_spec_type_key():
     assert not caps.supports("--cpu-moe")
 
 
+def test_capability_probe_spawns_help_and_version_concurrently(monkeypatch):
+    import subprocess
+    import threading
+    import time as _time
+
+    import kestrel.backends.llama_cpp as llama_cpp
+
+    active = 0
+    peak = 0
+    lock = threading.Lock()
+
+    def fake_run(command, **kwargs):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            _time.sleep(0.05)
+            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(llama_cpp, "_capability_cache_read", lambda *a, **k: None)
+    monkeypatch.setattr(llama_cpp, "_capability_cache_write", lambda *a, **k: None)
+    monkeypatch.setattr(llama_cpp.subprocess, "run", fake_run)
+
+    caps = _load_capabilities("/fake/llama-cli", refresh=True)
+    assert caps.help_text == "ok"
+    assert caps.version == "ok"
+    assert peak == 2
+
+
 def test_capability_probe_spawn_failure_is_typed(monkeypatch):
     monkeypatch.setattr(
         "kestrel.backends.llama_cpp.subprocess.run",

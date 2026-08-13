@@ -94,6 +94,10 @@ def cyan(text: str) -> str:
     return color(36, str(text))
 
 
+def ok_mark() -> str:
+    return pass_mark()
+
+
 def pass_mark() -> str:
     return green("✓") if USE_UTF8 else green("OK")
 
@@ -202,9 +206,9 @@ def hr(title: str | None = None) -> str:
     return h * max(4, terminal)
 
 
-def kv(label: str, value: str, *, value_color=None) -> str:
+def kv(label: str, value, *, value_color=None) -> str:
     display = (value_color or (lambda text: text))(value)
-    flattened = " ".join(display.splitlines())
+    flattened = " ".join(str(display).splitlines())
     return f"  {cyan(label + ':') if USE_ANSI else label + ':'} {flattened}"
 
 

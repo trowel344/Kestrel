@@ -187,13 +187,20 @@ def _resolve_node_plan(args) -> dict:
     active_tunnels: dict[str, nodes.SshTunnel] = {}
     managed_names: set[str] = set()
     try:
-        for item in inventory:
-            if item.name not in selected_names or not item.managed or not item.enabled:
-                continue
-            tunnel = stack.enter_context(nodes.SshTunnel(item))
-            endpoint_overrides[item.name] = tunnel.endpoint
-            active_tunnels[item.name] = tunnel
-            managed_names.add(item.name)
+        # Managed forwards start concurrently so N nodes cost max(T_i) instead
+        # of sum(T_i); each SshTunnel is self-contained in its own thread.
+        to_start = [
+            item
+            for item in inventory
+            if item.name in selected_names and item.managed and item.enabled
+        ]
+        if to_start:
+            started = nodes.start_managed_tunnels(to_start)
+            for item, tunnel in zip(to_start, started, strict=True):
+                stack.callback(tunnel.close)
+                endpoint_overrides[item.name] = tunnel.endpoint
+                active_tunnels[item.name] = tunnel
+                managed_names.add(item.name)
         args._ssh_tunnel_stack = stack
     except BaseException:
         stack.close()
@@ -635,4 +642,5 @@ def _build_server_cmd(model_info: dict, config: dict, args=None) -> list[str]:
         port=getattr(args, "port", 8080),
         alias=getattr(args, "alias", None),
         embeddings=bool(args and args.embeddings),
+        api_key_file=getattr(args, "api_key_file", None),
     )

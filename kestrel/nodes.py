@@ -19,6 +19,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from numbers import Real
 from pathlib import Path
@@ -897,6 +898,50 @@ class SshTunnel:
         self.close()
 
 
+def start_managed_tunnels(
+    selected: list[Node],
+    *,
+    timeout: float = 10.0,
+) -> list[SshTunnel]:
+    """Start one SSH tunnel per node concurrently.
+
+    Each tunnel handshake plus readiness probe can take up to ``timeout``
+    seconds, so a sequential loop costs ``sum(T_i)`` wall time. Starting the
+    tunnels in parallel brings that down to ``max(T_i)``. Every tunnel's state
+    is confined to its own worker thread (its subprocess, port, known-hosts
+    file, and readiness loop), so no shared mutable state is touched.
+
+    Tunnels are returned in the input order. Callers own cleanup: register
+    each on an :class:`ExitStack` (``stack.callback(tunnel.close)``) or call
+    ``close()`` directly. If any tunnel fails to start, every tunnel that did
+    start is closed before the first failure (in input order) is re-raised.
+    """
+    if not selected:
+        return []
+    tunnels: list[SshTunnel | None] = [None] * len(selected)
+    failures: dict[int, BaseException] = {}
+
+    def _start(index: int, node: Node) -> None:
+        tunnels[index] = SshTunnel(node, timeout=timeout).start()
+
+    with ThreadPoolExecutor(max_workers=min(16, len(selected))) as pool:
+        futures = {pool.submit(_start, index, node): index for index, node in enumerate(selected)}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                future.result()
+            except BaseException as exc:
+                failures[index] = exc
+
+    if failures:
+        for tunnel in tunnels:
+            if tunnel is not None:
+                tunnel.close()
+        first = min(failures)
+        raise failures[first].with_traceback(failures[first].__traceback__)
+    return [tunnel for tunnel in tunnels if tunnel is not None]
+
+
 def probe_reachability(
     node_or_endpoint: Node | Endpoint | str,
     *,
@@ -1281,8 +1326,24 @@ def resolve_node_plan(
         if override:
             _check_endpoint_security(runtime_item.parsed_endpoint, allow_insecure_direct_rpc=allow_insecure_rpc)
         runtime_nodes.append(runtime_item)
-        result = probe_rpc(runtime_item, timeout=timeout, allow_insecure_direct_rpc=allow_insecure_rpc)
-        results[item.name] = result
+
+    # Probe every enabled node concurrently. Each probe is a bounded ggml-rpc
+    # session on its own socket, so N nodes cost max(T_i) instead of sum(T_i)
+    # of serial handshake+device round-trips. Results are reordered back to the
+    # selected order so failure reporting and placement stay deterministic.
+    if runtime_nodes:
+        completed: dict[str, RpcProbeResult] = {}
+        with ThreadPoolExecutor(max_workers=min(16, len(runtime_nodes))) as pool:
+            futures = {
+                pool.submit(probe_rpc, item, timeout=timeout, allow_insecure_direct_rpc=allow_insecure_rpc): item.name
+                for item in runtime_nodes
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                completed[name] = future.result()
+        results = {item.name: completed[item.name] for item in runtime_nodes}
+    for item in runtime_nodes:
+        result = results[item.name]
         if not result.usable:
             if result.error:
                 detail = result.error

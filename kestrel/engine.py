@@ -153,14 +153,19 @@ def _git(
 def _rev_counts(directory: str, *, head: str, remote_head: str) -> tuple[int, int] | None:
     """Return ``(behind, ahead)`` commit counts; ``None`` when git can't answer.
 
-    Both ``engine_status`` and ``update`` compute the same ``git rev-list
-    --count`` pair to decide staleness; one helper keeps the two in lock-step.
+    Both ``engine_status`` and ``update`` compute the same counts to decide
+    staleness; one helper keeps the two in lock-step. A single ``git rev-list
+    --left-right --count`` spawn answers both sides at once.
     """
-    behind = _git(directory, ["rev-list", "--count", f"{head}..{remote_head}"], check=False)
-    ahead = _git(directory, ["rev-list", "--count", f"{remote_head}..{head}"], check=False)
-    if behind.returncode != 0 or ahead.returncode != 0:
+    counts = _git(
+        directory,
+        ["rev-list", "--left-right", "--count", f"{head}...{remote_head}"],
+        check=False,
+    )
+    if counts.returncode != 0:
         return None
-    return int(behind.stdout.strip() or 0), int(ahead.stdout.strip() or 0)
+    ahead, _, behind = counts.stdout.partition("\t")
+    return int(behind.strip() or 0), int(ahead.strip() or 0)
 
 
 def _binary_stat(binary: Path) -> dict[str, bool | int | float | None]:
@@ -355,7 +360,7 @@ def _snapshot_previous(directory: str, targets: list[str], *, commit: str | None
         info = _binary_stat(build_bin / name)
         if not info["exists"]:
             continue
-        util.copy_file(build_bin / name, prev / name)
+        util.clone_or_copy(build_bin / name, prev / name)
         snap["artifacts"][name] = {"size": info["size"], "mtime": info["mtime"]}
         wrote = True
     if not wrote:
@@ -378,7 +383,7 @@ def _rollback(directory: str, targets: list[str]) -> dict:
         src = prev / name
         if src.is_file():
             try:
-                util.copy_file(src, build_bin / name)
+                util.clone_or_copy(src, build_bin / name)
                 result["restored"] = True
             except OSError:
                 pass

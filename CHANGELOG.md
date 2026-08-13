@@ -13,6 +13,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Coding-agent work mode**: a top-level interactive UI and `kestrel agents`
+  commands configure, launch, inspect, and stop Pi, Oh My Pi, Codex, Claude
+  Code, and OpenCode against one reusable local model server. Client profiles
+  are reversible and Kestrel-owned; live route probes distinguish Chat
+  Completions, Responses, and Anthropic Messages compatibility.
+- The managed work server is loopback-only and API-key authenticated, with
+  private credential/state files, stale-PID ownership checks, bounded startup,
+  logs, and deterministic stop/reap behavior.
+
 - **Experimental trusted RPC nodes**: strict atomic named-node inventory,
   loopback/SSH-tunnel secure default, live ggml-rpc HELLO/device/memory
   preflight, pinned engine-commit matching, and deterministic local-plus-remote
@@ -52,6 +61,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bodies and error details are bounded before decoding.
 
 ### Security
+
+- `kestrel serve` now requires a private API-key file for non-loopback binds.
+  Coding-agent profiles use command/environment-backed credentials rather than
+  embedding the managed server token.
 
 - Direct non-loopback llama.cpp RPC is rejected unless the user supplies the
   explicit `--allow-insecure-rpc` acknowledgement. Documentation states that

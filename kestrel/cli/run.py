@@ -341,8 +341,55 @@ def _wait_server_process(proc) -> int:
         return 130
 
 
+def _wait_server_ready(proc, host: str, port: int, *, timeout: float) -> bool:
+    """Poll readiness while also failing immediately when llama-server exits."""
+
+    deadline = time.perf_counter() + timeout
+    while proc.poll() is None:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return False
+        if runtime._wait_ready(host, port, timeout=min(0.5, remaining), interval=0.1):
+            return True
+    return False
+
+
 def _cmd_serve_live(args):
     """Serve the planned model over an OpenAI-compatible llama-server endpoint."""
+    api_key_file = getattr(args, "api_key_file", None)
+    if args.host not in {"127.0.0.1", "::1", "localhost"} and not api_key_file:
+        raise InputError(
+            "non-loopback serving requires --api-key-file",
+            hint="keep the default 127.0.0.1 bind or provide a private API-key file and TLS-capable reverse proxy",
+        )
+    if api_key_file:
+        key_path = Path(api_key_file).expanduser()
+        if key_path.is_symlink() or not key_path.is_file():
+            raise InputError("--api-key-file must be a regular, non-symlink file")
+        try:
+            key_mode = key_path.stat().st_mode
+        except OSError as exc:
+            raise InputError(f"could not inspect --api-key-file: {exc}") from exc
+        if key_mode & 0o077:
+            raise InputError("--api-key-file must not be readable or writable by group/other", hint="run chmod 600")
+        try:
+            if key_path.stat().st_size > 64 * 1024:
+                raise InputError("--api-key-file is larger than the 64 KiB safety limit")
+            key_lines = key_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise InputError(f"could not read --api-key-file: {exc}") from exc
+        usable_keys = [line for line in key_lines if line and not line.startswith("#")]
+        if not usable_keys:
+            raise InputError("--api-key-file contains no usable API key")
+        if any(
+            line != line.strip()
+            or len(line) < 16
+            or len(line) > 512
+            or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in line)
+            for line in usable_keys
+        ):
+            raise InputError("--api-key-file keys must be 16-512 non-whitespace characters with no surrounding space")
+        args.api_key_file = str(key_path.resolve())
     if not args.model:
         args.model = parser._default_model(
             args,
@@ -406,7 +453,7 @@ def _cmd_serve_live(args):
                         else []
                     ),
                     "",
-                    "OpenAI-compatible endpoints: /v1/chat/completions, /v1/completions, /v1/models",
+                    "Agent endpoints: /v1/chat/completions, /v1/responses, /v1/messages, /v1/models",
                     "Press Ctrl+C to stop the server.",
                 ]
             ),
@@ -447,7 +494,7 @@ def _cmd_serve_live(args):
     )
     started = time.perf_counter()
     try:
-        ready = runtime._wait_ready(host, port, timeout=timeout)
+        ready = _wait_server_ready(proc, host, port, timeout=timeout)
     except KeyboardInterrupt:
         _stop_server_process(proc)
         if getattr(args, "json", False):
@@ -460,8 +507,14 @@ def _cmd_serve_live(args):
     elapsed = round(time.perf_counter() - started, 3)
     if not ready:
         _stop_server_process(proc)
+        exited = proc.poll()
+        summary = (
+            f"llama-server exited with status {exited} before becoming ready"
+            if exited is not None
+            else f"llama-server did not become ready on http://{host}:{port}/health within {timeout:.0f}s"
+        )
         raise ServiceError(
-            f"llama-server did not become ready on http://{host}:{port}/health within {timeout:.0f}s.",
+            summary + ".",
             hint=(
                 "check the llama-server output above for load errors "
                 "(CUDA OOM, missing GGUF, or an incompatible quant) and "

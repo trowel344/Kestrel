@@ -66,6 +66,7 @@ class _MenuSession:
 
         actions = (
             self._chat,
+            self._work,
             self._models,
             self._model_settings,
             self._tools,
@@ -93,6 +94,7 @@ class _MenuSession:
         return ui.select(
             [
                 ("Start chat", "automatic settings" if default_model else "choose a model first"),
+                ("Work with coding agents", "Pi, Oh My Pi, Codex, Claude Code, and OpenCode"),
                 ("Models", "choose, add, or organize models"),
                 ("Settings", "context window and reasoning level"),
                 ("Tools", "system check, benchmark, and conversion"),
@@ -197,6 +199,39 @@ class _MenuSession:
             self._import_models()
             return
         self._launch("chat", default_model)
+
+    def _work(self) -> None:
+        config = load_config()
+        if not config.default_model:
+            print(f"  {ui.info_mark()} Choose a model before launching a coding agent.")
+            self._import_models()
+            return
+        index = self._pick(
+            [
+                ("Launch Pi", "local coding agent with shell, read, edit, and write tools"),
+                ("Launch Oh My Pi", "enhanced Pi workflow using the Kestrel model"),
+                ("Launch Codex", "Responses API profile with Kestrel-owned settings"),
+                ("Launch Claude Code", "experimental Anthropic-compatible local endpoint"),
+                ("Launch OpenCode", "OpenAI-compatible local provider"),
+                ("Set up all integrations", "create private, reversible client profiles"),
+                ("Integration status", "server, API routes, and installed clients"),
+                ("Stop work server", "release model memory when work is finished"),
+                ("View server logs", "inspect model load or API failures"),
+                _BACK,
+            ],
+            "Work with coding agents",
+        )
+        launch_clients = ("pi", "omp", "codex", "claude", "opencode")
+        if index < len(launch_clients):
+            self._launch("agents", "launch", launch_clients[index])
+        elif index == 5:
+            self._launch("agents", "setup", "all")
+        elif index == 6:
+            self._launch("agents", "status")
+        elif index == 7:
+            self._launch("agents", "stop")
+        elif index == 8:
+            self._launch("agents", "logs")
 
     def _select_model(self) -> None:
         model = self._pick_model("Select a model")

@@ -85,7 +85,7 @@ def test_cmd_menu_requires_a_terminal(monkeypatch):
 
 
 def test_chat_action_builds_the_same_dispatch_vector_and_exit_returns(monkeypatch):
-    fake_ui = FakeUI(selections=[0, 4])
+    fake_ui = FakeUI(selections=[0, 5])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -97,7 +97,7 @@ def test_chat_action_builds_the_same_dispatch_vector_and_exit_returns(monkeypatc
 
 
 def test_submenu_back_is_a_noop_and_returns_to_main(monkeypatch):
-    fake_ui = FakeUI(selections=[1, 5, 4])
+    fake_ui = FakeUI(selections=[2, 5, 5])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -109,7 +109,7 @@ def test_submenu_back_is_a_noop_and_returns_to_main(monkeypatch):
 
 
 def test_cancelled_prompt_does_not_dispatch(monkeypatch):
-    fake_ui = FakeUI(selections=[1, 3, 4], answers=[KeyboardInterrupt()])
+    fake_ui = FakeUI(selections=[2, 3, 5], answers=[KeyboardInterrupt()])
     launches = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -185,7 +185,7 @@ def test_main_menu_has_visible_settings_and_current_values(monkeypatch):
     def select(options, **kwargs):
         captured["options"] = options
         captured["header"] = kwargs["header"]
-        return 4
+        return 5
 
     fake_ui.select = select
     monkeypatch.setattr(menu, "ui", fake_ui)
@@ -196,9 +196,10 @@ def test_main_menu_has_visible_settings_and_current_values(monkeypatch):
     )
     monkeypatch.setattr(menu, "_menu_status_compact", lambda: "hardware")
 
-    assert menu._MenuSession()._main_selection("1.6.0") == 4
+    assert menu._MenuSession()._main_selection("1.6.0") == 5
     assert [label for label, _description in captured["options"]] == [
         "Start chat",
+        "Work with coding agents",
         "Models",
         "Settings",
         "Tools",
@@ -209,7 +210,7 @@ def test_main_menu_has_visible_settings_and_current_values(monkeypatch):
 
 
 def test_top_level_settings_routes_to_settings_screen(monkeypatch):
-    fake_ui = FakeUI(selections=[2, 4])
+    fake_ui = FakeUI(selections=[3, 5])
     routed = []
     monkeypatch.setattr(menu, "ui", fake_ui)
     monkeypatch.setattr(menu, "load_config", lambda: _config())
@@ -220,6 +221,18 @@ def test_top_level_settings_routes_to_settings_screen(monkeypatch):
     session.run()
 
     assert routed == ["settings"]
+
+
+def test_work_menu_launches_pi_through_agents_command(monkeypatch):
+    fake_ui = FakeUI(selections=[1, 0, 5])
+    launches = []
+    monkeypatch.setattr(menu, "ui", fake_ui)
+    monkeypatch.setattr(menu, "load_config", lambda: _config())
+    monkeypatch.setattr(menu, "_menu_status_compact", lambda: "status")
+
+    menu._MenuSession(launch=lambda *args: launches.append(args)).run()
+
+    assert launches == [("agents", "launch", "pi")]
 
 
 def test_model_options_include_configured_local_and_ollama_models(monkeypatch, tmp_path):

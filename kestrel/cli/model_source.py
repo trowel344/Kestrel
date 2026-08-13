@@ -12,9 +12,8 @@ import sys
 from pathlib import Path
 
 from .. import ui
-from ..core.planner import model_file_size
 from ..errors import MissingModelError, ModelError
-from ..model_store import hf_snapshot_dir
+from ..model_store import hf_snapshot_dir, model_total_size
 from . import state
 
 
@@ -137,7 +136,7 @@ def _model_profile(model_info: dict):
             hidden_size=cfg["hidden"],
             expert_ff_size=cfg["n_ff"],
             has_mtp=cfg["mtp_layers"] > 0,
-            file_size_bytes=model_file_size(model_info["path"]),
+            file_size_bytes=_gguf_total_size(model_info["path"]),
         )
 
     from ..gguf.converter import NVFP4Converter
@@ -153,6 +152,23 @@ def _model_profile(model_info: dict):
         has_mtp=converter.mtp_layers > 0,
         file_size_bytes=_safetensors_size(converter),
     )
+
+
+def _gguf_total_size(path: str) -> int:
+    """Total on-disk bytes for a GGUF, summing sibling shards of a split set.
+
+    A split GGUF lives in several ``{prefix}-NNNNN-of-MMMMM`` files; sizing
+    from a single shard undercounts a multi-file model and would silently
+    disable CPU-MoE or pick an oversized context for a model that cannot fit.
+    Degrades to 0 (as the old single-file probe did) when the path is gone.
+    """
+    candidate = Path(path)
+    if not candidate.is_file():
+        return 0
+    try:
+        return model_total_size(candidate)
+    except (OSError, ValueError):
+        return 0
 
 
 def _safetensors_size(converter) -> int:

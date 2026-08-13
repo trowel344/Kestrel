@@ -85,6 +85,43 @@ they do not authenticate a malicious peer or attest the remote binary. A lost
 node fails the llama.cpp run—Kestrel does not silently move the workload back
 to local execution.
 
+## Coding-agent integrations
+
+`kestrel agents` runs a dedicated llama-server on `127.0.0.1` and enables
+llama.cpp API-key authentication with a random credential stored in a
+current-user 0600 file. Generated Pi, Oh My Pi, Codex, Claude Code, and
+OpenCode profiles refer to a command or environment variable that supplies
+the key; Kestrel does not embed the credential in their configuration.
+Managed process state is also private and includes an ownership token checked
+against `/proc` before Kestrel signals a process. A stale or foreign PID fails
+closed.
+
+Authentication protects inference routes from unrelated local clients that do
+not have the key. Upstream llama-server deliberately leaves health, model
+metadata, and UI assets public; Kestrel therefore keeps the whole listener on
+loopback. Authentication does not sandbox the coding agent. The launched agent
+can read, edit, execute, and sometimes access the network with the permissions
+of your user account, subject to that client's own approval and sandbox
+settings. Use version control, keep approval prompts enabled for risky work,
+and do not treat a local model as trusted merely because it runs on-device.
+
+Kestrel-owned Codex, Claude Code, and OpenCode files are separate overlays
+that do not rewrite global defaults, and are removed only when their ownership
+digest still matches. The clients may still layer their global approval,
+sandbox, and tool settings around those overlays.
+Pi and Oh My Pi both use mutable provider inventories, so Kestrel modifies
+only the `providers.kestrel` entry in each format and uses a sidecar digest to
+prevent overwriting or removing a pre-existing or user-modified entry.
+
+Direct `kestrel serve` remains loopback-first. A non-loopback bind is rejected
+without a private API-key file. An API key is not transport encryption: put a
+TLS reverse proxy in front of any intentionally remote HTTP endpoint, or use
+an authenticated SSH tunnel.
+
+Managed coding-agent start/stop currently requires Linux because ownership is
+verified through `/proc/<pid>/cmdline`; other platforms fail before spawning a
+managed process. Direct `kestrel serve` remains available there.
+
 ## Supported versions
 
 Security fixes are applied to the latest release on the `main` branch.
