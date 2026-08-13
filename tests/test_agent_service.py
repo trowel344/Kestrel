@@ -40,6 +40,7 @@ def test_credential_rejects_broad_permissions(isolated_agent_dirs):
     ["", "# comment only\n", "first\nsecond\n", " leading-space\n", "valid-key-value-\x7f\n", "valid-key-value-é\n"],
 )
 def test_invalid_credential_is_rejected_before_spawn(isolated_agent_dirs, monkeypatch, value):
+    monkeypatch.setattr(agent_service.sys, "platform", "linux")
     path = agent_service.credential_path()
     path.parent.mkdir(parents=True)
     path.write_text(value, encoding="utf-8")
@@ -68,6 +69,7 @@ def test_managed_server_fails_before_spawn_off_linux(isolated_agent_dirs, monkey
 
 
 def test_start_builds_authenticated_loopback_owned_process(isolated_agent_dirs, monkeypatch):
+    monkeypatch.setattr(agent_service.sys, "platform", "linux")
     captured = {}
 
     class FakeProcess:
@@ -111,6 +113,7 @@ def test_start_builds_authenticated_loopback_owned_process(isolated_agent_dirs, 
 
 
 def test_stop_refuses_stale_pid_without_signaling(isolated_agent_dirs, monkeypatch):
+    monkeypatch.setattr(agent_service.sys, "platform", "linux")
     state = {
         "schema": 1,
         "pid": 1234,

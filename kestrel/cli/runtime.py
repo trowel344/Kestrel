@@ -189,11 +189,7 @@ def _resolve_node_plan(args) -> dict:
     try:
         # Managed forwards start concurrently so N nodes cost max(T_i) instead
         # of sum(T_i); each SshTunnel is self-contained in its own thread.
-        to_start = [
-            item
-            for item in inventory
-            if item.name in selected_names and item.managed and item.enabled
-        ]
+        to_start = [item for item in inventory if item.name in selected_names and item.managed and item.enabled]
         if to_start:
             started = nodes.start_managed_tunnels(to_start)
             for item, tunnel in zip(to_start, started, strict=True):
