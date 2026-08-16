@@ -3,6 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 
+import pytest
+
+pytest.importorskip("sunmap")
+
 from sunmap import TaskCheckpoint
 
 from kestrel.agent_supervisor import extract_tool_calls, protected_paths, reduce_request, required_commands
