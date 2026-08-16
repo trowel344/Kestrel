@@ -560,9 +560,7 @@ def test_turbo_kv_emitted_when_enabled_and_supported(tmp_path):
 
 
 def test_turbo_kv_omitted_when_disabled_or_unsupported(tmp_path):
-    supported = _backend_with_engine_bins(
-        LlamaCppCapabilities(help_text="--turbo-kv\n" + _ENGINE_HELP), tmp_path
-    )
+    supported = _backend_with_engine_bins(LlamaCppCapabilities(help_text="--turbo-kv\n" + _ENGINE_HELP), tmp_path)
     assert "--turbo-kv" not in supported._common_engine_args(supported.capabilities())
     unsupported = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
     unsupported.turbo_kv = True

@@ -136,7 +136,9 @@ def test_benchmark_local_builds_exact_command_and_report(monkeypatch, tmp_path):
     monkeypatch.setattr(bench.parser, "_default_model", lambda args, error: str(model))
     monkeypatch.setattr(bench.model_source, "detect_model", lambda value: {"type": "gguf", "path": str(model)})
     monkeypatch.setattr(bench, "resolve_llama_binary", lambda name, dirs=None: "/fake/llama-bench")
-    monkeypatch.setattr(bench, "_load_capabilities", lambda binary, refresh=False: SimpleNamespace(supports=lambda flag: False))
+    monkeypatch.setattr(
+        bench, "_load_capabilities", lambda binary, refresh=False: SimpleNamespace(supports=lambda flag: False)
+    )
     monkeypatch.setattr(bench.probes, "detect_gpu", lambda: None)
     monkeypatch.setattr(
         bench.planning,
@@ -180,12 +182,21 @@ def test_benchmark_emits_threads_batch_when_llama_bench_supports_it(monkeypatch,
     monkeypatch.setattr(bench.parser, "_default_model", lambda args, error: str(model))
     monkeypatch.setattr(bench.model_source, "detect_model", lambda value: {"type": "gguf", "path": str(model)})
     monkeypatch.setattr(bench, "resolve_llama_binary", lambda name, dirs=None: "/fake/llama-bench")
-    monkeypatch.setattr(bench, "_load_capabilities", lambda binary, refresh=False: SimpleNamespace(supports=lambda flag: True))
+    monkeypatch.setattr(
+        bench, "_load_capabilities", lambda binary, refresh=False: SimpleNamespace(supports=lambda flag: True)
+    )
     monkeypatch.setattr(bench.probes, "detect_gpu", lambda: None)
     monkeypatch.setattr(
         bench.planning,
         "estimate_config",
-        lambda info, gpu, args: {"gpu_layers": "33", "cpu_moe": True, "n_layers": 48, "threads": 4, "threads_batch": 16, "model_size_gib": 3.5},
+        lambda info, gpu, args: {
+            "gpu_layers": "33",
+            "cpu_moe": True,
+            "n_layers": 48,
+            "threads": 4,
+            "threads_batch": 16,
+            "model_size_gib": 3.5,
+        },
     )
 
     def fake_popen(command, **kwargs):

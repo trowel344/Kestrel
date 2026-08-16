@@ -98,16 +98,11 @@ def test_kv_cache_bytes_uses_only_full_attention_layers(tmp_path):
     count and KV dim, not n_layer."""
     from gguf_fixture import write_gguf  # noqa: PLC0415
 
-    tensors = [
-        (f"blk.{lay}.attn_q.weight", (2688, 4096))
-        for lay in (5, 12, 19, 26, 33, 42, 52)
-    ] + [
-        (f"blk.{lay}.attn_k.weight", (2688, 256))
-        for lay in (5, 12, 19, 26, 33, 42, 52)
-    ] + [
-        (f"blk.{lay}.ssm_in.weight", (2688, 1536))
-        for lay in (7, 8, 9)
-    ]
+    tensors = (
+        [(f"blk.{lay}.attn_q.weight", (2688, 4096)) for lay in (5, 12, 19, 26, 33, 42, 52)]
+        + [(f"blk.{lay}.attn_k.weight", (2688, 256)) for lay in (5, 12, 19, 26, 33, 42, 52)]
+        + [(f"blk.{lay}.ssm_in.weight", (2688, 1536)) for lay in (7, 8, 9)]
+    )
     p = write_gguf(
         tmp_path / "hybrid.gguf",
         architecture="nemotron_h_moe",

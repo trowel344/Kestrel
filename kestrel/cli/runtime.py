@@ -332,8 +332,7 @@ def _configure_backend(model_info: dict, config: dict, args=None) -> LlamaCppBac
         fit_target_mib=(args.fit_target if args and args.fit_target else config["fit_target_mib"]),
         cache_type_k=cache_type_k,
         cache_type_v=cache_type_v,
-        turbo_kv=(getattr(args, "turbo_kv", None) if args else None)
-        or config.get("kv_cache_turbo", False),
+        turbo_kv=(getattr(args, "turbo_kv", None) if args else None) or config.get("kv_cache_turbo", False),
         use_mmap=not (args and args.no_mmap),
         use_mlock=bool(args and args.mlock),
         direct_io=bool(args and args.direct_io),

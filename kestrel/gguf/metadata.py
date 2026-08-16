@@ -246,6 +246,7 @@ def _read_planner_metadata_unwrapped(path: Path) -> dict:
                 f"unreasonable GGUF metadata count {kv_count} (>10M)",
                 hint="a corrupt header claimed an implausible number of KVs",
             )
+
         def consume(key: str, value_type: int) -> None:
             value = _value(handle, endian, value_type)
             if key == "general.architecture":

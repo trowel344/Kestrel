@@ -212,9 +212,7 @@ def test_agents_start_passes_split_overrides(monkeypatch, capsys):
 
     rc = _run_dispatched(
         parser,
-        parser.parse_args(
-            ["agents", "start", "model.gguf", "--gpu-layers", "24", "--cpu-moe", "on", "--json"]
-        ),
+        parser.parse_args(["agents", "start", "model.gguf", "--gpu-layers", "24", "--cpu-moe", "on", "--json"]),
     )
 
     assert rc == 0

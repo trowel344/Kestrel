@@ -163,9 +163,7 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
         plan_lines.append(ui.kv("MoE Q1 cold sidecar", cold_model_path))
     planned_threads = args.threads if args.threads is not None else config["threads"] or "llama.cpp default"
     planned_batch_threads = (
-        args.threads_batch
-        if getattr(args, "threads_batch", None) is not None
-        else (config.get("threads_batch") or 0)
+        args.threads_batch if getattr(args, "threads_batch", None) is not None else (config.get("threads_batch") or 0)
     )
     plan_lines.extend(
         [

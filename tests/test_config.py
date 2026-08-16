@@ -38,19 +38,19 @@ def test_config_placement_and_kv_defaults_roundtrip(tmp_path):
     )
     loaded = load_config(path)
     assert loaded == KestrelConfig(kv_cache_type="q4_0", gpu_layers="24", cpu_moe="on", kv_cache_turbo=True)
-    assert "kv_cache_type = \"q4_0\"" in path.read_text()
-    assert "gpu_layers = \"24\"" in path.read_text()
-    assert "cpu_moe = \"on\"" in path.read_text()
+    assert 'kv_cache_type = "q4_0"' in path.read_text()
+    assert 'gpu_layers = "24"' in path.read_text()
+    assert 'cpu_moe = "on"' in path.read_text()
 
 
 def test_config_rejects_invalid_new_fields(tmp_path):
     from kestrel.errors import ConfigError
 
     cases = {
-        "kv_cache_type = \"q2_0\"": "kv_cache_type",
-        "gpu_layers = \"banana\"": "gpu_layers",
+        'kv_cache_type = "q2_0"': "kv_cache_type",
+        'gpu_layers = "banana"': "gpu_layers",
         "gpu_layers = -4": "gpu_layers",
-        "cpu_moe = \"sometimes\"": "cpu_moe",
+        'cpu_moe = "sometimes"': "cpu_moe",
     }
     for line, _match in cases.items():
         path = tmp_path / f"bad-{line.split()[0]}.toml"
@@ -70,7 +70,7 @@ def test_config_auto_placement_defaults_omit_lines(tmp_path):
 
 def test_config_toml_integer_gpu_layers_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
-    path.write_text('[local]\ngpu_layers = 24\n')
+    path.write_text("[local]\ngpu_layers = 24\n")
     assert load_config(path).gpu_layers == "24"
 
 

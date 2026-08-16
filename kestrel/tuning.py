@@ -20,7 +20,9 @@ TUNED_PROFILE_REASON = "exact measured model/hardware profile"
 # Placement is weight/thread-bound and survives a larger request context; only
 # the KV cache grows beyond the measured size, which the caller bounds by
 # shrinking the prefill micro-batch and warning about memory pressure.
-LARGER_CONTEXT_REASON = "placement applied at a larger context than the tuned size (KV cache grows beyond the measured footprint)"
+LARGER_CONTEXT_REASON = (
+    "placement applied at a larger context than the tuned size (KV cache grows beyond the measured footprint)"
+)
 TUNABLE_PLAN_FIELDS = (
     "gpu_layers",
     "cpu_moe",
