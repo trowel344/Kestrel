@@ -19,6 +19,7 @@ from ..backends.llama_cpp import LlamaCppBackend, default_llama_cpp_dir
 from ..config import REASONING_BUDGETS, KestrelConfig, config_path, load_config, save_config
 from ..errors import ModelError
 from ..model_store import default_models_dir
+from ..tuning import profile_path_for
 from ..util import available_disk_bytes
 from . import model_source, probes, state
 
@@ -405,7 +406,15 @@ def cmd_status(args):
 
     configured = load_config()
     gpu = probes.detect_gpu()
-    profile_path = config_path().with_name("hardware-profile.json")
+    model = configured.default_model
+    legacy_profile_path = config_path().with_name("hardware-profile.json")
+    profile_path = legacy_profile_path
+    if model:
+        resolved = model_source.detect_model(model)
+        if resolved and resolved.get("type") == "gguf" and resolved.get("path"):
+            exact_profile_path = profile_path_for(resolved, gpu)
+            if exact_profile_path.is_file():
+                profile_path = exact_profile_path
     profile = None
     profile_error = None
     if profile_path.is_file():
@@ -413,7 +422,6 @@ def cmd_status(args):
             profile = json.loads(profile_path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
             profile_error = str(exc)
-    model = configured.default_model
     engine = "ollama" if model and model.startswith("ollama://") else "llama.cpp"
     profile_model_data = (profile.get("model") or {}) if profile else {}
     profile_model = profile_model_data.get("source") or profile_model_data.get("path")
@@ -432,6 +440,7 @@ def cmd_status(args):
         "profile_matches_model": profile_matches_model,
         "plan": profile.get("plan") if profile else None,
         "benchmark": profile.get("benchmark") if profile else None,
+        "tuning": profile.get("tuning") if profile else None,
         "profile_error": profile_error,
     }
     if args.json:
@@ -542,6 +551,10 @@ def cmd_setup(args):
         if getattr(args, "context", None) is not None
         else current.context_size,
         reasoning_level=getattr(args, "reasoning", None) or current.reasoning_level,
+        kv_cache_type=current.kv_cache_type,
+        kv_cache_turbo=current.kv_cache_turbo,
+        gpu_layers=current.gpu_layers,
+        cpu_moe=current.cpu_moe,
     )
     target = save_config(configured)
     state.reload_state()
@@ -575,6 +588,10 @@ def cmd_settings(args):
         llama_cpp_dir=current.llama_cpp_dir,
         context_size=args.context if args.context is not None else current.context_size,
         reasoning_level=args.reasoning or current.reasoning_level,
+        kv_cache_type=args.kv_cache_type or current.kv_cache_type,
+        kv_cache_turbo=current.kv_cache_turbo if args.turbo_kv is None else args.turbo_kv,
+        gpu_layers=args.gpu_layers or current.gpu_layers,
+        cpu_moe=args.cpu_moe or current.cpu_moe,
     )
     changed = configured != current
     target = config_path()
@@ -584,6 +601,10 @@ def cmd_settings(args):
     payload = {
         "context_size": configured.context_size,
         "reasoning_level": configured.reasoning_level,
+        "kv_cache_type": configured.kv_cache_type,
+        "kv_cache_turbo": configured.kv_cache_turbo,
+        "gpu_layers": configured.gpu_layers,
+        "cpu_moe": configured.cpu_moe,
         "reasoning_budgets": REASONING_BUDGETS,
         "changed": changed,
         "file": str(target),
@@ -598,9 +619,13 @@ def cmd_settings(args):
                 [
                     ui.kv("Context", str(configured.context_size), value_color=ui.cyan),
                     ui.kv("Reasoning", configured.reasoning_level, value_color=ui.cyan),
+                    ui.kv("KV cache", configured.kv_cache_type, value_color=ui.cyan),
+                    ui.kv("Turbo KV", "on" if configured.kv_cache_turbo else "off", value_color=ui.cyan),
+                    ui.kv("GPU layers", configured.gpu_layers, value_color=ui.cyan),
+                    ui.kv("CPU MoE", configured.cpu_moe, value_color=ui.cyan),
                     ui.kv("File", str(target)),
                     "",
-                    ui.dim("CLI overrides: --ctx-size and --reasoning"),
+                    ui.dim("CLI overrides: --ctx-size, --reasoning, --kv-cache-type, --gpu-layers, --cpu-moe"),
                 ]
             ),
         )
@@ -617,6 +642,10 @@ def _save_default_model(model: str | Path) -> None:
             llama_cpp_dir=current.llama_cpp_dir,
             context_size=current.context_size,
             reasoning_level=current.reasoning_level,
+            kv_cache_type=current.kv_cache_type,
+            kv_cache_turbo=current.kv_cache_turbo,
+            gpu_layers=current.gpu_layers,
+            cpu_moe=current.cpu_moe,
         )
     )
     state.reload_state()

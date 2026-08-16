@@ -414,9 +414,9 @@ def _backend_with_engine_bins(caps, tmp_path, server_caps=None):
 
 _ENGINE_HELP = (
     "--fit\n--fit-target\n--mlock\n--tensor-split\n--mmap\n--no-mmap\n"
-    "--cpu-moe\n--moe-cache\n--cache-type-k\n--cache-type-v\n--flash-attn\n"
+    "--cpu-moe\n--n-cpu-moe\n--moe-cache\n--cache-type-k\n--cache-type-v\n--flash-attn\n"
     "--threads\n--threads-batch\n--spec-type none,draft-mtp\n--spec-draft-n-max\n"
-    "--direct-io\n--embeddings\n--reasoning-budget\n"
+    "--direct-io\n--embeddings\n--reasoning-budget\n--parallel\n"
 )
 
 
@@ -429,7 +429,7 @@ def test_build_server_cmd_emits_fit_and_engine_flags(tmp_path):
     backend.use_mmap = True
     backend.reasoning_level = "high"
     backend.extra_args = ["--temp", "0.4"]
-    cmd = backend.build_server_cmd(host="0.0.0.0", port=9000, alias="m", embeddings=True)
+    cmd = backend.build_server_cmd(host="0.0.0.0", port=9000, alias="m", embeddings=True, parallel=1)
     for flag in (
         "--fit",
         "on",
@@ -439,6 +439,8 @@ def test_build_server_cmd_emits_fit_and_engine_flags(tmp_path):
         "--tensor-split",
         "25,75",
         "--embeddings",
+        "--parallel",
+        "1",
         "--host",
         "0.0.0.0",
         "--port",
@@ -449,6 +451,16 @@ def test_build_server_cmd_emits_fit_and_engine_flags(tmp_path):
         "0.4",
     ):
         assert flag in cmd
+
+
+def test_partial_cpu_moe_overrides_all_cpu_moe_flag(tmp_path):
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    backend.cpu_moe = True
+    backend.n_cpu_moe_layers = 42
+    cmd = backend.build_server_cmd()
+    assert "--n-cpu-moe" in cmd
+    assert cmd[cmd.index("--n-cpu-moe") + 1] == "42"
+    assert "--cpu-moe" not in cmd
 
 
 def test_build_server_cmd_embeddings_capability_gated(tmp_path):
@@ -494,3 +506,81 @@ def test_build_server_cmd_uses_server_binary_and_address(tmp_path):
     assert cmd[1:3] == ["-m", backend.model_path]
     assert "--host" in cmd and "0.0.0.0" in cmd
     assert "--port" in cmd and "9999" in cmd
+
+
+def test_server_cmd_emits_cache_reuse_when_enabled_and_supported(tmp_path):
+    caps = LlamaCppCapabilities(help_text="--cache-reuse\n" + _ENGINE_HELP)
+    backend = _backend_with_engine_bins(caps, tmp_path)
+    backend.cache_reuse = 256
+    cmd = backend.build_server_cmd()
+    assert "--cache-reuse" in cmd
+    assert cmd[cmd.index("--cache-reuse") + 1] == "256"
+
+
+def test_server_cmd_omits_cache_reuse_when_disabled(tmp_path):
+    caps = LlamaCppCapabilities(help_text="--cache-reuse\n" + _ENGINE_HELP)
+    backend = _backend_with_engine_bins(caps, tmp_path)
+    backend.cache_reuse = 0
+    cmd = backend.build_server_cmd()
+    assert "--cache-reuse" not in cmd
+
+
+def test_server_cmd_omits_cache_reuse_when_engine_unsupported(tmp_path):
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    backend.cache_reuse = 256
+    cmd = backend.build_server_cmd()
+    assert "--cache-reuse" not in cmd
+
+
+def test_server_cmd_emits_ctx_checkpoints_when_enabled_and_supported(tmp_path):
+    caps = LlamaCppCapabilities(help_text="--ctx-checkpoints\n" + _ENGINE_HELP)
+    backend = _backend_with_engine_bins(caps, tmp_path)
+    backend.ctx_checkpoints = 64
+    cmd = backend.build_server_cmd()
+    assert "--ctx-checkpoints" in cmd
+    assert cmd[cmd.index("--ctx-checkpoints") + 1] == "64"
+
+
+def test_server_cmd_omits_ctx_checkpoints_when_disabled_or_unsupported(tmp_path):
+    supported = _backend_with_engine_bins(
+        LlamaCppCapabilities(help_text="--ctx-checkpoints\n" + _ENGINE_HELP), tmp_path
+    )
+    supported.ctx_checkpoints = 0
+    assert "--ctx-checkpoints" not in supported.build_server_cmd()
+    unsupported = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    unsupported.ctx_checkpoints = 64
+    assert "--ctx-checkpoints" not in unsupported.build_server_cmd()
+
+
+def test_turbo_kv_emitted_when_enabled_and_supported(tmp_path):
+    caps = LlamaCppCapabilities(help_text="--turbo-kv\n" + _ENGINE_HELP)
+    backend = _backend_with_engine_bins(caps, tmp_path)
+    backend.turbo_kv = True
+    assert "--turbo-kv" in backend._common_engine_args(caps)
+
+
+def test_turbo_kv_omitted_when_disabled_or_unsupported(tmp_path):
+    supported = _backend_with_engine_bins(
+        LlamaCppCapabilities(help_text="--turbo-kv\n" + _ENGINE_HELP), tmp_path
+    )
+    assert "--turbo-kv" not in supported._common_engine_args(supported.capabilities())
+    unsupported = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    unsupported.turbo_kv = True
+    assert "--turbo-kv" not in unsupported._common_engine_args(unsupported.capabilities())
+
+
+def test_threads_batch_emitted_as_dedicated_value(tmp_path):
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    backend.n_threads = 8
+    backend.threads_batch = 16
+    cmd = backend._base_cmd()
+    assert cmd[cmd.index("--threads") + 1] == "8"
+    assert cmd[cmd.index("--threads-batch") + 1] == "16"
+
+
+def test_threads_batch_defaults_to_decode_threads(tmp_path):
+    backend = _backend_with_engine_bins(LlamaCppCapabilities(help_text=_ENGINE_HELP), tmp_path)
+    backend.n_threads = 8
+    backend.threads_batch = None
+    cmd = backend._base_cmd()
+    assert cmd[cmd.index("--threads-batch") + 1] == "8"

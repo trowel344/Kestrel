@@ -96,7 +96,7 @@ class _MenuSession:
                 ("Start chat", "automatic settings" if default_model else "choose a model first"),
                 ("Work with coding agents", "Pi, Oh My Pi, Codex, Claude Code, and OpenCode"),
                 ("Models", "choose, add, or organize models"),
-                ("Settings", "context window and reasoning level"),
+                ("Settings", "context, reasoning, KV cache, and GPU placement"),
                 ("Tools", "system check, benchmark, and conversion"),
                 ("Exit", ""),
             ],
@@ -307,10 +307,18 @@ class _MenuSession:
         config = load_config()
         context = str(getattr(config, "context_size", "auto"))
         reasoning = str(getattr(config, "reasoning_level", "auto"))
+        kv_cache_type = str(getattr(config, "kv_cache_type", "auto"))
+        turbo = "on" if getattr(config, "kv_cache_turbo", False) else "off"
+        gpu_layers = str(getattr(config, "gpu_layers", "auto"))
+        cpu_moe = str(getattr(config, "cpu_moe", "auto"))
         index = self._pick(
             [
                 ("Context window", f"currently {context}"),
                 ("Reasoning level", f"currently {reasoning}"),
+                ("KV cache type", f"currently {kv_cache_type}"),
+                ("Turbo KV", f"currently {turbo}"),
+                ("GPU layers", f"currently {gpu_layers}"),
+                ("CPU MoE", f"currently {cpu_moe}"),
                 _BACK,
             ],
             "Model settings",
@@ -319,6 +327,14 @@ class _MenuSession:
             self._configure_context()
         elif index == 1:
             self._configure_reasoning()
+        elif index == 2:
+            self._configure_kv_cache_type()
+        elif index == 3:
+            self._configure_turbo_kv()
+        elif index == 4:
+            self._configure_gpu_layers()
+        elif index == 5:
+            self._configure_cpu_moe()
 
     def _configure_context(self) -> None:
         options = [
@@ -354,6 +370,65 @@ class _MenuSession:
         values = ("auto", "off", "low", "medium", "high", "maximum")
         if index < len(values):
             self._launch("settings", "--reasoning", values[index])
+
+    def _configure_kv_cache_type(self) -> None:
+        types = [
+            ("Automatic", "use the engine's default KV cache type"),
+            ("FP16", "full precision"),
+            ("BF16", "bfloat16 precision"),
+            ("Q8_0", "8-bit quantized"),
+            ("Q4_0", "4-bit quantized, halves KV use (lossless on hybrid models)"),
+            ("Q4_1", "4-bit with residual"),
+            _BACK,
+        ]
+        index = self._pick(types, "KV cache type")
+        values = ("auto", "f16", "bf16", "q8_0", "q4_0", "q4_1")
+        if index < len(values):
+            self._launch("settings", "--kv-cache-type", values[index])
+
+    def _configure_turbo_kv(self) -> None:
+        options = [
+            ("Off", "standard KV cache (recommended until engines ship --turbo-kv)"),
+            ("On", "opt-in TurboQuant KV compression, only if the engine build supports it"),
+            _BACK,
+        ]
+        index = self._pick(options, "Turbo KV cache")
+        if index == 0:
+            self._launch("settings", "--no-turbo-kv")
+        elif index == 1:
+            self._launch("settings", "--turbo-kv")
+
+    def _configure_gpu_layers(self) -> None:
+        options = [
+            ("Automatic", "use the tuned placement profile"),
+            ("All", "place every layer on the GPU"),
+            ("24", "a balanced middle ground"),
+            ("Custom", "enter any exact layer count"),
+            _BACK,
+        ]
+        index = self._pick(options, "GPU layers")
+        if index == 0:
+            self._launch("settings", "--gpu-layers", "auto")
+        elif index == 1:
+            self._launch("settings", "--gpu-layers", "all")
+        elif index == 2:
+            self._launch("settings", "--gpu-layers", "24")
+        elif index == 3:
+            value = self._prompt_required("GPU layers (auto, all, or a count)")
+            if value:
+                self._launch("settings", "--gpu-layers", value)
+
+    def _configure_cpu_moe(self) -> None:
+        options = [
+            ("Automatic", "use the tuned placement profile"),
+            ("On", "run all MoE experts on the CPU (stable on small GPUs)"),
+            ("Off", "offload MoE experts to the GPU when VRAM allows"),
+            _BACK,
+        ]
+        index = self._pick(options, "CPU MoE")
+        values = ("auto", "on", "off")
+        if index < len(values):
+            self._launch("settings", "--cpu-moe", values[index])
 
     def _tools(self) -> None:
         index = self._pick(

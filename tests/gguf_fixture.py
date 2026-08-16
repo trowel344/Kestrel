@@ -40,8 +40,16 @@ def write_gguf(
     n_heads: int = 0,
     n_kv_heads: int = 0,
     head_dim: int = 0,
+    file_type: int = 0,
+    tensors: list[tuple[str, tuple[int, ...]]] | None = None,
 ) -> Path:
-    """Write a minimal valid GGUF header with the planner-relevant metadata."""
+    """Write a minimal valid GGUF header with the planner-relevant metadata.
+
+    ``tensors`` is an optional list of ``(name, dims)`` tensor-info entries
+    written after the KV section; ``tensor_count`` is ignored when it is set.
+    """
+    if tensors is not None:
+        tensor_count = len(tensors)
     body = bytearray(GGUF_MAGIC)
     body += struct.pack(_ENCODING + "I", VERSION)
     body += struct.pack(_ENCODING + "Q", tensor_count)
@@ -66,12 +74,24 @@ def write_gguf(
         kvs.append((f"{architecture}.attention.key_length", V_UINT32, struct.pack(_ENCODING + "I", head_dim)))
     if tokenizer_keys:
         kvs.append(("tokenizer.ggml.pre", V_STRING, _string_to_bytes("default")))
+    # Some producers (llama.cpp's quantizer) write general.file_type at the
+    # very end of the metadata, after the tokenizer section.
+    if file_type:
+        kvs.append(("general.file_type", V_UINT32, struct.pack(_ENCODING + "I", file_type)))
 
     body += struct.pack(_ENCODING + "Q", len(kvs))
     for key, vtype, payload in kvs:
         _string(body, key)
         body += struct.pack(_ENCODING + "I", vtype)
         body += payload
+    if tensors:
+        for name, dims in tensors:
+            _string(body, name)
+            body += struct.pack(_ENCODING + "I", len(dims))
+            for dim in dims:
+                body += struct.pack(_ENCODING + "Q", dim)
+            body += struct.pack(_ENCODING + "I", 1)  # GGML_TYPE_F16
+            body += struct.pack(_ENCODING + "Q", 0)  # tensor data offset
     path.write_bytes(bytes(body))
     return path
 

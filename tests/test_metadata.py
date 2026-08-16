@@ -119,6 +119,35 @@ def test_present_scalar_array_parses(tmp_path):
     assert m["architecture"] == "qwen35moe"
 
 
+def test_file_type_read_when_written_after_tokenizer_section(tmp_path):
+    """general.file_type emitted at the end is still recovered via the resume scan."""
+    p = write_gguf(
+        tmp_path / "late.gguf",
+        n_layer=53,
+        n_exp=128,
+        n_used=6,
+        hidden=2688,
+        n_ff=1856,
+        tokenizer_keys=True,
+        file_type=30,
+    )
+    m = read_planner_metadata(p)
+    assert m["file_type"] == 30
+
+
+def test_file_type_missing_defaults_zero(tmp_path):
+    p = write_gguf(
+        tmp_path / "none.gguf",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+    )
+    m = read_planner_metadata(p)
+    assert m["file_type"] == 0
+
+
 def test_planner_unknown_arch_defaults(tmp_path):
     p = write_gguf(
         tmp_path / "u.gguf",
@@ -182,6 +211,62 @@ def test_attention_dims_missing_default_to_zero(tmp_path):
     m = read_planner_metadata(p)
     assert m["n_kv_heads"] == 0
     assert m["head_dim"] == 0
+
+
+def _hybrid_tensors() -> list[tuple[str, tuple[int, ...]]]:
+    tensors: list[tuple[str, tuple[int, ...]]] = []
+    for lay in (5, 12, 19, 26, 33, 42, 52):
+        tensors.append((f"blk.{lay}.attn_norm.weight", (2688,)))
+        tensors.append((f"blk.{lay}.attn_q.weight", (2688, 4096)))
+        tensors.append((f"blk.{lay}.attn_k.weight", (2688, 256)))
+        tensors.append((f"blk.{lay}.attn_v.weight", (2688, 256)))
+        tensors.append((f"blk.{lay}.attn_output.weight", (4096, 2688)))
+    for lay in (7, 8, 9):
+        tensors.append((f"blk.{lay}.ssm_in.weight", (2688, 1536)))
+        tensors.append((f"blk.{lay}.ssm_out.weight", (1536, 2688)))
+    for lay in (0, 1, 2):
+        tensors.append((f"blk.{lay}.ffn_up_exps.weight", (1024, 2688, 128)))
+    tensors.append(("token_embd.weight", (3072, 2688)))
+    tensors.append(("output.weight", (2688, 3072)))
+    return tensors
+
+
+def test_hybrid_attention_kv_layout_scanned(tmp_path):
+    """Hybrid models store KV only for full-attention layers; the tensor scan
+    must count those (7) and their KV dim (8 heads * 32 = 256), not n_layer."""
+    p = write_gguf(
+        tmp_path / "hybrid.gguf",
+        architecture="nemotron_h_moe",
+        n_layer=53,
+        n_exp=128,
+        n_used=6,
+        hidden=2688,
+        n_ff=1856,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=128,
+        tensors=_hybrid_tensors(),
+    )
+    m = read_planner_metadata(p)
+    assert m["kv_layers"] == 7
+    assert m["kv_values_per_token"] == 256
+    assert m["n_tensors"] == len(_hybrid_tensors())
+
+
+def test_kv_layout_missing_defaults_zero(tmp_path):
+    p = write_gguf(
+        tmp_path / "layoutless.gguf",
+        architecture="qwen35moe",
+        n_layer=48,
+        n_exp=256,
+        n_used=8,
+        hidden=3072,
+        n_ff=1024,
+    )
+    m = read_planner_metadata(p)
+    assert m["kv_layers"] == 0
+    assert m["kv_values_per_token"] == 0
+    assert m["n_tensors"] == 0
 
 
 def test_planner_disk_cache_rejects_non_object_metadata(tmp_path, monkeypatch):

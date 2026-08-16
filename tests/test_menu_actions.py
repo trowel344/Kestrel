@@ -416,3 +416,39 @@ def test_model_settings_dispatch_context_presets_custom_and_reasoning(monkeypatc
         ("settings", "--context", "12288"),
         ("settings", "--reasoning", "high"),
     ]
+
+
+def test_model_settings_dispatch_kv_cache_type_and_turbo(monkeypatch):
+    launches = []
+    session = menu._MenuSession(launch=lambda *args: launches.append(args))
+    monkeypatch.setattr(menu, "ui", FakeUI())
+
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 3)
+    session._configure_kv_cache_type()
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 1)
+    session._configure_turbo_kv()
+
+    assert launches == [
+        ("settings", "--kv-cache-type", "q8_0"),
+        ("settings", "--turbo-kv"),
+    ]
+
+
+def test_model_settings_dispatch_gpu_layers_and_cpu_moe(monkeypatch):
+    launches = []
+    session = menu._MenuSession(launch=lambda *args: launches.append(args))
+    fake_ui = FakeUI(answers=["40"])
+    monkeypatch.setattr(menu, "ui", fake_ui)
+
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 2)
+    session._configure_gpu_layers()
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 3)
+    session._configure_gpu_layers()
+    monkeypatch.setattr(session, "_pick", lambda _items, _title: 1)
+    session._configure_cpu_moe()
+
+    assert launches == [
+        ("settings", "--gpu-layers", "24"),
+        ("settings", "--gpu-layers", "40"),
+        ("settings", "--cpu-moe", "on"),
+    ]

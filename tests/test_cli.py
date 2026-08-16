@@ -92,6 +92,39 @@ def test_kv_cache_bytes_uses_gqa_value_dim(tmp_path):
     assert bytes_per_token == pytest.approx(2 * 48 * (8 * 128) * 1.1)
 
 
+def test_kv_cache_bytes_uses_only_full_attention_layers(tmp_path):
+    """Hybrid-attention models (interleaved SSM/linear layers) allocate KV for
+    the full-attention layers only; the per-token estimate must use the scanned
+    count and KV dim, not n_layer."""
+    from gguf_fixture import write_gguf  # noqa: PLC0415
+
+    tensors = [
+        (f"blk.{lay}.attn_q.weight", (2688, 4096))
+        for lay in (5, 12, 19, 26, 33, 42, 52)
+    ] + [
+        (f"blk.{lay}.attn_k.weight", (2688, 256))
+        for lay in (5, 12, 19, 26, 33, 42, 52)
+    ] + [
+        (f"blk.{lay}.ssm_in.weight", (2688, 1536))
+        for lay in (7, 8, 9)
+    ]
+    p = write_gguf(
+        tmp_path / "hybrid.gguf",
+        architecture="nemotron_h_moe",
+        n_layer=53,
+        n_exp=128,
+        n_used=6,
+        hidden=2688,
+        n_ff=1856,
+        n_heads=32,
+        n_kv_heads=8,
+        head_dim=128,
+        tensors=tensors,
+    )
+    bytes_per_token = cli._kv_cache_bytes_per_token({"type": "gguf", "path": str(p)})
+    assert bytes_per_token == pytest.approx(2 * 7 * 256 * 1.1)
+
+
 def test_select_context_gpu_resident_accounts_for_kv_cache(tmp_path, monkeypatch):
     """A 17 GiB MoE on a 24 GiB card fits by weight, but a 32K context would
     push weights+KV past free VRAM; the planner must cap the context."""
@@ -283,6 +316,44 @@ def test_configure_backend_maps_config_and_args(monkeypatch, tmp_path):
     assert backend.moe_cache == "2048"
 
 
+def test_configure_backend_auto_kv_cache_type_falls_back_to_plan(monkeypatch, tmp_path):
+    model = write_gguf(tmp_path / "m.gguf", n_layer=48)
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
+    args = SimpleNamespace(
+        batch_size=None,
+        ubatch_size=None,
+        mtp_tokens=3,
+        fit_target=None,
+        kv_cache_type="auto",
+        no_mmap=False,
+        mlock=False,
+        direct_io=False,
+        tensor_split=None,
+        extra=None,
+        threads=None,
+        no_mtp=False,
+        _gpu=None,
+    )
+    config = {
+        "use_mtp": False,
+        "gpu_layers": "auto",
+        "context_size": 4096,
+        "batch_size": 128,
+        "ubatch_size": 64,
+        "cpu_moe": True,
+        "fit": True,
+        "fit_target_mib": 512,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0",
+        "threads": 8,
+        "moe_cache": "on",
+        "moe_cache_budget_mib": 2048,
+    }
+    backend = cli._configure_backend({"path": str(model)}, config, args)
+    assert backend.cache_type_k == "q8_0"
+    assert backend.cache_type_v == "q8_0"
+
+
 class _StubBackend:
     def __init__(self):
         self.server_kwargs = None
@@ -313,6 +384,7 @@ def test_build_server_cmd_passes_serve_args(monkeypatch, tmp_path):
         "alias": "m",
         "embeddings": True,
         "api_key_file": str(key_file),
+        "parallel": None,
     }
 
 
@@ -323,6 +395,7 @@ def test_build_server_cmd_default_serving_defaults(monkeypatch, tmp_path):
     assert stub.server_kwargs["host"] == "127.0.0.1"
     assert stub.server_kwargs["port"] == 8080
     assert stub.server_kwargs["embeddings"] is False
+    assert stub.server_kwargs["parallel"] is None
 
 
 def test_human_stream_routes_by_json_flag():
@@ -562,6 +635,50 @@ def test_cmd_run_dry_run_json_keeps_stdout_clean(capsys, monkeypatch, tmp_path):
     # Human plan/command must live on stderr; stdout is one JSON document.
     assert "Runtime plan" in captured.err
     assert captured.out.count("\n") == 1
+
+
+def test_prepare_run_model_invokes_auto_tune_before_launch(monkeypatch, tmp_path):
+    model = write_gguf(tmp_path / "m.gguf", n_layer=48)
+    model_info = {"type": "gguf", "path": str(model), "gguf_name": str(model)}
+    config = {
+        "model_size_gib": 3.0,
+        "gpu_layers": "all",
+        "fit_target_mib": 512,
+        "cpu_moe": False,
+        "moe_cache": "off",
+        "moe_cache_budget_mib": 0,
+        "threads": 8,
+        "context_size": 4096,
+        "context_reason": "test",
+        "batch_size": 128,
+        "ubatch_size": 64,
+        "predicted_decode_tps": 5.0,
+        "prediction_confidence": "uncalibrated-model-estimate",
+        "memory_overcommit": False,
+        "has_mtp": False,
+        "use_mtp": False,
+        "tuning_profile_applied": False,
+        "tuning_profile_reason": "no measured profile",
+    }
+    monkeypatch.setattr(cli.probes, "detect_gpu", lambda: None)
+    monkeypatch.setattr(cli.model_source, "_resolve_model_source", lambda args: model_info)
+    monkeypatch.setattr(cli.model_source, "_ensure_local_gguf", lambda info, args: info)
+    monkeypatch.setattr(cli.runtime, "_resolve_node_plan", lambda args: {})
+    monkeypatch.setattr(cli.planning, "estimate_config", lambda model_info, gpu_info, args: dict(config))
+
+    calls = []
+
+    def fake_auto_tune(model_info, gpu_info, config, args):
+        calls.append((model_info, gpu_info, config, args))
+        return {**config, "gpu_layers": "33", "prediction_confidence": "measured", "predicted_decode_tps": 12.3}
+
+    monkeypatch.setattr(cli.bench, "auto_tune_plan", fake_auto_tune)
+    args = _run_args(str(model), dry_run=False)
+    prepared = cli.run._prepare_run_model(args)
+    assert len(calls) == 1
+    assert prepared[1]["gpu_layers"] == "33"
+    assert prepared[1]["predicted_decode_tps"] == 12.3
+    assert prepared[1]["prediction_confidence"] == "measured"
 
 
 def test_resolve_ollama_native_returns_local_blob(monkeypatch):

@@ -137,6 +137,7 @@ def _model_profile(model_info: dict):
             expert_ff_size=cfg["n_ff"],
             has_mtp=cfg["mtp_layers"] > 0,
             file_size_bytes=_gguf_total_size(model_info["path"]),
+            file_type=cfg["file_type"],
         )
 
     from ..gguf.converter import NVFP4Converter

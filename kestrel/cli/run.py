@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .. import ui
 from ..errors import BackendError, InputError, ModelError, ServiceError
-from . import model_source, parser, planning, probes, runtime, telemetry
+from . import bench, model_source, parser, planning, probes, runtime, telemetry
 
 
 def _ollama_run_command(name: str, reasoning: str) -> list[str]:
@@ -122,6 +122,7 @@ def _prepare_run_model(args):
     args._node_plan = runtime._annotate_node_model_fit(args._node_plan, model_info)
 
     config = planning.estimate_config(model_info, gpu_info, args)
+    config = bench.auto_tune_plan(model_info, gpu_info, config, args)
     return model_info, config
 
 
@@ -161,9 +162,15 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
     if cold_model_path:
         plan_lines.append(ui.kv("MoE Q1 cold sidecar", cold_model_path))
     planned_threads = args.threads if args.threads is not None else config["threads"] or "llama.cpp default"
+    planned_batch_threads = (
+        args.threads_batch
+        if getattr(args, "threads_batch", None) is not None
+        else (config.get("threads_batch") or 0)
+    )
     plan_lines.extend(
         [
             ui.kv("Threads", str(planned_threads)),
+            ui.kv("Prompt threads", str(planned_batch_threads or "llama.cpp default")),
             ui.kv("Context", f"{config['context_size']} ({config['context_reason']})"),
             ui.kv("Reasoning", config.get("reasoning_level", "auto")),
             ui.kv("KV cache", str(args.kv_cache_type)),
@@ -175,10 +182,12 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
         ]
     )
     predicted = config["predicted_decode_tps"]
+    confidence = config.get("prediction_confidence", "uncalibrated-model-estimate")
+    confidence_note = "measured profile" if confidence == "measured" else f"{confidence}; benchmark required"
     plan_lines.append(
         ui.kv(
             "Decode estimate",
-            f"{predicted} tok/s ({config['prediction_confidence']}; benchmark required)",
+            f"{predicted} tok/s ({confidence_note})",
             value_color=ui.green if (predicted and predicted >= 10) else ui.yellow,
         )
     )
@@ -190,6 +199,13 @@ def _print_run_plan(args, config, cmd, llama_cli_version, *, hot_model_path=None
             "Context was reduced to the minimum to avoid an OOM crash, but "
             "expect heavy disk paging and low speed. Free memory or use a "
             "smaller quant/tier to run it comfortably."
+        )
+    if config.get("context_scaled"):
+        notes.append(
+            "Applied the measured placement at a context larger than the tuned "
+            "size, so the KV cache grows beyond the profile's measured "
+            "footprint. Free RAM/VRAM may become the limit; prefer the tuned "
+            "context or free memory if launches become unstable."
         )
     if predicted and predicted < 10:
         if cold_model_path:
@@ -421,6 +437,7 @@ def _cmd_serve_live(args):
     args._gpu = gpu_info
     args._node_plan = runtime._resolve_node_plan(args)
     config = planning.estimate_config(model_info, gpu_info, args)
+    config = bench.auto_tune_plan(model_info, gpu_info, config, args)
     cmd = runtime._build_server_cmd(model_info, config, args)
     host = args.host
     port = args.port

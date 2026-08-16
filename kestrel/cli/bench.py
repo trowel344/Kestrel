@@ -19,11 +19,24 @@ import time
 from pathlib import Path
 
 from .. import ui
-from ..backends.llama_cpp import resolve_llama_binary
+from ..backends.llama_cpp import _load_capabilities, resolve_llama_binary
 from ..config import config_path
 from ..errors import BackendError, InputError, KestrelError, ModelError, ServiceError
+from ..tuning import PROFILE_SCHEMA, engine_identity, hardware_identity, model_identity, profile_path_for
 from ..util import write_atomic
 from . import model_source, parser, planning, probes, state
+
+# Tuning reasons that mean "the current plan has no measured basis" and therefore
+# justify an automatic in-line placement scan at launch time. The VRAM-floor
+# reason is deliberately excluded: scanning while VRAM is scarce cannot help and
+# risks a wasteful OOM.
+_AUTO_TUNE_REASONS = {
+    "no measured profile",
+    "profile unreadable",
+    "model artifact changed",
+    "hardware layout changed",
+    "llama.cpp engine changed",
+}
 
 
 def _build_optimize_profile(args, model_arg, gpu, storage_path) -> dict:
@@ -89,8 +102,9 @@ def _build_optimize_profile(args, model_arg, gpu, storage_path) -> dict:
     if args.context:
         context = args.context
         context_reason = "explicit user setting"
+        overcommitted = False
     else:
-        context, context_reason = planning._select_context_size(model_info, gpu)
+        context, context_reason, overcommitted = planning._select_context_size(model_info, gpu)
     plan_args = argparse.Namespace(
         gpu_layers="auto",
         ctx_size=context,
@@ -98,9 +112,11 @@ def _build_optimize_profile(args, model_arg, gpu, storage_path) -> dict:
         moe_cache="off",
         moe_cold_model=None,
         target=args.quality,
+        use_tuning_profile=False,
     )
     plan = planning.estimate_config(model_info, gpu, plan_args)
     plan["context_reason"] = context_reason
+    plan["memory_overcommit"] = overcommitted
     plan["quality_profile"] = args.quality
     plan["kv_cache_type"] = {
         "speed": "q4_0",
@@ -118,43 +134,268 @@ def _build_optimize_profile(args, model_arg, gpu, storage_path) -> dict:
     return profile
 
 
+def _add_tuning_candidate(candidates: list[dict], seen: set[tuple], **candidate) -> None:
+    key = tuple(candidate.get(name) for name in ("gpu_layers", "cpu_moe_layers", "batch_size", "ubatch_size"))
+    if key not in seen:
+        seen.add(key)
+        candidates.append(candidate)
+
+
+def _tuning_candidates(plan: dict) -> list[dict]:
+    """Build a bounded, architecture-generic placement/prefill search.
+
+    The search deliberately avoids model-name checks. MoE candidates keep all
+    experts on CPU first, then try a bounded one-eighth expert-layer slice on
+    the GPU. Dense and MoE models both test larger physical micro-batches.
+    Failed/OOM candidates are evidence and are retained in the profile.
+    """
+    candidates: list[dict] = []
+    seen: set[tuple] = set()
+    layers = max(0, int(plan.get("n_layers") or 0))
+    experts = max(0, int(plan.get("n_experts") or 0))
+    baseline_cpu_layers = plan.get("n_cpu_moe_layers")
+    if baseline_cpu_layers is None and experts and plan.get("cpu_moe"):
+        baseline_cpu_layers = layers
+    base = {
+        "gpu_layers": str(plan.get("gpu_layers", "auto")),
+        "cpu_moe_layers": baseline_cpu_layers,
+        "batch_size": int(plan.get("batch_size") or 256),
+        "ubatch_size": int(plan.get("ubatch_size") or 64),
+        "label": "planner_baseline",
+    }
+    _add_tuning_candidate(candidates, seen, **base)
+
+    full_gpu_layers = str(layers + 1) if layers else str(plan.get("gpu_layers", "auto"))
+    all_cpu_experts = layers if experts else None
+    for batch, ubatch, label in (
+        (512, 128, "larger_prefill"),
+        (512, 256, "wide_prefill"),
+    ):
+        _add_tuning_candidate(
+            candidates,
+            seen,
+            gpu_layers=full_gpu_layers,
+            cpu_moe_layers=all_cpu_experts,
+            batch_size=batch,
+            ubatch_size=ubatch,
+            label=label,
+        )
+    if experts and layers >= 8:
+        # Bounded expert slices climbing toward the VRAM ceiling: the
+        # one-eighth slice stays safely inside the coarse floor on small
+        # cards, while the one-quarter and one-third slices probe for more
+        # GPU-expert headroom. Aggressive slices are only gated by the relaxed
+        # preflight; llama-bench remains the authority on what actually loads
+        # and records OOM candidates as evidence instead of guessing.
+        for slice_divisor in (8, 4, 3):
+            gpu_expert_layers = max(1, layers // slice_divisor)
+            if gpu_expert_layers >= layers:
+                continue
+            _add_tuning_candidate(
+                candidates,
+                seen,
+                gpu_layers=full_gpu_layers,
+                cpu_moe_layers=layers - gpu_expert_layers,
+                batch_size=512,
+                ubatch_size=256,
+                label=f"bounded_gpu_experts_{slice_divisor}",
+            )
+    return candidates
+
+
+# The coarse preflight below overestimates VRAM for aggressive GPU-expert
+# slices (measured placements can load at ~1.3x the estimate), and llama-bench
+# records OOM failures gracefully as evidence. So candidates are only skipped
+# when their estimate exceeds free VRAM by a clear margin, leaving the actual
+# ceiling to the measurement.
+PREFLIGHT_SKIP_MARGIN = 1.5
+
+
+def _poll_peak_vram(process, timeout: float) -> int:
+    """Poll nvidia-smi while the benchmark process runs and return peak VRAM.
+
+    llama-bench frees its buffers on exit, so the footprint has to be observed
+    while the process is alive. Returns 0 when no NVIDIA GPU / nvidia-smi is
+    available; the coarse estimate then stands in for the stored floor.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    peak = 0
+    while process.poll() is None:
+        if time.monotonic() >= deadline:
+            return peak
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                peak = max(peak, int(result.stdout.splitlines()[0].strip()))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return peak
+        time.sleep(0.3)
+    return peak
+
+
+def _estimated_required_free_vram_mib(profile: dict, candidate: dict) -> int:
+    """Conservative preflight floor for a benchmark candidate.
+
+    It is intentionally coarse: llama-bench remains the authority on whether
+    the placement loads. This estimate only prevents obviously oversized
+    expert slices from provoking an avoidable OOM during the search.
+    """
+    plan = profile.get("plan") or {}
+    layers = max(1, int(plan.get("n_layers") or 1))
+    experts = int(plan.get("n_experts") or 0)
+    size_mib = float(plan.get("model_size_gib") or 0) * 1024
+    cpu_layers = candidate.get("cpu_moe_layers")
+    gpu_expert_layers = max(0, layers - int(cpu_layers)) if experts and cpu_layers is not None else 0
+    expert_slice = size_mib * gpu_expert_layers / layers
+    dense_and_runtime = min(2048.0, size_mib * 0.15) + 1536.0
+    graph = 512.0 if candidate.get("ubatch_size", 0) >= 256 else 256.0
+    return max(2048, math.ceil(expert_slice + dense_and_runtime + graph))
+
+
+def _candidate_score(report: dict, quality: str) -> float:
+    prompt = float(report["prompt_tokens_per_second"])
+    decode = float(report["decode_tokens_per_second"])
+    prompt_weight = {"speed": 0.7, "balanced": 0.6, "quality": 0.5}[quality]
+    return (prompt**prompt_weight) * (decode ** (1.0 - prompt_weight))
+
+
 def _run_optimize_benchmark(profile, model_arg, target, args) -> None:
-    """Run the measurement sweep for ``optimize`` and fold the results into
-    ``profile``, raising a :class:`KestrelError` when the run fails (the caller then
-    re-raises after persisting the failure state)."""
+    """Measure bounded candidates and persist the fastest safe exact profile."""
     if not model_arg:
         raise InputError("--benchmark requires a model")
-    benchmark_path = target.with_name("hardware-benchmark.json")
+    model_info = model_source.detect_model(model_arg)
+    if not model_info or model_info.get("type") != "gguf" or not model_info.get("path"):
+        raise ModelError("adaptive optimization requires a local GGUF model")
+    gpu = probes.detect_gpu()
+    free_vram = (gpu or {}).get("vram_free_mb") or 0
+    candidates = _tuning_candidates(profile["plan"])
+    results = []
     try:
-        report = cmd_benchmark(
-            argparse.Namespace(
-                model=model_arg,
-                prompt_tokens=128,
-                generate_tokens=64,
-                repetitions=3,
-                ctx_size=profile["plan"]["context_size"],
-                gpu_layers="auto",
-                cpu_moe="auto",
-                threads=(planning._cpu_moe_thread_sweep(os.cpu_count() or 1) if profile["plan"]["cpu_moe"] else None),
-                batch_size=profile["plan"]["batch_size"],
-                ubatch_size=profile["plan"]["ubatch_size"],
-                kv_cache_type=profile["plan"]["kv_cache_type"],
-                output=str(benchmark_path),
-                quiet=True,
+        for candidate in candidates:
+            required_free = _estimated_required_free_vram_mib(profile, candidate)
+            result = {**candidate, "estimated_required_free_vram_mib": required_free}
+            if free_vram and required_free > free_vram * PREFLIGHT_SKIP_MARGIN:
+                results.append({**result, "status": "skipped", "error": "estimated VRAM floor exceeds free VRAM"})
+                continue
+            try:
+                report = cmd_benchmark(
+                    argparse.Namespace(
+                        model=model_arg,
+                        prompt_tokens=256,
+                        generate_tokens=64,
+                        repetitions=2,
+                        ctx_size=profile["plan"]["context_size"],
+                        gpu_layers=candidate["gpu_layers"],
+                        cpu_moe="on" if candidate["cpu_moe_layers"] is not None else "auto",
+                        cpu_moe_layers=candidate["cpu_moe_layers"],
+                        threads=profile["plan"].get("threads") or max(1, (os.cpu_count() or 2) - 2),
+                        batch_size=candidate["batch_size"],
+                        ubatch_size=candidate["ubatch_size"],
+                        kv_cache_type=profile["plan"]["kv_cache_type"],
+                        output=None,
+                        quiet=True,
+                    )
+                )
+            except KestrelError as exc:
+                results.append({**result, "status": "failed", "error": str(exc)})
+                continue
+            results.append(
+                {
+                    **result,
+                    "status": "measured",
+                    "prompt_tokens_per_second": report["prompt_tokens_per_second"],
+                    "decode_tokens_per_second": report["decode_tokens_per_second"],
+                    "score": _candidate_score(report, args.quality),
+                    # The observed peak (when available) is the true floor for
+                    # the profile gate; the coarse estimate overstates it for
+                    # aggressive GPU-expert slices.
+                    "estimated_required_free_vram_mib": report.get("peak_vram_mib")
+                    or result["estimated_required_free_vram_mib"],
+                }
             )
-        )
+        measured = [item for item in results if item["status"] == "measured"]
+        if not measured:
+            raise ServiceError("all adaptive tuning candidates failed or exceeded the VRAM safety floor")
+        selected = max(measured, key=lambda item: item["score"])
+        selected_threads = profile["plan"].get("threads") or max(1, (os.cpu_count() or 2) - 2)
+        thread_refinement: dict = {"status": "not_needed"}
+        if selected["cpu_moe_layers"] is not None:
+            try:
+                thread_report = cmd_benchmark(
+                    argparse.Namespace(
+                        model=model_arg,
+                        prompt_tokens=128,
+                        generate_tokens=32,
+                        repetitions=1,
+                        ctx_size=profile["plan"]["context_size"],
+                        gpu_layers=selected["gpu_layers"],
+                        cpu_moe="on",
+                        cpu_moe_layers=selected["cpu_moe_layers"],
+                        threads=planning._cpu_moe_thread_sweep(os.cpu_count() or 1),
+                        batch_size=selected["batch_size"],
+                        ubatch_size=selected["ubatch_size"],
+                        kv_cache_type=profile["plan"]["kv_cache_type"],
+                        output=None,
+                        quiet=True,
+                    )
+                )
+            except KestrelError as exc:
+                thread_refinement = {"status": "failed", "error": str(exc)}
+            else:
+                selected_threads = thread_report.get("placement", {}).get("threads") or selected_threads
+                thread_refinement = {
+                    "status": "measured",
+                    "selected_threads": selected_threads,
+                    "thread_sweep": thread_report.get("thread_sweep", []),
+                }
+        selected_plan = {
+            "gpu_layers": selected["gpu_layers"],
+            "cpu_moe": selected["cpu_moe_layers"] is not None,
+            "n_cpu_moe_layers": selected["cpu_moe_layers"],
+            "batch_size": selected["batch_size"],
+            "ubatch_size": selected["ubatch_size"],
+            "threads": selected_threads,
+            "cache_type_k": profile["plan"].get("cache_type_k", "q8_0"),
+            "cache_type_v": profile["plan"].get("cache_type_v", "q8_0"),
+        }
+        profile["schema_version"] = PROFILE_SCHEMA
+        profile["tuning"] = {
+            "status": "measured",
+            "model_identity": model_identity(model_info),
+            "hardware_identity": hardware_identity(gpu),
+            "engine_identity": engine_identity((state.LLAMA_CPP_DIR,)),
+            "context_size": profile["plan"]["context_size"],
+            "minimum_free_vram_mib": selected["estimated_required_free_vram_mib"],
+            "selected_plan": selected_plan,
+            "objective": args.quality,
+            "thread_refinement": thread_refinement,
+            "candidates": results,
+        }
+        profile["plan"].update(selected_plan)
         profile["benchmark"] = {
             "status": "measured",
-            "report": str(benchmark_path),
-            "prompt_tokens_per_second": report["prompt_tokens_per_second"],
-            "decode_tokens_per_second": report["decode_tokens_per_second"],
-            "release_speed_floor_passed": report["release_speed_floor_passed"],
-            "quality_gate": report.get("quality_gate", "not_run"),
-            "selected_placement": report.get("placement"),
+            "prompt_tokens_per_second": selected["prompt_tokens_per_second"],
+            "decode_tokens_per_second": selected["decode_tokens_per_second"],
+            "release_speed_floor_passed": selected["decode_tokens_per_second"] >= 10.0,
+            "quality_gate": "same_artifact_placement_only",
+            "selected_placement": selected_plan,
         }
-        if report.get("placement", {}).get("threads") is not None:
-            profile["plan"]["threads"] = report["placement"]["threads"]
     except KestrelError as exc:
+        profile["schema_version"] = PROFILE_SCHEMA
+        profile["tuning"] = {
+            "status": "failed",
+            "model_identity": model_identity(model_info),
+            "hardware_identity": hardware_identity(gpu),
+            "engine_identity": engine_identity((state.LLAMA_CPP_DIR,)),
+            "context_size": profile["plan"]["context_size"],
+            "candidates": results,
+            "error": str(exc),
+        }
         profile["benchmark"] = {"status": "failed", "error": str(exc)}
         if not args.no_save:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -164,13 +405,230 @@ def _run_optimize_benchmark(profile, model_arg, target, args) -> None:
         raise
 
 
+def _build_auto_profile(model_info: dict, gpu: dict | None, config: dict) -> dict:
+    """Build the persisted profile document for an in-line auto-tune scan."""
+    return {
+        "schema_version": 1,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "hardware": {
+            "cpu": platform.processor(),
+            "logical_cpu_count": os.cpu_count() or 0,
+            "available_ram_mib": probes._available_ram_mib(),
+            "memory": probes._memory_snapshot(),
+            "gpu": gpu,
+        },
+        "model": {
+            "source": model_info.get("path"),
+            "engine": "llama.cpp",
+            "path": model_info.get("path"),
+            "size_gib": config.get("model_size_gib"),
+            **model_source.read_gguf_config(model_info["path"]),
+        },
+        "plan": config,
+        "benchmark": {"status": "not_run"},
+    }
+
+
+def _persist_auto_profile(profile: dict, model_info: dict, gpu: dict | None) -> Path | None:
+    target = profile_path_for(model_info, gpu)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(target, json.dumps(profile, indent=2) + "\n")
+    except OSError as exc:
+        print(ui.dim(f"could not persist auto-tune profile: {exc}"), file=sys.stderr)
+        return None
+    return target
+
+
+def auto_tune_plan(model_info: dict, gpu: dict | None, config: dict, args) -> dict:
+    """Measure and persist an adaptive profile for an unprofiled model at launch.
+
+    Triggered when the plan has no measured basis (no profile, or a stale one)
+    and auto-tune is enabled. Runs a bounded candidate scan with reduced token
+    budgets, persists the fastest safe placement, and folds the measured rates
+    back into ``config`` so this very launch uses it. Never raises: failures
+    log a warning and return the conservative config unchanged.
+    """
+    if getattr(args, "no_auto_tune", False) or getattr(args, "dry_run", False):
+        return config
+    if config.get("tuning_profile_applied"):
+        return config
+    if config.get("tuning_profile_reason") not in _AUTO_TUNE_REASONS:
+        return config
+    model_path = model_info.get("path")
+    if not model_path:
+        return config
+    if not resolve_llama_binary("llama-bench", dirs=(state.LLAMA_CPP_DIR,)):
+        return config
+    out = sys.stderr
+    print(
+        ui.dim("No measured tuning profile for this model; scanning placements..."),
+        file=out,
+    )
+    print(ui.dim("(pass --no-auto-tune to keep the conservative planner defaults)"), file=out)
+
+    profile = _build_auto_profile(model_info, gpu, config)
+    candidates = _tuning_candidates(profile["plan"])
+    results: list[dict] = []
+    free_vram = (gpu or {}).get("vram_free_mb") or 0
+    for candidate in candidates:
+        required_free = _estimated_required_free_vram_mib(profile, candidate)
+        result = {**candidate, "estimated_required_free_vram_mib": required_free}
+        if free_vram and required_free > free_vram * PREFLIGHT_SKIP_MARGIN:
+            results.append({**result, "status": "skipped", "error": "estimated VRAM floor exceeds free VRAM"})
+            continue
+        try:
+            report = cmd_benchmark(
+                argparse.Namespace(
+                    model=model_path,
+                    prompt_tokens=128,
+                    generate_tokens=64,
+                    repetitions=2,
+                    ctx_size=config["context_size"],
+                    gpu_layers=candidate["gpu_layers"],
+                    cpu_moe="on" if candidate["cpu_moe_layers"] is not None else "auto",
+                    cpu_moe_layers=candidate["cpu_moe_layers"],
+                    threads=config.get("threads") or max(1, (os.cpu_count() or 2) - 2),
+                    batch_size=candidate["batch_size"],
+                    ubatch_size=candidate["ubatch_size"],
+                    kv_cache_type="auto",
+                    output=None,
+                    quiet=True,
+                )
+            )
+        except KestrelError as exc:
+            results.append({**result, "status": "failed", "error": str(exc)})
+            continue
+        results.append(
+            {
+                **result,
+                "status": "measured",
+                "prompt_tokens_per_second": report["prompt_tokens_per_second"],
+                "decode_tokens_per_second": report["decode_tokens_per_second"],
+                "score": _candidate_score(report, "balanced"),
+                "estimated_required_free_vram_mib": report.get("peak_vram_mib")
+                or result["estimated_required_free_vram_mib"],
+            }
+        )
+    measured = [item for item in results if item["status"] == "measured"]
+    if not measured:
+        profile["schema_version"] = PROFILE_SCHEMA
+        profile["tuning"] = {
+            "status": "failed",
+            "model_identity": model_identity(model_info),
+            "hardware_identity": hardware_identity(gpu),
+            "engine_identity": engine_identity((state.LLAMA_CPP_DIR,)),
+            "context_size": config["context_size"],
+            "candidates": results,
+            "error": "all auto-tune candidates failed or exceeded the VRAM safety floor",
+        }
+        profile["benchmark"] = {"status": "failed", "error": profile["tuning"]["error"]}
+        _persist_auto_profile(profile, model_info, gpu)
+        print(
+            f"  {ui.warn_mark()} {ui.yellow('auto-tune found no usable placement; keeping the planner defaults')}",
+            file=out,
+        )
+        return config
+    selected = max(measured, key=lambda item: item["score"])
+    selected_threads = config.get("threads") or max(1, (os.cpu_count() or 2) - 2)
+    thread_refinement: dict = {"status": "not_needed"}
+    if selected["cpu_moe_layers"] is not None:
+        try:
+            thread_report = cmd_benchmark(
+                argparse.Namespace(
+                    model=model_path,
+                    prompt_tokens=64,
+                    generate_tokens=16,
+                    repetitions=1,
+                    ctx_size=config["context_size"],
+                    gpu_layers=selected["gpu_layers"],
+                    cpu_moe="on",
+                    cpu_moe_layers=selected["cpu_moe_layers"],
+                    threads=planning._cpu_moe_thread_sweep(os.cpu_count() or 1),
+                    batch_size=selected["batch_size"],
+                    ubatch_size=selected["ubatch_size"],
+                    kv_cache_type="auto",
+                    output=None,
+                    quiet=True,
+                )
+            )
+        except KestrelError as exc:
+            thread_refinement = {"status": "failed", "error": str(exc)}
+        else:
+            selected_threads = thread_report.get("placement", {}).get("threads") or selected_threads
+            thread_refinement = {
+                "status": "measured",
+                "selected_threads": selected_threads,
+                "thread_sweep": thread_report.get("thread_sweep", []),
+            }
+    selected_plan = {
+        "gpu_layers": selected["gpu_layers"],
+        "cpu_moe": selected["cpu_moe_layers"] is not None,
+        "n_cpu_moe_layers": selected["cpu_moe_layers"],
+        "batch_size": selected["batch_size"],
+        "ubatch_size": selected["ubatch_size"],
+        "threads": selected_threads,
+        "cache_type_k": config.get("cache_type_k", "q8_0"),
+        "cache_type_v": config.get("cache_type_v", "q8_0"),
+    }
+    profile["schema_version"] = PROFILE_SCHEMA
+    profile["tuning"] = {
+        "status": "measured",
+        "model_identity": model_identity(model_info),
+        "hardware_identity": hardware_identity(gpu),
+        "engine_identity": engine_identity((state.LLAMA_CPP_DIR,)),
+        "context_size": config["context_size"],
+        "minimum_free_vram_mib": selected["estimated_required_free_vram_mib"],
+        "selected_plan": selected_plan,
+        "objective": "balanced",
+        "thread_refinement": thread_refinement,
+        "candidates": results,
+    }
+    profile["benchmark"] = {
+        "status": "measured",
+        "prompt_tokens_per_second": selected["prompt_tokens_per_second"],
+        "decode_tokens_per_second": selected["decode_tokens_per_second"],
+        "release_speed_floor_passed": selected["decode_tokens_per_second"] >= 10.0,
+        "quality_gate": "same_artifact_placement_only",
+        "selected_placement": selected_plan,
+    }
+    target = _persist_auto_profile(profile, model_info, gpu)
+    config.update(selected_plan)
+    config["predicted_decode_tps"] = selected["decode_tokens_per_second"]
+    config["prediction_confidence"] = "measured"
+    config["tuning_profile_applied"] = True
+    config["tuning_profile_reason"] = "auto-tuned at launch"
+    config["measured_prompt_tps"] = selected["prompt_tokens_per_second"]
+    config["measured_decode_tps"] = selected["decode_tokens_per_second"]
+    persisted = f"; profile: {target}" if target else ""
+    print(
+        ui.kv(
+            "Auto-tuned",
+            f"{selected['decode_tokens_per_second']} decode / {selected['prompt_tokens_per_second']} prompt tok/s"
+            f"{persisted}",
+        ),
+        file=out,
+    )
+    return config
+
+
 def cmd_optimize(args):
     """Create an explainable hardware/model plan and optionally measure it."""
     model_arg = args.model or os.environ.get("KESTREL_MODEL") or state.USER_CONFIG.default_model
     gpu = probes.detect_gpu()
     storage_path = Path(args.storage_path or ".").expanduser().resolve()
     profile = _build_optimize_profile(args, model_arg, gpu, storage_path)
-    target = Path(args.output).expanduser() if args.output else config_path().with_name("hardware-profile.json")
+    if args.output:
+        target = Path(args.output).expanduser()
+    elif model_arg:
+        resolved_for_profile = model_source.detect_model(model_arg)
+        target = (
+            profile_path_for(resolved_for_profile, gpu)
+            if resolved_for_profile and resolved_for_profile.get("type") == "gguf" and resolved_for_profile.get("path")
+            else config_path().with_name("hardware-profile.json")
+        )
+    else:
+        target = config_path().with_name("hardware-profile.json")
     profile["benchmark"] = {"status": "not_run"}
     if args.benchmark:
         _run_optimize_benchmark(profile, model_arg, target, args)
@@ -219,6 +677,8 @@ def _validate_benchmark_rows(rows) -> list[dict]:
 def _validate_benchmark_args(args) -> None:
     for name in ("prompt_tokens", "generate_tokens", "repetitions", "ctx_size", "batch_size", "ubatch_size"):
         value = getattr(args, name)
+        if name in {"batch_size", "ubatch_size"} and value is None:
+            continue
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise InputError(f"--{name.replace('_', '-')} must be a positive integer")
 
@@ -352,7 +812,16 @@ def cmd_benchmark(args):
         moe_cold_model=None,
     )
     config = planning.estimate_config(model_info, gpu, plan_args)
+    requested_cpu_moe_layers = getattr(args, "cpu_moe_layers", None)
+    if requested_cpu_moe_layers is not None:
+        if requested_cpu_moe_layers > config["n_layers"]:
+            raise InputError("--cpu-moe-layers cannot exceed the model layer count")
+        config["cpu_moe"] = requested_cpu_moe_layers > 0
+        config["n_cpu_moe_layers"] = requested_cpu_moe_layers
     threads = args.threads or config["threads"] or max(1, (os.cpu_count() or 2) - 2)
+    batch_size = args.batch_size or config["batch_size"]
+    ubatch_size = args.ubatch_size or config["ubatch_size"]
+    kv_cache_type = args.kv_cache_type or config["cache_type_k"]
     if (
         isinstance(threads, bool)
         or (isinstance(threads, int) and threads <= 0)
@@ -361,6 +830,14 @@ def cmd_benchmark(args):
         raise InputError("--threads must be a positive integer or comma-separated positive integers")
     planned_gpu_layers = str(config["gpu_layers"])
     bench_gpu_layers = "99" if planned_gpu_layers in {"auto", "all"} else planned_gpu_layers
+    # llama-bench lags llama-cli/server on some flags: emit --threads-batch only
+    # when this build's llama-bench actually exposes it, so an older engine
+    # still benchmarks instead of failing on an unknown option. A failed probe
+    # (missing binary, older build) degrades to the legacy flag set.
+    try:
+        bench_caps = _load_capabilities(binary, refresh=False)
+    except (BackendError, OSError):
+        bench_caps = None
     command = [
         binary,
         "-m",
@@ -375,34 +852,46 @@ def cmd_benchmark(args):
         bench_gpu_layers,
         "-t",
         str(threads),
+    ]
+    if bench_caps is not None and bench_caps.supports("--threads-batch"):
+        command += ["-tb", str(config.get("threads_batch") or threads)]
+    command += [
         "-b",
-        str(args.batch_size),
+        str(batch_size),
         "-ub",
-        str(args.ubatch_size),
+        str(ubatch_size),
         "-fa",
         "on",
         "-ctk",
-        args.kv_cache_type,
+        kv_cache_type,
         "-ctv",
-        args.kv_cache_type,
+        kv_cache_type,
         "-o",
         "json",
     ]
     if planned_gpu_layers == "auto":
         command.extend(["-fitt", str(config["fit_target_mib"])])
-    if config["cpu_moe"]:
+    if config.get("n_cpu_moe_layers") is not None:
+        command.extend(["-ncmoe", str(config["n_cpu_moe_layers"])])
+    elif config["cpu_moe"]:
         command.extend(["-ncmoe", str(config["n_layers"])])
-    print("Benchmarking the exact configured placement...", file=sys.stderr)
+    if not getattr(args, "quiet", False):
+        print("Benchmarking the exact configured placement...", file=sys.stderr)
     bench_timeout = 30 * 60 * max(1, args.repetitions or 1)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=bench_timeout)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        peak_vram_mib = _poll_peak_vram(process, bench_timeout)
+        stdout, stderr = process.communicate(timeout=max(1, bench_timeout))
     except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.communicate()
         raise ServiceError(
             f"llama-bench exceeded its time budget ({bench_timeout}s)",
             hint="reduce --repetitions or the token counts",
         ) from exc
     except OSError as exc:
         raise BackendError(f"could not launch llama-bench: {exc}") from exc
+    result = argparse.Namespace(returncode=process.returncode, stdout=stdout, stderr=stderr)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout)[-3000:]
         raise BackendError(f"llama-bench failed ({result.returncode}):\n{detail}")
@@ -422,15 +911,16 @@ def cmd_benchmark(args):
             "cpu_moe": config["cpu_moe"],
             "threads": decode.get("n_threads") if decode else threads,
             "requested_threads": threads,
-            "batch_size": args.batch_size,
-            "ubatch_size": args.ubatch_size,
-            "kv_cache_type": args.kv_cache_type,
+            "batch_size": batch_size,
+            "ubatch_size": ubatch_size,
+            "kv_cache_type": kv_cache_type,
         },
         "prompt_tokens_per_second": prompt.get("avg_ts") if prompt else None,
         "decode_tokens_per_second": decode.get("avg_ts") if decode else None,
         "release_speed_floor_passed": bool(decode and decode.get("avg_ts", 0) >= 10),
         "quality_gate": "not_run",
         "thread_sweep": thread_sweep,
+        "peak_vram_mib": peak_vram_mib,
         "raw": rows,
     }
     encoded = json.dumps(report, indent=2)

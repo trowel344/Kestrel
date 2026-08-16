@@ -31,6 +31,16 @@ def test_lower_memory_command_stops_when_nothing_can_change():
     assert _lower_memory_command(["llama-cli"]) is None
 
 
+def test_lower_memory_command_moves_partial_experts_back_to_cpu():
+    retry = _lower_memory_command(
+        ["llama-cli", "-ngl", "54", "--n-cpu-moe", "45", "-ub", "256", "--fit-target", "1473"]
+    )
+    assert retry == (
+        ["llama-cli", "-ngl", "54", "--n-cpu-moe", "49", "-ub", "128", "--fit-target", "1985"],
+        ["micro-batch 128", "CPU experts through layer 49", "a larger VRAM margin"],
+    )
+
+
 def test_lower_memory_command_adjusts_effective_last_duplicate():
     retry = _lower_memory_command(
         ["llama-cli", "-ub", "128", "--fit-target", "1024", "-ub", "64", "--fit-target", "2048"]

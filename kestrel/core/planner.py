@@ -72,6 +72,9 @@ class ModelProfile:
     expert_ff_size: int
     has_mtp: bool
     file_size_bytes: int = 0
+    # GGUF `general.file_type` id (0 when unknown/not a GGUF). Used to anchor
+    # the parameter estimate against the file's own size; see estimate_parameters.
+    file_type: int = 0
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,7 @@ class RuntimePlan:
     fit: bool = True
     fit_target_mib: int = 1024
     cpu_moe: bool = False
+    n_cpu_moe_layers: int | None = None
     context_size: int = 2048
     batch_size: int = 512
     ubatch_size: int = 128
@@ -90,6 +94,11 @@ class RuntimePlan:
     moe_cache_budget_mib: int = 0
     mmap: bool = True
     threads: int = 0
+    # Dedicated CPU thread budget for prompt processing (--threads-batch).
+    # 0 means "reuse the decode thread count"; when CPU-MoE is active the
+    # planner raises it to the full logical core count because prefill is
+    # heavily parallel CPU work for the layers that stay resident.
+    threads_batch: int = 0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -109,12 +118,54 @@ def gpu_bandwidth_gb_s(name: str | None) -> float:
     return DEFAULT_GPU_BANDWIDTH_GB_S
 
 
+# Nominal bits per weight for GGUF `general.file_type` ids (llama.cpp ggml
+# block types). Missing ids (e.g. unquantized/converted files that omit or
+# write -1) simply disable the file-size anchor below.
+FILE_TYPE_BITS = {
+    0: 32.0,  # F32
+    1: 16.0,  # F16
+    2: 4.5625,  # Q4_0
+    3: 5.5625,  # Q4_1
+    5: 4.5625,  # Q4_2
+    6: 5.5625,  # Q4_3
+    7: 8.5,  # Q8_0
+    8: 5.5625,  # Q5_0
+    9: 6.5625,  # Q5_1
+    11: 9.5,  # Q8_1
+    12: 3.1875,  # Q2_K
+    13: 4.15625,  # Q3_K
+    14: 5.4375,  # Q4_K
+    15: 6.4375,  # Q5_K
+    16: 7.4375,  # Q6_K
+    17: 9.125,  # Q8_K
+    18: 2.0625,  # IQ2_XXS
+    19: 2.3125,  # IQ2_XS
+    20: 2.4375,  # IQ3_XXS
+    21: 1.5625,  # IQ1_S
+    22: 4.5,  # IQ4_NL
+    23: 3.4375,  # IQ3_S
+    24: 2.5,  # IQ2_S
+    30: 4.25,  # IQ4_XS
+    31: 1.75,  # IQ1_M
+    32: 8.0,  # I8
+}
+
+
 def estimate_parameters(model: ModelProfile) -> dict:
     """Approximate dense and MoE parameter counts from the architecture.
 
     Dense per layer uses the four attention projections; each expert is the
     three (up/gate/down) hidden<->FF matrices. Exact counts vary by backend,
     so this is a close, explainable estimate used only for rate prediction.
+
+    When ``general.file_type`` is known, the FFN slice is rescaled so the
+    estimated total matches the file's own size. Some hybrid-MoE conversions
+    (e.g. a 30B-A3B class model) advertise a ``feed_forward_length`` that does
+    not correspond to the tensor payloads -- only a fraction of the layers
+    carry experts -- which would otherwise inflate the total to a multi-TB
+    phantom and make every prediction absurdly slow. The active set is scaled
+    the same way so the routed-expert working set stays consistent with the
+    file.
     """
     attention_per_layer = 4 * model.hidden_size * model.hidden_size
     expert_params = 3 * model.hidden_size * model.expert_ff_size
@@ -125,6 +176,20 @@ def estimate_parameters(model: ModelProfile) -> dict:
     dense_per_layer = attention_per_layer + dense_ffn_per_layer
     total = model.n_layers * (dense_per_layer + model.n_experts * expert_params)
     active = model.n_layers * (dense_per_layer + model.n_experts_used * expert_params)
+    bits = FILE_TYPE_BITS.get(model.file_type)
+    if bits and model.file_size_bytes > 0:
+        anchor = model.file_size_bytes * 8 / bits
+        dense_total = model.n_layers * dense_per_layer
+        ffn_total = total - dense_total
+        if ffn_total > 0 and dense_total < anchor:
+            scale = (anchor - dense_total) / ffn_total
+            # Within ~30% the advertised structure is credible; outside it the
+            # metadata is almost certainly inconsistent with the payload, so
+            # rescale the FFN slice (and thus both totals) to the file.
+            if not 0.7 <= scale <= 1.4:
+                expert_params = expert_params * scale
+                total = model.n_layers * (dense_per_layer + model.n_experts * expert_params)
+                active = model.n_layers * (dense_per_layer + model.n_experts_used * expert_params)
     return {
         "dense_per_layer": dense_per_layer,
         "expert_params": expert_params,
@@ -232,19 +297,25 @@ def plan_runtime(
     model_is_larger_than_vram = bool(model.file_size_bytes and model.file_size_bytes > usable_vram_bytes)
     cpu_moe = model_is_larger_than_vram if requested_cpu_moe is None else requested_cpu_moe
     threads = _tune_threads(cpu_moe, hardware.logical_cpu_count)
+    threads_batch = _tune_threads_batch(cpu_moe, hardware.logical_cpu_count)
 
-    verified = _is_qwen35_122b_a10b(model)
+    full_dense_fit = _can_full_dense_offload(
+        model,
+        hardware,
+        cpu_moe=cpu_moe,
+        fit_target_mib=fit_target,
+    )
     batch_size, ubatch_size = _select_batch_sizes(
         total_vram,
         cpu_moe=cpu_moe,
-        verified=verified,
+        verified=full_dense_fit,
     )
     gpu_layers = _resolve_verified_placement(
         requested_gpu_layers,
         cpu_moe=cpu_moe,
         n_experts=model.n_experts,
         total_vram=total_vram,
-        verified=verified,
+        verified=full_dense_fit,
         n_layers=model.n_layers,
     )
     moe_cache, moe_cache_budget_mib = _select_moe_cache(cpu_moe, model.n_experts)
@@ -255,6 +326,7 @@ def plan_runtime(
             fit=True,
             fit_target_mib=fit_target,
             cpu_moe=cpu_moe and model.n_experts > 0,
+            n_cpu_moe_layers=None,
             context_size=max(512, context_size),
             batch_size=batch_size,
             ubatch_size=ubatch_size,
@@ -268,6 +340,7 @@ def plan_runtime(
             moe_cache_budget_mib=moe_cache_budget_mib,
             mmap=True,
             threads=threads,
+            threads_batch=threads_batch,
         ),
         mode=mode,
         model=model,
@@ -292,14 +365,41 @@ def _tune_threads(cpu_moe: bool, logical_cpu_count: int) -> int:
     return min(14, max(1, logical_cpu_count - 2))
 
 
-def _is_qwen35_122b_a10b(model: ModelProfile) -> bool:
-    return (
-        model.n_layers == 48
-        and model.n_experts == 256
-        and model.n_experts_used == 8
-        and model.hidden_size == 3072
-        and model.expert_ff_size == 1024
-    )
+def _tune_threads_batch(cpu_moe: bool, logical_cpu_count: int) -> int:
+    """Dedicated prompt-processing thread budget for CPU-MoE plans.
+
+    Prefill over the CPU-resident layers is a parallel GEMM/dequant workload
+    that saturates more threads than memory-bound decode. Capped at 16 to avoid
+    oversubscribing hybrid parts, and 0 (reuse decode threads) when no CPU work
+    is expected or the CPU count is unknown.
+    """
+    if not cpu_moe or not logical_cpu_count:
+        return 0
+    return min(16, max(1, logical_cpu_count))
+
+
+def _can_full_dense_offload(
+    model: ModelProfile,
+    hardware: HardwareProfile,
+    *,
+    cpu_moe: bool,
+    fit_target_mib: int,
+) -> bool:
+    """Conservatively estimate whether every non-expert layer fits on GPU.
+
+    This is deliberately architecture-generic. The estimate uses Q4 density
+    even when the whole-file density appears lower (grouped MoE metadata can
+    make parameter estimates misleading), doubles the attention footprint for
+    unmodelled routers/shared/SSM tensors, and reserves another GiB for graphs.
+    Aggressive expert and micro-batch placement belongs to measured profiles.
+    """
+    if not cpu_moe or model.n_experts <= 0 or not hardware.vram_free_mib:
+        return False
+    params = estimate_parameters(model)
+    dense_bytes = model.n_layers * params["dense_per_layer"] * max(BYTES_PER_PARAM["q4_k"], 0.6)
+    conservative_dense_mib = (dense_bytes * 2.0) / MIB
+    available = hardware.vram_free_mib - fit_target_mib - 1024
+    return available > 0 and conservative_dense_mib <= available
 
 
 def _select_batch_sizes(
@@ -338,16 +438,15 @@ def _resolve_verified_placement(
     if not (requested_gpu_layers == "auto" and cpu_moe and n_experts > 0 and total_vram and total_vram <= 8192):
         return requested_gpu_layers
     # llama.cpp's fitter currently accounts poorly for some mixed
-    # CPU-MoE/CUDA layouts. Use the measured Qwen3.5-122B-A10B placement;
-    # retain the conservative four-layer fallback for unknown MoE shapes.
+    # CPU-MoE/CUDA layouts. Use a full dense-layer placement when the generic
+    # conservative footprint estimate fits; retain the four-layer fallback
+    # when it does not.
     # Dense models are left to llama.cpp's own fitter so they offload as
     # many layers as fit instead of being pinned to four CPU layers.
     if verified:
-        # 49 requests all 48 transformer blocks plus the output tensor. A real
-        # 38.67 GiB Q2-expert/Q4-dense artifact used 3.94 GiB VRAM on the
-        # reference RTX 4060 Laptop and improved decode from 3.28 to 6.25 t/s.
-        # Runtime --fit remains enabled and can lower this if other VRAM users
-        # or a larger context consume the remaining safety margin.
+        # n_layers + 1 requests every transformer block plus the output tensor.
+        # Partial expert placement and larger prefill batches are never guessed
+        # here; adaptive tuning must measure and persist those overrides.
         return str(max(0, n_layers) + 1)
     return str(min(4, max(0, n_layers)))
 

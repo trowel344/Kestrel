@@ -6,6 +6,133 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- The Settings tab of the `kestrel menu` now also manages KV cache type,
+  Turbo KV, GPU layers, and CPU MoE. These live in `config.toml`
+  (`kv_cache_type` auto/f16/bf16/q8_0/q4_0/q4_1, `kv_cache_turbo` bool,
+  `gpu_layers` auto/all/count, `cpu_moe` auto/on/off) and are applied by
+  `chat`, `run`, `serve`, and the managed agent server: `auto` keeps the
+  tuned placement profile (measured ~23 tok/s on the 8 GiB target), while an
+  explicit value overrides it. `kestrel settings` gained `--kv-cache-type`,
+  `--turbo-kv`/`--no-turbo-kv`, `--gpu-layers`, and `--cpu-moe`.
+- `kestrel agents start` and `kestrel agents launch` now accept `--gpu-layers`
+  and `--cpu-moe`, forwarding explicit layer placement to the managed
+  llama-server (mirroring `kestrel serve`). This gives an escape hatch on GPUs
+  where the tuned aggressive split can exhaust VRAM during real decode: e.g.
+  an 8 GiB card with a 30B-A3B model OOMs during agentic generation at the
+  tuned placement but runs stably with `--cpu-moe on` (experts on CPU).
+  The override is threaded through the managed server, its reuse check, and the
+  loopback proxy child command, and is surfaced in `agents status`/`start`
+  output.
+- Fixed `kestrel benchmark` failing on engine builds whose `llama-bench` does
+  not expose `--threads-batch`: the flag is now capability-gated, so older
+  engines benchmark with the legacy flag set instead of erroring on an unknown
+  option.
+- A measured tuning profile now keeps its placement when the requested context
+  is larger than the tuned context instead of being discarded. The prefill
+  micro-batch is bounded to the conservative small-VRAM tier and the runtime
+  plan warns that the KV cache grows beyond the measured footprint, while the
+  measured decode/prompt rates still replace the analytic estimate. This fixes
+  an unprofiled-style fallback (e.g. `n_cpu_moe_layers=None`, batch 256/64, and
+  a wildly pessimistic Tok/s prediction) appearing for users whose default
+  context exceeds the tuned size.
+- Parameter estimates for GGUF files now anchor the total against the file's
+  own size via the declared `general.file_type` quant. Hybrid-MoE conversions
+  (e.g. a 30B-A3B class model) whose advertised `feed_forward_length` does not
+  match the tensor payloads previously inflated the estimate to a multi-TB
+  phantom and produced absurdly slow analytic predictions; the active/total
+  set is rescaled to the file instead. The planner metadata reader now recovers
+  `general.file_type` even when a producer emits it after the tokenizer
+  section (bounded resume scan), and the on-disk metadata cache was bumped so
+  stale entries are rebuilt.
+- The auto-tune scan measures each candidate with a longer decode window and
+  two repetitions (128 prompt / 64 generated) for a more stable selection, and
+  probes one-eighth, one-quarter, and one-third GPU-expert slices toward the
+  VRAM ceiling.
+- The preflight VRAM estimate no longer skips aggressive GPU-expert candidates
+  that a coarse formula would reject: candidates within 1.5x of free VRAM are
+  measured and llama-bench records any OOM as evidence. Each measured candidate
+  now records its *sampled peak* VRAM (nvidia-smi polled while llama-bench runs)
+  so the persisted `minimum_free_vram_mib` gate reflects the real footprint
+  instead of the conservative estimate. This lets the search find the fastest
+  placement that actually fits (e.g. the 30B-A3B class model on an 8 GiB card
+  jumped from 15.1 to ~23.2 tok/s decode by moving 18 of 53 layers' experts to
+  the GPU, right at the 7.8 GiB VRAM ceiling).
+- Fixed `kestrel optimize --benchmark` unpacking `_select_context_size`, which
+  now returns an extra `overcommitted` flag; the flag is folded into the plan.
+- KV-cache sizing for GGUF models now counts only the layers that actually
+  allocate K/V. Hybrid-attention architectures (interleaved full-attention,
+  SSM/linear-attention, and FFN-only layers, e.g. `nemotron_h_moe`) were sized
+  as if every layer stored KV, which over-estimated the cache by the full layer
+  count (for a 30B-A3B class model the 32K-context KV estimate dropped from
+  ~9.8 GiB to ~0.12 GiB). The metadata reader scans the tensor-info section for
+  `blk.*.attn_k.weight` tensors to count KV-bearing layers and their value dim,
+  cached on disk (schema bumped), so context selection and the 
+  `context_scaled` footprint are no longer wildly conservative for hybrid
+  models.
+- `kestrel serve` gained `--ctx-checkpoints N` (default 0) which passes
+  llama-server `--ctx-checkpoints`, keeping per-slot KV state restorable across
+  context truncation. Combined with `--cache-reuse` this lets long coding
+  sessions reuse a cached prefix after the ring buffer wraps instead of forcing
+  a full re-prefill; the flag is capability-gated per engine build.
+- Added an opt-in TurboQuant KV cache switch: `local.kv_cache_turbo = true` in
+  the config and `--turbo-kv` on `run`/`chat`/`serve`. It passes llama.cpp's
+  `--turbo-kv` (random orthogonal rotation before low-bit K/V quantization)
+  for higher KV compression, and is silently skipped until the selected engine
+  exposes the flag. TurboQuant is still an open upstream PR rather than merged
+  llama.cpp, so the switch is inert on stock builds and activates automatically
+  once a turbo-capable engine (or a forked build) is installed.
+- `kestrel run`/`serve` now auto-tune on first launch of a model that has no
+  measured tuning profile: a bounded llama-bench scan measures candidate
+  placements, persists the fastest safe profile, and this very launch uses it
+  with the measured decode/prompt rates replacing the analytic Tok/s estimate.
+  Pass `--no-auto-tune` to keep the conservative planner defaults. Existing
+  measured profiles also now feed the plan: `predicted_decode_tps` becomes the
+  profile's measured rate (`prediction_confidence: "measured"`).
+- `kestrel serve` now enables llama-server KV chunk reuse (`--cache-reuse 256`)
+  by default so multi-turn chat and coding-agent requests reuse a matching
+  cached prefix instead of re-processing the full system prompt and tool schema
+  every turn. The chunk size is configurable with `--cache-reuse N` and
+  `--cache-reuse 0` disables it; the flag is skipped when the engine build does
+  not expose it.
+- CPU-MoE plans now use a dedicated prompt-processing thread budget
+  (`--threads-batch`, up to all logical cores) separate from the tuned decode
+  thread count, speeding up prefill over the CPU-resident layers. An explicit
+  `--threads-batch N` override is available on `run`/`chat`/`serve`, and the
+  runtime plan reports the prompt-thread count.
+- Added opt-in Sun Map persistence to `kestrel agents start/launch --sunmap`.
+  The loopback proxy compiles bounded memory into Responses, Chat Completions,
+  and Anthropic Messages requests, observes completed assistant output without
+  buffering live streams, deduplicates replayed messages, and excludes raw
+  tool output from privileged persistent memory. Compiled context remains
+  stable during a tool loop and refreshes after its terminal response.
+- Sun Map mode now adds a durable task checkpoint, deterministic tool-event
+  reducer, repetition and protected-file supervision, provenance/staleness
+  tracking, and a separate hash-versioned current-code index. Client-reported
+  passes stop at `ready_for_verification`; only an independent gate can mark a
+  task complete.
+- Long-horizon injection is now query- and token-aware: compact checkpoint
+  projections omit repeated objectives and irrelevant fields, code evidence
+  uses focused non-overlapping windows, stale replayed user turns no longer
+  broaden retrieval, and status exposes estimated tokens by evidence channel.
+- Added mode-0600 redacted trajectory recording and direct Sun Map replay.
+  Runtime allocation returns unused code capacity to semantic memory,
+  suppresses noisy history for explicit checkpoint questions, and can use the
+  llama.cpp tokenizer route with a bounded fallback. Ollama reasoning settings
+  now forward through `reasoning_effort`, including `none` for off.
+- Exact user-mandated verification commands are now durable task-contract
+  state. Divergent gates create warnings, and repeated no-progress failures
+  produce a strong bounded recovery directive for small local models.
+- Managed agent servers now accept `ollama://MODEL` for authenticated,
+  memory-aware Chat Completions proxying. Kestrel never forwards its private
+  credential to Ollama and does not claim unsupported Responses or Anthropic
+  routes. Startup preloads the selected model before reporting readiness and
+  rejects Ollama aliases whose configured `num_ctx` is smaller than Kestrel's
+  advertised agent context.
+- Managed llama.cpp coding-agent servers use one inference slot so the full
+  configured context is not divided across idle slots. Cancelled downstream
+  streams are also handled as normal disconnects instead of emitting noisy
+  secondary proxy errors.
+
 - Added persistent model settings for context size and reasoning level. They
   are visible from the top-level **Settings** screen, `kestrel settings`, and
   per-launch `--ctx-size` / `--reasoning` overrides; explicit reasoning levels

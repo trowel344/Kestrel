@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import struct
 from pathlib import Path
 from typing import BinaryIO
@@ -107,6 +108,10 @@ def _seek_checked(handle: BinaryIO, offset: int) -> None:
 # identity (mtime + size) keeps stale reads out after the file changes.
 _planner_metadata_cache: tuple[tuple[str, int, int], dict] | None = None
 
+# Bump when the planner metadata shape changes so stale on-disk entries are
+# rebuilt instead of being served without the new fields (e.g. file_type).
+PLANNER_CACHE_SCHEMA = 3
+
 
 def _planner_cache_dir() -> Path:
     override = os.environ.get("KESTREL_CACHE_DIR")
@@ -125,7 +130,11 @@ def _planner_cache_read(path: Path, size: int, mtime_ns: int) -> dict | None:
     try:
         cache_file = _planner_cache_path(path)
         data = json.loads(cache_file.read_text())
-        if data.get("file_size") == size and data.get("file_mtime_ns") == mtime_ns:
+        if (
+            data.get("schema") == PLANNER_CACHE_SCHEMA
+            and data.get("file_size") == size
+            and data.get("file_mtime_ns") == mtime_ns
+        ):
             metadata = data.get("metadata")
             return metadata if isinstance(metadata, dict) else None
     except (OSError, ValueError, TypeError):
@@ -141,6 +150,7 @@ def _planner_cache_write(path: Path, size: int, mtime_ns: int, metadata: dict) -
             _planner_cache_path(path),
             json.dumps(
                 {
+                    "schema": PLANNER_CACHE_SCHEMA,
                     "file_size": size,
                     "file_mtime_ns": mtime_ns,
                     "metadata": metadata,
@@ -236,16 +246,7 @@ def _read_planner_metadata_unwrapped(path: Path) -> dict:
                 f"unreasonable GGUF metadata count {kv_count} (>10M)",
                 hint="a corrupt header claimed an implausible number of KVs",
             )
-        for _ in range(kv_count):
-            key = _string(handle, endian)
-            value_type = _unpack(handle, endian, "I")
-            required = {"architecture", "n_layer", "hidden"}
-            if (
-                key.startswith("tokenizer.")
-                and required.issubset(values)
-                and ("n_ff" in values or "n_ff_fallback" in values)
-            ):
-                break
+        def consume(key: str, value_type: int) -> None:
             value = _value(handle, endian, value_type)
             if key == "general.architecture":
                 values["architecture"] = value
@@ -254,7 +255,10 @@ def _read_planner_metadata_unwrapped(path: Path) -> dict:
                     for suffix, output_key in wanted_suffixes.items():
                         if full_name == f"{value}.{suffix}" and output_key not in values:
                             values[output_key] = orphan
-                continue
+                return
+            if key == "general.file_type" and isinstance(value, int):
+                values["file_type"] = value
+                return
             normalized = key.rsplit(".", 1)
             if len(normalized) != 2 or normalized[1] not in wanted_suffixes:
                 parent, _, leaf = key.rpartition(".")
@@ -267,7 +271,7 @@ def _read_planner_metadata_unwrapped(path: Path) -> dict:
                             values[output_key] = value
                     elif not architecture:
                         orphans[key] = value
-                continue
+                return
             output_key = wanted_suffixes[normalized[1]]
             architecture = values.get("architecture")
             if architecture and key == f"{architecture}.{normalized[1]}":
@@ -278,6 +282,62 @@ def _read_planner_metadata_unwrapped(path: Path) -> dict:
                 # if it matches the declared model architecture. This is
                 # blocked so a producer listing architecture late still works.
                 orphans[key] = value
+
+        required = {"architecture", "n_layer", "hidden"}
+        consumed = 0
+        for index in range(kv_count):
+            key = _string(handle, endian)
+            value_type = _unpack(handle, endian, "I")
+            consumed += 1
+            if (
+                key.startswith("tokenizer.")
+                and required.issubset(values)
+                and ("n_ff" in values or "n_ff_fallback" in values)
+            ):
+                if "file_type" in values:
+                    consume(key, value_type)
+                    break
+                # A few producers (notably llama.cpp's quantizer) write
+                # general.file_type after the tokenizer section. Consume the
+                # key we stopped at, then resume reading only until that
+                # scalar appears so the fast path stays untouched for the
+                # common ordering.
+                consume(key, value_type)
+                for _resume_index in range(index + 1, kv_count):
+                    key = _string(handle, endian)
+                    value_type = _unpack(handle, endian, "I")
+                    consumed += 1
+                    consume(key, value_type)
+                    if "file_type" in values:
+                        break
+                break
+            consume(key, value_type)
+        # The fast path may have stopped at the tokenizer section before
+        # consuming every KV entry; drain the remainder so the handle lands
+        # exactly on the tensor-info section below.
+        for _drain in range(consumed, kv_count):
+            key = _string(handle, endian)
+            value_type = _unpack(handle, endian, "I")
+            consume(key, value_type)
+        # Hybrid-attention architectures (interleaved full attention + SSM/
+        # linear-attention layers) only store KV state for the full-attention
+        # layers; sizing the cache by n_layer over-counts them badly. Count
+        # the tensors that actually allocate K/V so the planner's KV estimate
+        # reflects the real footprint.
+        kv_layers = 0
+        kv_values_per_token = 0
+        n_tensors = 0
+        for _tensor in range(tensor_count):
+            name = _string(handle, endian)
+            n_dims = _unpack(handle, endian, "I")
+            dims = tuple(_unpack(handle, endian, "Q") for _ in range(n_dims))
+            _unpack(handle, endian, "I")  # ggml tensor type
+            _unpack(handle, endian, "Q")  # tensor data offset
+            n_tensors += 1
+            if re.fullmatch(r"blk\.\d+\.attn_k\.weight", name) and len(dims) == 2:
+                kv_layers += 1
+                if kv_values_per_token == 0:
+                    kv_values_per_token = dims[1]
     return {
         "architecture": str(values.get("architecture") or "unknown"),
         "n_layer": int(values.get("n_layer") or 0),
@@ -289,5 +349,9 @@ def _read_planner_metadata_unwrapped(path: Path) -> dict:
         "n_heads": int(values.get("n_heads") or 0),
         "n_kv_heads": int(values.get("n_kv_heads") or 0),
         "head_dim": int(values.get("head_dim") or 0),
+        "file_type": int(values.get("file_type") or 0),
+        "kv_layers": int(kv_layers),
+        "kv_values_per_token": int(kv_values_per_token),
+        "n_tensors": int(n_tensors),
         "gguf_version": version,
     }

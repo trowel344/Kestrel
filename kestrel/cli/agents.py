@@ -6,11 +6,13 @@ import os
 import shutil
 import subprocess
 from dataclasses import asdict
+from pathlib import Path
+from urllib.parse import urlsplit
 
 from .. import agent_service, integrations, ui
 from ..config import load_config
 from ..errors import InputError, IntegrationError
-from . import parser, runtime
+from . import parser, probes, runtime, telemetry
 
 _CLIENTS = ("pi", "omp", "codex", "claude", "opencode")
 _BINARIES = {"pi": "pi", "omp": "omp", "codex": "codex", "claude": "claude", "opencode": "opencode"}
@@ -61,6 +63,37 @@ def _default_model(args) -> str:
     if getattr(args, "model", None):
         return args.model
     return parser._default_model(args, error="Error: no model selected. Pass a model or configure a default.")
+
+
+def _split_overrides(args) -> dict[str, str]:
+    """Explicit layer-placement knobs passed through to the managed server."""
+
+    config = load_config()
+    gpu_layers = getattr(args, "gpu_layers", "auto")
+    cpu_moe = getattr(args, "cpu_moe", "auto")
+    return {
+        "gpu_layers": gpu_layers if gpu_layers != "auto" else getattr(config, "gpu_layers", "auto"),
+        "cpu_moe": cpu_moe if cpu_moe != "auto" else getattr(config, "cpu_moe", "auto"),
+    }
+
+
+def _sunmap_settings(args) -> tuple[str | None, int]:
+    tokens = getattr(args, "sunmap_tokens", 4096)
+    if tokens < 512:
+        raise InputError("Sun Map token budget must be at least 512")
+    custom = getattr(args, "sunmap_db", None)
+    enabled = bool(getattr(args, "sunmap", False) or custom)
+    return (
+        (str(Path(custom).expanduser()) if custom else str(agent_service.sunmap_path(Path.cwd()))) if enabled else None,
+        tokens,
+    )
+
+
+def _sunmap_trace(args) -> str | None:
+    value = getattr(args, "sunmap_trace", None)
+    if value and not (getattr(args, "sunmap", False) or getattr(args, "sunmap_db", None)):
+        raise InputError("--sunmap-trace requires --sunmap or --sunmap-db")
+    return str(Path(value).expanduser()) if value else None
 
 
 def _metadata_payload(metadata) -> dict[str, object]:
@@ -163,6 +196,8 @@ def _cmd_remove(args):
 
 def _cmd_start(args):
     context, reasoning = _settings(args)
+    sunmap_db, sunmap_tokens = _sunmap_settings(args)
+    sunmap_trace = _sunmap_trace(args)
     result = agent_service.start_server(
         _default_model(args),
         alias=args.alias,
@@ -170,6 +205,10 @@ def _cmd_start(args):
         context=str(context),
         reasoning=reasoning,
         timeout=args.timeout,
+        sunmap_db=sunmap_db,
+        sunmap_tokens=sunmap_tokens,
+        sunmap_trace=sunmap_trace,
+        **_split_overrides(args),
     )
     protocols = agent_service.probe_protocols()
     result["protocols"] = protocols
@@ -258,6 +297,122 @@ def _cmd_doctor(args):
     return runtime._finish_json(args, payload)
 
 
+def _cmd_usage(args):
+    server = agent_service.server_status()
+    pid = server.get("pid")
+    process = _process_usage(pid)
+    tokens_per_second = None
+    if server.get("healthy") and server.get("url"):
+        host, port = _url_host_port(server["url"])
+        tokens_per_second = telemetry._server_tps(host, port)
+    payload = {
+        "action": "usage",
+        "server": server,
+        "process": process,
+        "tokens_per_second": tokens_per_second,
+        "ram": probes._memory_snapshot(),
+        "gpu": probes.detect_gpu(),
+    }
+    if not args.json:
+        print(ui.box("Coding-agent usage", "\n".join(_usage_rows(payload))))
+    return runtime._finish_json(args, payload)
+
+
+def _url_host_port(url: str) -> tuple[str, int]:
+    parsed = urlsplit(url)
+    host = parsed.hostname or "127.0.0.1"
+    return host, parsed.port or 8080
+
+
+def _proc_field(pid: int, key: str) -> str | None:
+    """Read a single field (e.g. ``VmRSS:``) from /proc/<pid>/status."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith(key):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _process_usage(pid: int | None) -> dict:
+    if not pid:
+        return {"available": False}
+    rss_kib = _proc_field(pid, "VmRSS")
+    cpu_percent = None
+    elapsed_seconds = None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "%cpu=,etimes=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.split()
+            cpu_percent = float(parts[0]) if parts else None
+            elapsed_seconds = int(parts[1]) if len(parts) > 1 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    vram_mib = _process_vram_mib(pid)
+    return {
+        "available": True,
+        "pid": pid,
+        "rss_mib": int(rss_kib.split()[0]) // 1024 if rss_kib else None,
+        "cpu_percent": cpu_percent,
+        "vram_mib": vram_mib,
+        "elapsed_seconds": elapsed_seconds,
+    }
+
+
+def _process_vram_mib(pid: int) -> int | None:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split(",")
+        if fields and fields[0].strip() == str(pid) and len(fields) > 1:
+            try:
+                return int(fields[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
+def _usage_rows(payload: dict[str, object]) -> list[str]:
+    server = payload["server"]
+    rows = [ui.kv("Status", server["status"])]
+    if payload["server"].get("running"):
+        rows.append(ui.kv("Model", server.get("alias") or "unknown"))
+        process = payload["process"]
+        if process.get("available"):
+            rows.append(ui.kv("PID", str(process.get("pid"))))
+            if process.get("cpu_percent") is not None:
+                rows.append(ui.kv("CPU", f"{process['cpu_percent']:.1f}%"))
+            if process.get("rss_mib") is not None:
+                rows.append(ui.kv("RAM", f"{process['rss_mib']} MiB"))
+            if process.get("vram_mib") is not None:
+                rows.append(ui.kv("VRAM", f"{process['vram_mib']} MiB"))
+            if process.get("elapsed_seconds") is not None:
+                rows.append(ui.kv("Uptime", f"{process['elapsed_seconds']}s"))
+        tps = payload.get("tokens_per_second")
+        if tps:
+            rows.append(ui.kv("Tokens/s", f"{tps:.1f}"))
+    return rows
+
+
 def _cmd_logs(args):
     content = agent_service.tail_logs(args.lines)
     if args.json:
@@ -270,6 +425,8 @@ def _cmd_launch(args):
     if args.json and not args.dry_run:
         raise InputError("agents launch --json requires --dry-run because an interactive child owns the terminal")
     context, reasoning = _settings(args)
+    sunmap_db, sunmap_tokens = _sunmap_settings(args)
+    sunmap_trace = _sunmap_trace(args)
     model = _default_model(args)
     endpoint = f"http://127.0.0.1:{args.port}"
     if not args.dry_run and shutil.which(_BINARIES[args.client]) is None:
@@ -298,6 +455,13 @@ def _cmd_launch(args):
                 "server_model": model,
                 "client": _metadata_payload(metadata),
                 "command": command,
+                "sunmap": {
+                    "database": sunmap_db,
+                    "token_budget": sunmap_tokens,
+                    "trace": sunmap_trace,
+                }
+                if sunmap_db
+                else None,
             },
         )
     status = agent_service.start_server(
@@ -306,6 +470,10 @@ def _cmd_launch(args):
         port=args.port,
         context=str(context),
         reasoning=reasoning,
+        sunmap_db=sunmap_db,
+        sunmap_tokens=sunmap_tokens,
+        sunmap_trace=sunmap_trace,
+        **_split_overrides(args),
     )
     protocols = agent_service.probe_protocols()
     required = _PROTOCOL[args.client]
@@ -342,6 +510,7 @@ def cmd_agents(args):
         "start": _cmd_start,
         "stop": _cmd_stop,
         "status": _cmd_status,
+        "usage": _cmd_usage,
         "doctor": _cmd_doctor,
         "logs": _cmd_logs,
         "launch": _cmd_launch,

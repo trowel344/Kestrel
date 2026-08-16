@@ -27,6 +27,13 @@ class KestrelConfig:
     llama_cpp_dir: str | None = None
     context_size: int | str = "auto"
     reasoning_level: str = "auto"
+    kv_cache_type: str = "auto"
+    kv_cache_turbo: bool = False
+    gpu_layers: str = "auto"
+    cpu_moe: str = "auto"
+
+
+KV_CACHE_TYPES = ("auto", "f16", "bf16", "q8_0", "q4_0", "q4_1")
 
 
 def config_path() -> Path:
@@ -62,12 +69,37 @@ def load_config(path: str | Path | None = None) -> KestrelConfig:
         raise ConfigError(
             f"invalid Kestrel config {target}: local.reasoning_level must be one of {', '.join(REASONING_LEVELS)}"
         )
+    kv_cache_turbo = local.get("kv_cache_turbo", False)
+    if type(kv_cache_turbo) is not bool:
+        raise ConfigError(f"invalid Kestrel config {target}: local.kv_cache_turbo must be a boolean")
+    kv_cache_type = local.get("kv_cache_type", "auto")
+    if kv_cache_type not in KV_CACHE_TYPES:
+        raise ConfigError(
+            f"invalid Kestrel config {target}: local.kv_cache_type must be one of {', '.join(KV_CACHE_TYPES)}"
+        )
+    gpu_layers = local.get("gpu_layers", "auto")
+    if isinstance(gpu_layers, int):
+        if gpu_layers < 0:
+            raise ConfigError(f"invalid Kestrel config {target}: local.gpu_layers cannot be negative")
+        gpu_layers = str(gpu_layers)
+    elif isinstance(gpu_layers, str):
+        if gpu_layers not in {"auto", "all"} and not gpu_layers.isdigit():
+            raise ConfigError(f"invalid Kestrel config {target}: local.gpu_layers must be 'auto', 'all', or a count")
+    else:
+        raise ConfigError(f"invalid Kestrel config {target}: local.gpu_layers must be 'auto', 'all', or a count")
+    cpu_moe = local.get("cpu_moe", "auto")
+    if cpu_moe not in {"auto", "on", "off"}:
+        raise ConfigError(f"invalid Kestrel config {target}: local.cpu_moe must be 'auto', 'on', or 'off'")
     return KestrelConfig(
         default_model=local.get("default_model"),
         models_dir=local.get("models_dir"),
         llama_cpp_dir=local.get("llama_cpp_dir"),
         context_size=context_size,
         reasoning_level=reasoning_level,
+        kv_cache_type=kv_cache_type,
+        kv_cache_turbo=kv_cache_turbo,
+        gpu_layers=str(gpu_layers),
+        cpu_moe=cpu_moe,
     )
 
 
@@ -86,5 +118,12 @@ def save_config(config: KestrelConfig, path: str | Path | None = None) -> Path:
         + (json.dumps(config.context_size) if config.context_size == "auto" else str(config.context_size))
     )
     lines.append(f"reasoning_level = {json.dumps(config.reasoning_level)}")
+    if config.kv_cache_type != "auto":
+        lines.append(f"kv_cache_type = {json.dumps(config.kv_cache_type)}")
+    lines.append(f"kv_cache_turbo = {json.dumps(config.kv_cache_turbo)}")
+    if config.gpu_layers != "auto":
+        lines.append(f"gpu_layers = {json.dumps(config.gpu_layers)}")
+    if config.cpu_moe != "auto":
+        lines.append(f"cpu_moe = {json.dumps(config.cpu_moe)}")
     write_atomic(target, "\n".join(lines) + "\n")
     return target

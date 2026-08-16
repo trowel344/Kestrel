@@ -8,6 +8,7 @@ unrelated process after a stale PID is reused.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import secrets
@@ -25,6 +26,8 @@ from typing import Any
 
 from .errors import IntegrationError
 from .util import write_atomic
+
+_DEFAULT_OLLAMA_CONTEXT = 4096
 
 
 def _state_root() -> Path:
@@ -47,6 +50,22 @@ def state_path() -> Path:
 
 def log_path() -> Path:
     return _state_root() / "server.log"
+
+
+def sunmap_path(project_dir: str | Path | None = None) -> Path:
+    scope = Path(project_dir or Path.cwd()).expanduser().resolve()
+    digest = hashlib.sha256(str(scope).encode()).hexdigest()[:16]
+    return _state_root() / "sunmap" / f"{scope.name or 'project'}-{digest}.sqlite3"
+
+
+def _require_sunmap() -> None:
+    try:
+        from sunmap import SunMap, TaskCheckpoint, TokenBudget, __version__  # noqa: F401
+    except (ImportError, AttributeError) as exc:
+        raise IntegrationError(
+            "Sun Map memory was requested but sunmap>=0.2 is not installed",
+            hint="install the companion project into Kestrel's environment and retry",
+        ) from exc
 
 
 def credential_path() -> Path:
@@ -242,6 +261,30 @@ def _port_busy(port: int) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _ollama_context(model: str) -> int:
+    try:
+        result = subprocess.run(
+            ["ollama", "show", model, "--modelfile"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise IntegrationError("could not inspect the selected Ollama model", hint=str(exc)) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "ollama show failed"
+        raise IntegrationError(f"could not inspect Ollama model {model}: {detail}")
+    configured = 4096
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].upper() == "PARAMETER" and parts[1] == "num_ctx":
+            try:
+                configured = int(parts[2])
+            except ValueError:
+                raise IntegrationError(f"Ollama model {model} has an invalid num_ctx parameter") from None
+    return configured
+
+
 def _terminate_started_process(proc: subprocess.Popen[Any]) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -271,6 +314,9 @@ def server_status() -> dict[str, Any]:
         "url": state.get("url"),
         "context": state.get("context"),
         "reasoning": state.get("reasoning"),
+        "gpu_layers": state.get("gpu_layers", "auto"),
+        "cpu_moe": state.get("cpu_moe", "auto"),
+        "sunmap": state.get("sunmap"),
         "log": state.get("log"),
     }
 
@@ -283,6 +329,11 @@ def start_server(
     context: str = "auto",
     reasoning: str = "auto",
     timeout: float = 180.0,
+    sunmap_db: str | None = None,
+    sunmap_tokens: int = 4096,
+    sunmap_trace: str | None = None,
+    gpu_layers: str = "auto",
+    cpu_moe: str = "auto",
 ) -> dict[str, Any]:
     """Start a detached authenticated loopback server and wait for readiness."""
 
@@ -293,7 +344,17 @@ def start_server(
         )
     with _lifecycle_lock():
         return _start_server_unlocked(
-            model, alias=alias, port=port, context=context, reasoning=reasoning, timeout=timeout
+            model,
+            alias=alias,
+            port=port,
+            context=context,
+            reasoning=reasoning,
+            timeout=timeout,
+            sunmap_db=sunmap_db,
+            sunmap_tokens=sunmap_tokens,
+            sunmap_trace=sunmap_trace,
+            gpu_layers=gpu_layers,
+            cpu_moe=cpu_moe,
         )
 
 
@@ -305,7 +366,28 @@ def _start_server_unlocked(
     context: str,
     reasoning: str,
     timeout: float,
+    sunmap_db: str | None,
+    sunmap_tokens: int,
+    sunmap_trace: str | None,
+    gpu_layers: str,
+    cpu_moe: str,
 ) -> dict[str, Any]:
+    if model.startswith("ollama://"):
+        ollama_model = model.removeprefix("ollama://")
+        if not ollama_model:
+            raise IntegrationError("Ollama model name must not be empty")
+        try:
+            requested_context = int(context)
+        except (TypeError, ValueError):
+            requested_context = _DEFAULT_OLLAMA_CONTEXT
+        configured_context = _ollama_context(ollama_model)
+        if configured_context < requested_context:
+            raise IntegrationError(
+                f"Ollama model {ollama_model} is configured for {configured_context} tokens, "
+                f"below Kestrel's advertised {requested_context}",
+                hint=f"create an Ollama alias with `PARAMETER num_ctx {requested_context}` and use that alias",
+            )
+    workspace = str(Path.cwd().resolve()) if sunmap_db else None
     existing = _load_state()
     if existing and _owned_alive(existing):
         status = server_status()
@@ -316,6 +398,19 @@ def _start_server_unlocked(
                 and existing.get("port") == port
                 and existing.get("context") == str(context)
                 and existing.get("reasoning") == reasoning
+                and existing.get("gpu_layers") == gpu_layers
+                and existing.get("cpu_moe") == cpu_moe
+                and existing.get("sunmap")
+                == (
+                    {
+                        "database": str(Path(sunmap_db).expanduser()),
+                        "token_budget": sunmap_tokens,
+                        "workspace": workspace,
+                        "trace": str(Path(sunmap_trace).expanduser()) if sunmap_trace else None,
+                    }
+                    if sunmap_db
+                    else None
+                )
             )
             if same:
                 status["reused"] = True
@@ -355,6 +450,28 @@ def _start_server_unlocked(
         "--timeout",
         str(timeout),
     ]
+    if gpu_layers != "auto":
+        command.extend(("--gpu-layers", gpu_layers))
+    if cpu_moe != "auto":
+        command.extend(("--cpu-moe", cpu_moe))
+    if sunmap_db:
+        if sunmap_tokens < 512:
+            raise IntegrationError("Sun Map token budget must be at least 512")
+        _require_sunmap()
+        sunmap_db = str(Path(sunmap_db).expanduser())
+        sunmap_trace = str(Path(sunmap_trace).expanduser()) if sunmap_trace else None
+        command.extend(
+            (
+                "--sunmap-db",
+                sunmap_db,
+                "--sunmap-tokens",
+                str(sunmap_tokens),
+                "--workspace",
+                workspace or str(Path.cwd().resolve()),
+            )
+        )
+        if sunmap_trace:
+            command.extend(("--sunmap-trace", sunmap_trace))
     log = log_path()
     _private_parent(log.parent)
     try:
@@ -384,6 +501,18 @@ def _start_server_unlocked(
         "url": f"http://127.0.0.1:{port}",
         "context": str(context),
         "reasoning": reasoning,
+        "gpu_layers": gpu_layers,
+        "cpu_moe": cpu_moe,
+        "sunmap": (
+            {
+                "database": sunmap_db,
+                "token_budget": sunmap_tokens,
+                "workspace": workspace,
+                "trace": sunmap_trace,
+            }
+            if sunmap_db
+            else None
+        ),
         "log": str(log),
         "started_at": int(time.time()),
     }
@@ -495,5 +624,6 @@ __all__ = [
     "start_server",
     "state_path",
     "stop_server",
+    "sunmap_path",
     "tail_logs",
 ]

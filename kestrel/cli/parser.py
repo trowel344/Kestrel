@@ -208,8 +208,18 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
         default=getattr(state.USER_CONFIG, "reasoning_level", "auto"),
         help="reasoning budget: auto, off, low, medium, high, or maximum (default: saved model setting)",
     )
-    parser.add_argument("--gpu-layers", type=_gpu_layers, default="auto", help="auto, all, or an exact count")
-    parser.add_argument("--cpu-moe", choices=("auto", "on", "off"), default="auto")
+    parser.add_argument(
+        "--gpu-layers",
+        type=_gpu_layers,
+        default=getattr(state.USER_CONFIG, "gpu_layers", "auto"),
+        help="auto, all, or an exact count (default: saved model setting)",
+    )
+    parser.add_argument(
+        "--cpu-moe",
+        choices=("auto", "on", "off"),
+        default=getattr(state.USER_CONFIG, "cpu_moe", "auto"),
+        help="run MoE experts on the CPU: auto, on, or off (default: saved model setting)",
+    )
     parser.add_argument(
         "--target",
         choices=("auto", "balanced", "quality", "speed"),
@@ -229,9 +239,22 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
         help="CPU generation and prompt threads (default: hardware-aware)",
     )
     parser.add_argument(
+        "--threads-batch",
+        type=_positive_int,
+        help="CPU prompt-processing threads, separate from generation threads (default: hardware-aware)",
+    )
+    parser.add_argument(
         "--kv-cache-type",
-        choices=("f16", "bf16", "q8_0", "q4_0", "q4_1"),
-        default="q8_0",
+        choices=("auto", "f16", "bf16", "q8_0", "q4_0", "q4_1"),
+        default=getattr(state.USER_CONFIG, "kv_cache_type", "auto"),
+        help="KV cache quantization: auto (engine default), f16, bf16, q8_0, q4_0, or q4_1 "
+        "(default: saved model setting)",
+    )
+    parser.add_argument(
+        "--turbo-kv",
+        action="store_true",
+        help="opt-in TurboQuant KV cache (--turbo-kv) for higher KV compression; "
+        "skipped unless the engine build exposes it (not yet in upstream llama.cpp)",
     )
     parser.add_argument(
         "--moe-cache",
@@ -289,6 +312,12 @@ def _add_local_run_options(parser, *, model_optional: bool = False):
         "--no-oom-retry",
         action="store_true",
         help="Do not retry startup with lower-memory settings",
+    )
+    parser.add_argument(
+        "--no-auto-tune",
+        action="store_true",
+        help="skip the measured placement scan for a model without a tuning profile "
+        "(auto-tune is on by default and persists a measured profile on first run)",
     )
 
 
@@ -356,6 +385,24 @@ def build_parser():
     )
     serve.add_argument("--managed-token", help=argparse.SUPPRESS)
     serve.add_argument(
+        "--parallel",
+        type=_positive_int,
+        help="number of concurrent llama-server slots (managed agents use one)",
+    )
+    serve.add_argument(
+        "--cache-reuse",
+        type=_nonnegative_int,
+        default=256,
+        help="llama-server KV chunk reuse across requests (min token chunk; 0 disables; default 256)",
+    )
+    serve.add_argument(
+        "--ctx-checkpoints",
+        type=_nonnegative_int,
+        default=0,
+        help="llama-server per-slot KV checkpoints that survive context truncation "
+        "(keeps long prompts reusable after the ring buffer wraps; 0 disables)",
+    )
+    serve.add_argument(
         "--embeddings",
         action="store_true",
         help="enable the /v1/embeddings endpoint for RAG workloads (llama-server --embeddings)",
@@ -383,6 +430,25 @@ def build_parser():
     settings = sub.add_parser("settings", help="View or change default model context and reasoning")
     settings.add_argument("--context", type=planning._context_size_arg, help="auto or at least 512 tokens")
     settings.add_argument("--reasoning", choices=REASONING_LEVELS, help="auto, off, low, medium, high, or maximum")
+    settings.add_argument(
+        "--kv-cache-type",
+        choices=("auto", "f16", "bf16", "q8_0", "q4_0", "q4_1"),
+        help="KV cache quantization: auto, f16, bf16, q8_0, q4_0, or q4_1",
+    )
+    turbo = settings.add_mutually_exclusive_group()
+    turbo.add_argument("--turbo-kv", dest="turbo_kv", action="store_true", help="opt-in TurboQuant KV cache")
+    turbo.add_argument(
+        "--no-turbo-kv",
+        dest="turbo_kv",
+        action="store_false",
+        help="disable the TurboQuant KV cache opt-in",
+    )
+    settings.add_argument(
+        "--gpu-layers",
+        type=_gpu_layers,
+        help="auto, all, or an exact count of layers to place on the GPU",
+    )
+    settings.add_argument("--cpu-moe", choices=("auto", "on", "off"), help="run MoE experts on the CPU")
     _add_json_flag(settings)
 
     agents = sub.add_parser(
@@ -420,12 +486,27 @@ def build_parser():
     agent_start.add_argument("--port", type=_port, default=8080)
     agent_start.add_argument("--context", type=planning._context_size_arg)
     agent_start.add_argument("--reasoning", choices=REASONING_LEVELS)
+    agent_start.add_argument(
+        "--gpu-layers",
+        type=_gpu_layers,
+        default="auto",
+        help="auto, all, or an exact count; forces the split instead of the tuned profile",
+    )
+    agent_start.add_argument("--cpu-moe", choices=("auto", "on", "off"), default="auto")
     agent_start.add_argument("--timeout", type=_positive_float, default=180.0)
+    agent_start.add_argument("--sunmap", action="store_true", help="enable persistent Sun Map agent memory")
+    agent_start.add_argument("--sunmap-db", help="custom Sun Map SQLite database (also enables memory)")
+    agent_start.add_argument("--sunmap-tokens", type=_positive_int, default=4096)
+    agent_start.add_argument("--sunmap-trace", help="record a privacy-bounded replay trajectory as JSONL")
     _add_json_flag(agent_start)
     agent_stop = agent_sub.add_parser("stop", help="Stop the managed coding-agent model server")
     _add_json_flag(agent_stop)
     agent_status = agent_sub.add_parser("status", help="Show server, protocol, and client configuration status")
     _add_json_flag(agent_status)
+    agent_usage = agent_sub.add_parser(
+        "usage", help="Report live CPU, RAM, VRAM, and token throughput of the managed server"
+    )
+    _add_json_flag(agent_usage)
     agent_doctor = agent_sub.add_parser("doctor", help="Verify installed clients and live API compatibility")
     _add_json_flag(agent_doctor)
     agent_logs = agent_sub.add_parser("logs", help="Show recent managed-server logs")
@@ -438,6 +519,17 @@ def build_parser():
     agent_launch.add_argument("--port", type=_port, default=8080)
     agent_launch.add_argument("--context", type=planning._context_size_arg)
     agent_launch.add_argument("--reasoning", choices=REASONING_LEVELS)
+    agent_launch.add_argument(
+        "--gpu-layers",
+        type=_gpu_layers,
+        default="auto",
+        help="auto, all, or an exact count; forces the split instead of the tuned profile",
+    )
+    agent_launch.add_argument("--cpu-moe", choices=("auto", "on", "off"), default="auto")
+    agent_launch.add_argument("--sunmap", action="store_true", help="enable persistent Sun Map agent memory")
+    agent_launch.add_argument("--sunmap-db", help="custom Sun Map SQLite database (also enables memory)")
+    agent_launch.add_argument("--sunmap-tokens", type=_positive_int, default=4096)
+    agent_launch.add_argument("--sunmap-trace", help="record a privacy-bounded replay trajectory as JSONL")
     agent_launch.add_argument("--dry-run", action="store_true")
     _add_json_flag(agent_launch)
     agent_token = agent_sub.add_parser("token", help=argparse.SUPPRESS)
@@ -452,13 +544,22 @@ def build_parser():
     benchmark.add_argument("--gpu-layers", default="auto")
     benchmark.add_argument("--cpu-moe", choices=("auto", "on", "off"), default="auto")
     benchmark.add_argument(
+        "--cpu-moe-layers",
+        type=_nonnegative_int,
+        help="keep experts for the first N layers on CPU (advanced/tuning use)",
+    )
+    benchmark.add_argument(
         "--threads",
         type=_positive_int_sweep,
         help="one thread count or a comma-separated sweep, e.g. 8,10,12,14,16",
     )
-    benchmark.add_argument("--batch-size", type=_positive_int, default=128)
-    benchmark.add_argument("--ubatch-size", type=_positive_int, default=64)
-    benchmark.add_argument("--kv-cache-type", choices=("f16", "bf16", "q8_0", "q4_0", "q4_1"), default="q8_0")
+    benchmark.add_argument("--batch-size", type=_positive_int, help="logical batch size (default: active plan)")
+    benchmark.add_argument("--ubatch-size", type=_positive_int, help="physical micro-batch size (default: active plan)")
+    benchmark.add_argument(
+        "--kv-cache-type",
+        choices=("f16", "bf16", "q8_0", "q4_0", "q4_1"),
+        help="KV cache type (default: active plan)",
+    )
     benchmark.add_argument("--output", help="write the complete JSON report")
     _add_json_flag(benchmark)
 

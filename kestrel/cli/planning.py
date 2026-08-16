@@ -18,7 +18,13 @@ from ..core.planner import (
     predict_decode_tokens_per_second,
 )
 from ..model_store import model_total_size
-from . import model_source, probes
+from ..tuning import (
+    LARGER_CONTEXT_REASON,
+    TUNED_PROFILE_REASON,
+    matching_tuned_plan,
+    profile_measured_rates,
+)
+from . import model_source, probes, state
 
 
 def _plan_mode(model, requested: str) -> str:
@@ -71,9 +77,15 @@ def _kv_cache_bytes_per_token(model_info: dict) -> float:
     try:
         if model_info.get("type") == "gguf":
             cfg = model_source.read_gguf_config(model_info["path"])
-            layers = cfg["n_layer"]
+            # Hybrid-attention models only allocate KV for their full-attention
+            # layers (SSM/linear layers store none); the tensor-layout scan in
+            # the metadata reader reports that count so the estimate does not
+            # over-count by n_layer.
+            layers = int(cfg.get("kv_layers") or cfg["n_layer"])
             hidden = cfg["hidden"]
-            if cfg.get("n_kv_heads") and cfg.get("head_dim"):
+            if cfg.get("kv_values_per_token"):
+                values_per_token = int(cfg["kv_values_per_token"])
+            elif cfg.get("n_kv_heads") and cfg.get("head_dim"):
                 values_per_token = cfg["n_kv_heads"] * cfg["head_dim"]
         else:
             cfg_path = Path(model_info["path"]) / "config.json"
@@ -222,7 +234,6 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
     context_size = 2048
     context_reason = "default"
     if args:
-        requested_gpu_layers = args.gpu_layers
         context_size = args.ctx_size
         if context_size == "auto":
             context_size, context_reason, overcommitted = _select_context_size(
@@ -233,7 +244,14 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
         else:
             context_reason = "explicit user setting"
             overcommitted = False
+    if getattr(args, "gpu_layers", "auto") != "auto":
+        requested_gpu_layers = args.gpu_layers
+    elif getattr(state.USER_CONFIG, "gpu_layers", "auto") != "auto":
+        requested_gpu_layers = state.USER_CONFIG.gpu_layers
+    if getattr(args, "cpu_moe", "auto") != "auto":
         requested_cpu_moe = {"on": True, "off": False, "auto": None}[args.cpu_moe]
+    elif getattr(state.USER_CONFIG, "cpu_moe", "auto") != "auto":
+        requested_cpu_moe = {"on": True, "off": False}[state.USER_CONFIG.cpu_moe]
     plan = plan_runtime(
         model,
         hardware,
@@ -255,11 +273,43 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
             except ValueError:
                 moe_cache = "auto"
     result = plan.as_dict()
+    tuning_reason = "profile disabled for this request"
+    tuned_rates = None
+    if (
+        args
+        and getattr(args, "use_tuning_profile", True)
+        and requested_gpu_layers == "auto"
+        and requested_cpu_moe is None
+    ):
+        tuned_plan, tuning_reason = matching_tuned_plan(
+            model_info,
+            gpu_info,
+            context_size=int(context_size),
+            engine_dirs=(state.LLAMA_CPP_DIR,),
+        )
+        if tuned_plan:
+            result.update(tuned_plan)
+            if tuning_reason == LARGER_CONTEXT_REASON:
+                # The measured placement survives a larger request context, but
+                # prefill scratch scales with the KV footprint: bound the
+                # physical micro-batch to the conservative small-VRAM tier.
+                result["batch_size"] = min(result["batch_size"], 256)
+                result["ubatch_size"] = min(result["ubatch_size"], 64)
+                result["context_scaled"] = True
+            tuned_rates = profile_measured_rates(
+                model_info,
+                gpu_info,
+                context_size=int(context_size),
+                engine_dirs=(state.LLAMA_CPP_DIR,),
+            )
+    result["tuning_profile_applied"] = tuning_reason in (TUNED_PROFILE_REASON, LARGER_CONTEXT_REASON)
+    result["tuning_profile_reason"] = tuning_reason
+    result["context_scaled"] = bool(result.get("context_scaled"))
     try:
-        gpu_layers_offloaded = int(plan.gpu_layers)
+        gpu_layers_offloaded = int(result["gpu_layers"])
     except ValueError:
         gpu_layers_offloaded = 0
-    result["n_gpu_layers"] = plan.gpu_layers
+    result["n_gpu_layers"] = result["gpu_layers"]
     result["has_mtp"] = model.has_mtp
     result["n_layers"] = model.n_layers
     result["n_experts"] = model.n_experts
@@ -271,17 +321,33 @@ def estimate_config(model_info: dict, gpu_info: dict | None, args=None) -> dict:
     result["predicted_decode_tps"] = predict_decode_tokens_per_second(
         model,
         hardware,
-        cpu_moe=plan.cpu_moe,
+        cpu_moe=result["cpu_moe"],
         moe_cache_budget_mib=moe_cache_budget_mib,
         gpu_layers_offloaded=gpu_layers_offloaded,
         draft=plan.use_mtp,
         cpu_expert_quant=("q1_0" if args and getattr(args, "moe_cold_model", None) else None),
     )
     result["active_params_b"] = round(estimate_parameters(model)["active_params"] / 1e9, 1)
-    result["prediction_confidence"] = (
-        "measured-q1-fallback" if args and getattr(args, "moe_cold_model", None) else "uncalibrated-model-estimate"
-    )
+    result["measured_prompt_tps"] = None
+    result["measured_decode_tps"] = None
+    if tuned_rates:
+        result["measured_prompt_tps"] = tuned_rates["prompt_tokens_per_second"]
+        result["measured_decode_tps"] = tuned_rates["decode_tokens_per_second"]
+        result["predicted_decode_tps"] = tuned_rates["decode_tokens_per_second"]
+        result["prediction_confidence"] = "measured"
+    else:
+        result["prediction_confidence"] = (
+            "measured-q1-fallback" if args and getattr(args, "moe_cold_model", None) else "uncalibrated-model-estimate"
+        )
     result["context_reason"] = context_reason
     result["reasoning_level"] = getattr(args, "reasoning", "auto") if args else "auto"
     result["memory_overcommit"] = overcommitted
+    result["kv_cache_turbo"] = bool(getattr(state.USER_CONFIG, "kv_cache_turbo", False))
+    effective_kv = getattr(args, "kv_cache_type", "auto") if args else "auto"
+    if effective_kv in (None, "auto"):
+        effective_kv = getattr(state.USER_CONFIG, "kv_cache_type", "auto")
+    result["kv_cache_type"] = effective_kv
+    if effective_kv not in (None, "auto"):
+        result["cache_type_k"] = effective_kv
+        result["cache_type_v"] = effective_kv
     return result

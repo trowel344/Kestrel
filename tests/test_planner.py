@@ -50,6 +50,47 @@ def test_estimate_parameters_moe():
     assert params["active_params"] < params["total_params"] // 10
 
 
+def test_estimate_parameters_rescaled_to_file_size_for_hybrid_moe():
+    """A hybrid-MoE file whose advertised FF dim does not match its payload is
+    rescaled against the file size so predictions stay sane."""
+    model = ModelProfile(
+        path="/x",
+        n_layers=53,
+        n_experts=128,
+        n_experts_used=6,
+        hidden_size=2688,
+        expert_ff_size=1856,
+        has_mtp=True,
+        file_size_bytes=19_000_000_000,
+        file_type=30,  # IQ4_XS
+    )
+    params = estimate_parameters(model)
+    # Anchored total lands near the real ~36B, not the ~103B the advertised
+    # FF dim alone would claim, and the active set stays near the A3B class.
+    assert 30e9 < params["total_params"] < 42e9
+    assert 2.5e9 < params["active_params"] < 4e9
+    density = model.file_size_bytes / params["total_params"]
+    assert 0.45 < density < 0.65
+
+
+def test_estimate_parameters_keeps_consistent_metadata_untouched():
+    """A file whose structure already matches its size keeps the estimate."""
+    model = ModelProfile(
+        path="/x",
+        n_layers=48,
+        n_experts=128,
+        n_experts_used=8,
+        hidden_size=3072,
+        expert_ff_size=2048,
+        has_mtp=False,
+        file_size_bytes=int(60e9),
+        file_type=14,  # Q4_K
+    )
+    params = estimate_parameters(model)
+    density = model.file_size_bytes / params["total_params"]
+    assert 0.45 < density < 0.75
+
+
 def test_effective_bytes_per_param_uses_file_density():
     model = ModelProfile(
         path="/x",
@@ -122,12 +163,35 @@ def _moe_122b():
     )
 
 
+def _nemotron_30b_a3b():
+    return ModelProfile(
+        path="/x",
+        n_layers=53,
+        n_experts=128,
+        n_experts_used=6,
+        hidden_size=2688,
+        expert_ff_size=1856,
+        has_mtp=True,
+        file_size_bytes=18_918_361_056,
+    )
+
+
 def _small_gpu():
     return HardwareProfile(
         gpu_name="rtx 4060",
         vram_total_mib=8188,
         vram_free_mib=6000,
         ram_available_mib=24000,
+        logical_cpu_count=16,
+    )
+
+
+def _free_small_gpu():
+    return HardwareProfile(
+        gpu_name="rtx 4060",
+        vram_total_mib=8188,
+        vram_free_mib=7744,
+        ram_available_mib=12000,
         logical_cpu_count=16,
     )
 
@@ -146,7 +210,59 @@ def test_plan_moe_known_placement():
     assert plan.gpu_layers == "49"
 
 
-def test_plan_unknown_moe_conservative():
+def test_plan_cpu_moe_sets_dedicated_prompt_threads():
+    plan = plan_runtime(_moe_122b(), _small_gpu(), context_size=2048)
+    assert plan.cpu_moe is True
+    assert plan.threads == 14
+    assert plan.threads_batch == 16
+
+
+def test_plan_dense_keeps_prompt_threads_at_zero():
+    small_dense = ModelProfile(
+        path="/x",
+        n_layers=20,
+        n_experts=0,
+        n_experts_used=0,
+        hidden_size=2048,
+        expert_ff_size=5632,
+        has_mtp=False,
+        file_size_bytes=1536 * 1024**2,
+    )
+    plan = plan_runtime(small_dense, _small_gpu(), context_size=2048)
+    assert plan.cpu_moe is False
+    assert plan.threads == 0
+    assert plan.threads_batch == 0
+
+
+def test_plan_nemotron_30b_a3b_uses_verified_dense_offload():
+    plan = plan_runtime(_nemotron_30b_a3b(), _free_small_gpu(), context_size=16384)
+    assert plan.cpu_moe is True
+    assert plan.n_cpu_moe_layers is None
+    assert plan.gpu_layers == "54"
+    assert plan.batch_size == 256
+    assert plan.ubatch_size == 64
+    assert plan.use_mtp is False
+
+
+def test_plan_nemotron_partial_expert_offload_requires_vram_headroom():
+    plan = plan_runtime(_nemotron_30b_a3b(), _small_gpu(), context_size=16384)
+    assert plan.gpu_layers == "54"
+    assert plan.cpu_moe is True
+    assert plan.n_cpu_moe_layers is None
+
+
+def test_plan_explicit_cpu_moe_on_keeps_all_experts_on_cpu():
+    plan = plan_runtime(
+        _nemotron_30b_a3b(),
+        _free_small_gpu(),
+        context_size=16384,
+        requested_cpu_moe=True,
+    )
+    assert plan.cpu_moe is True
+    assert plan.n_cpu_moe_layers is None
+
+
+def test_plan_unknown_moe_uses_generic_dense_fit():
     unknown = ModelProfile(
         path="/x",
         n_layers=48,
@@ -156,6 +272,22 @@ def test_plan_unknown_moe_conservative():
         expert_ff_size=1024,
         has_mtp=False,
         file_size_bytes=35 * 1024**3,
+    )
+    plan = plan_runtime(unknown, _small_gpu(), context_size=2048)
+    assert plan.cpu_moe is True
+    assert plan.gpu_layers == "49"
+
+
+def test_plan_unknown_moe_keeps_conservative_fallback_when_dense_does_not_fit():
+    unknown = ModelProfile(
+        path="/x",
+        n_layers=80,
+        n_experts=8,
+        n_experts_used=2,
+        hidden_size=8192,
+        expert_ff_size=4096,
+        has_mtp=False,
+        file_size_bytes=80 * 1024**3,
     )
     plan = plan_runtime(unknown, _small_gpu(), context_size=2048)
     assert plan.cpu_moe is True

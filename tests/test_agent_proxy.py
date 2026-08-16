@@ -6,13 +6,18 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 import pytest
 
 from kestrel.agent_proxy import (
     AgentProxyServer,
+    _llama_token_counter,
+    _ProxyHandler,
     _terminate_child,
+    _warm_ollama_model,
     build_backend_command,
     merge_responses_instructions,
 )
@@ -152,6 +157,142 @@ def test_shell_free_child_command_contains_managed_options():
     assert command[command.index("--port") + 1] == "19999"
     assert command[command.index("--api-key-file") + 1] == "/tmp/api-key"
     assert command[command.index("--managed-token") + 1] == "opaque-owner-token"
+    assert command[command.index("--parallel") + 1] == "1"
+
+
+def test_backend_command_forwards_split_overrides():
+    command = build_backend_command(
+        "model.gguf",
+        19999,
+        alias="local",
+        context="8192",
+        reasoning="medium",
+        api_key_file=None,
+        managed_token=None,
+        timeout=30.0,
+        gpu_layers="24",
+        cpu_moe="on",
+    )
+
+    assert command[command.index("--gpu-layers") + 1] == "24"
+    assert command[command.index("--cpu-moe") + 1] == "on"
+
+
+def test_backend_command_omits_auto_split_overrides():
+    command = build_backend_command(
+        "model.gguf",
+        19999,
+        alias="local",
+        context="8192",
+        reasoning="medium",
+        api_key_file=None,
+        managed_token=None,
+        timeout=30.0,
+    )
+
+    assert "--gpu-layers" not in command
+    assert "--cpu-moe" not in command
+
+
+def test_backend_command_rejects_invalid_split_overrides():
+    with pytest.raises(ValueError, match="gpu_layers"):
+        build_backend_command(
+            "model.gguf",
+            19999,
+            alias="local",
+            context="8192",
+            reasoning="medium",
+            api_key_file=None,
+            managed_token=None,
+            timeout=30.0,
+            gpu_layers="banana",
+        )
+    with pytest.raises(ValueError, match="cpu_moe"):
+        build_backend_command(
+            "model.gguf",
+            19999,
+            alias="local",
+            context="8192",
+            reasoning="medium",
+            api_key_file=None,
+            managed_token=None,
+            timeout=30.0,
+            cpu_moe="sometimes",
+        )
+
+
+def test_ollama_warmup_loads_selected_model_without_generating(monkeypatch):
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"done":true,"done_reason":"load"}'
+
+    def fake_urlopen(request, *, timeout):
+        seen["url"] = request.full_url
+        seen["payload"] = json.loads(request.data)
+        seen["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("kestrel.agent_proxy.urllib.request.urlopen", fake_urlopen)
+
+    _warm_ollama_model("qwen3.5:4b", timeout=42.0)
+
+    assert seen == {
+        "url": "http://127.0.0.1:11434/api/generate",
+        "payload": {
+            "model": "qwen3.5:4b",
+            "prompt": "",
+            "stream": False,
+            "keep_alive": "5m",
+        },
+        "timeout": 42.0,
+    }
+
+
+def test_ollama_warmup_fails_startup_when_model_cannot_load(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel.agent_proxy.urllib.request.urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(URLError("model load failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="Ollama could not load model 'too-large:latest'"):
+        _warm_ollama_model("too-large:latest", timeout=1.0)
+
+
+def test_llama_token_counter_authenticates_caches_and_counts_exact_tokens(monkeypatch):
+    seen = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"tokens":[1,2,3]}'
+
+    def fake_urlopen(request, *, timeout):
+        seen.append((request, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr("kestrel.agent_proxy.urllib.request.urlopen", fake_urlopen)
+    counter = _llama_token_counter("http://127.0.0.1:9999", "private-token")
+
+    assert counter("exact text") == 3
+    assert counter("exact text") == 3
+    assert len(seen) == 1
+    request, timeout = seen[0]
+    assert request.full_url == "http://127.0.0.1:9999/tokenize"
+    assert request.headers["Authorization"] == "Bearer private-token"
+    assert timeout == 5.0
 
 
 def test_proxy_forwards_auth_and_streams_response(proxy_pair):
@@ -179,6 +320,41 @@ def test_proxy_does_not_buffer_delayed_sse_event(proxy_pair):
     assert response.read() == b"\ndata: second\n\n"
 
 
+def test_proxy_treats_downstream_disconnect_as_normal(monkeypatch):
+    class FakeResponse:
+        headers = {}
+        status = 200
+        reason = "OK"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    handler = SimpleNamespace(
+        path="/health",
+        command="GET",
+        headers={},
+        close_connection=False,
+        proxy_server=SimpleNamespace(
+            backend_model=None,
+            backend_base_url="http://127.0.0.1:1",
+            request_timeout=1.0,
+            memory=None,
+        ),
+    )
+    monkeypatch.setattr("kestrel.agent_proxy.urllib.request.urlopen", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "kestrel.agent_proxy._forward_response",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(BrokenPipeError()),
+    )
+
+    _ProxyHandler._proxy(handler, None)
+
+    assert handler.close_connection is True
+
+
 def test_proxy_transforms_responses_and_preserves_tools(proxy_pair):
     payload = {
         "input": [
@@ -198,6 +374,253 @@ def test_proxy_transforms_responses_and_preserves_tools(proxy_pair):
     transformed = json.loads(response.read())
     assert transformed["instructions"] == "Use tools"
     assert transformed["input"] == [payload["input"][1]]
+
+
+def test_proxy_enriches_request_and_observes_streamed_response():
+    class FakeMemory:
+        def __init__(self):
+            self.observed = []
+            self.observed_event = threading.Event()
+
+        def enrich_request(self, path, payload):
+            assert path == "/v1/responses"
+            return {**payload, "instructions": "remembered state"}
+
+        def observe_response(self, path, content_type, body):
+            self.observed.append((path, content_type, body))
+            self.observed_event.set()
+
+    memory = FakeMemory()
+    _BackendHandler.seen = []
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), _BackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+    proxy = AgentProxyServer(
+        ("127.0.0.1", 0),
+        backend.server_address[1],
+        max_body_bytes=1024,
+        request_timeout=2.0,
+        memory=memory,
+    )
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    try:
+        response = urlopen(
+            Request(
+                f"http://127.0.0.1:{proxy.server_address[1]}/v1/responses",
+                data=json.dumps({"input": "remember this"}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            ),
+            timeout=2,
+        )
+        returned = json.loads(response.read())
+        assert returned["instructions"] == "remembered state"
+        assert memory.observed_event.wait(timeout=2)
+        assert memory.observed
+        assert memory.observed[0][0] == "/v1/responses"
+        assert b"remembered state" in memory.observed[0][2]
+        assert proxy.memory_errors == 0
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=2)
+        backend.shutdown()
+        backend.server_close()
+        backend_thread.join(timeout=2)
+
+
+def test_proxy_live_sunmap_checkpoint_and_code_evidence_round_trip(tmp_path):
+    from kestrel.sunmap_memory import SunMapMemory
+
+    source = tmp_path / "service.py"
+    source.write_text("def repair_service():\n    return 'current-proof'\n", encoding="utf-8")
+    database = tmp_path / "memory.sqlite3"
+    memory = SunMapMemory(database, token_budget=2048, workspace=tmp_path)
+    _BackendHandler.seen = []
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), _BackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+    proxy = AgentProxyServer(
+        ("127.0.0.1", 0),
+        backend.server_address[1],
+        max_body_bytes=32 * 1024,
+        request_timeout=2.0,
+        memory=memory,
+        api_token="private-token",
+    )
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    base = f"http://127.0.0.1:{proxy.server_address[1]}"
+    try:
+        first_payload = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Repair repair_service. Do not modify tests.",
+                }
+            ]
+        }
+        first = urlopen(
+            Request(
+                f"{base}/v1/chat/completions",
+                data=json.dumps(first_payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer private-token",
+                },
+                method="POST",
+            ),
+            timeout=2,
+        )
+        enriched = json.loads(first.read())
+        suffix = enriched["messages"][-1]["content"]
+        assert "<CURRENT_CODE_EVIDENCE>" in suffix
+        assert "current-proof" in suffix
+        assert "<SUNMAP_TASK_STATE>" in suffix
+        assert "tests/**" in suffix
+
+        followup_payload = {
+            "messages": [
+                *first_payload["messages"],
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "tests",
+                            "function": {
+                                "name": "bash",
+                                "arguments": json.dumps({"command": "pytest -q"}),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "tests",
+                    "content": "3 passed in 0.01s",
+                },
+            ]
+        }
+        followup = urlopen(
+            Request(
+                f"{base}/v1/chat/completions",
+                data=json.dumps(followup_payload).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer private-token",
+                },
+                method="POST",
+            ),
+            timeout=2,
+        )
+        checkpoint = json.loads(followup.read())["messages"][-1]["content"]
+        assert "verify=passed 3/0 @client" in checkpoint
+
+        restarted = SunMapMemory(database, token_budget=2048, workspace=tmp_path)
+        assert restarted.status()["task"]["verification"] == "passed"
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=2)
+        backend.shutdown()
+        backend.server_close()
+        backend_thread.join(timeout=2)
+
+
+def test_ollama_backend_enforces_proxy_auth_and_rewrites_model():
+    _BackendHandler.seen = []
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), _BackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+    proxy = AgentProxyServer(
+        ("127.0.0.1", 0),
+        backend.server_address[1],
+        max_body_bytes=1024,
+        request_timeout=2.0,
+        api_token="private-token",
+        backend_base_url=f"http://127.0.0.1:{backend.server_address[1]}",
+        backend_model="qwen3.5:4b",
+        backend_reasoning="off",
+    )
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    base = f"http://127.0.0.1:{proxy.server_address[1]}"
+    try:
+        with pytest.raises(Exception) as error:
+            urlopen(f"{base}/health", timeout=2)
+        assert getattr(error.value, "code", None) == 401
+        assert not _BackendHandler.seen
+
+        health = urlopen(Request(f"{base}/health", headers={"Authorization": "Bearer private-token"}), timeout=2)
+        assert health.status == 200
+        assert _BackendHandler.seen[-1][0] == "/api/tags"
+
+        response = urlopen(
+            Request(
+                f"{base}/v1/chat/completions",
+                data=json.dumps({"model": "kestrel-local", "messages": []}).encode(),
+                headers={"Content-Type": "application/json", "X-Api-Key": "private-token"},
+                method="POST",
+            ),
+            timeout=2,
+        )
+        forwarded = json.loads(response.read())
+        assert forwarded["model"] == "qwen3.5:4b"
+        assert forwarded["reasoning_effort"] == "none"
+        _path, forwarded_headers, _body = _BackendHandler.seen[-1]
+        assert "Authorization" not in forwarded_headers
+        assert "X-Api-Key" not in forwarded_headers
+
+        unsupported = Request(
+            f"{base}/v1/responses",
+            data=b"{}",
+            headers={"Authorization": "Bearer private-token"},
+            method="POST",
+        )
+        with pytest.raises(Exception) as error:
+            urlopen(unsupported, timeout=2)
+        assert getattr(error.value, "code", None) == 404
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=2)
+        backend.shutdown()
+        backend.server_close()
+        backend_thread.join(timeout=2)
+
+
+def test_llama_backend_keeps_validated_credential_for_upstream():
+    _BackendHandler.seen = []
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), _BackendHandler)
+    backend_thread = threading.Thread(target=backend.serve_forever, daemon=True)
+    backend_thread.start()
+    proxy = AgentProxyServer(
+        ("127.0.0.1", 0),
+        backend.server_address[1],
+        max_body_bytes=1024,
+        request_timeout=2.0,
+        api_token="shared-token",
+    )
+    proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    proxy_thread.start()
+    try:
+        response = urlopen(
+            Request(
+                f"http://127.0.0.1:{proxy.server_address[1]}/health",
+                headers={"Authorization": "Bearer shared-token"},
+            ),
+            timeout=2,
+        )
+        assert response.status == 200
+        assert _BackendHandler.seen[-1][1]["Authorization"] == "Bearer shared-token"
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=2)
+        backend.shutdown()
+        backend.server_close()
+        backend_thread.join(timeout=2)
 
 
 def test_proxy_rejects_body_over_limit(proxy_pair):

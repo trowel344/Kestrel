@@ -70,6 +70,7 @@ def test_managed_server_fails_before_spawn_off_linux(isolated_agent_dirs, monkey
 
 def test_start_builds_authenticated_loopback_owned_process(isolated_agent_dirs, monkeypatch):
     monkeypatch.setattr(agent_service.sys, "platform", "linux")
+    monkeypatch.setattr(agent_service, "_require_sunmap", lambda: None)
     captured = {}
 
     class FakeProcess:
@@ -98,6 +99,8 @@ def test_start_builds_authenticated_loopback_owned_process(isolated_agent_dirs, 
         port=8111,
         context="4096",
         reasoning="high",
+        sunmap_db=str(isolated_agent_dirs / "memory.sqlite3"),
+        sunmap_tokens=2048,
     )
 
     command = captured["command"]
@@ -105,11 +108,63 @@ def test_start_builds_authenticated_loopback_owned_process(isolated_agent_dirs, 
     assert command[command.index("--model") + 1] == "/models/model.gguf"
     assert "--api-key-file" in command
     assert "--managed-token" in command
+    assert command[command.index("--sunmap-db") + 1].endswith("memory.sqlite3")
+    assert command[command.index("--sunmap-tokens") + 1] == "2048"
     assert captured["kwargs"]["start_new_session"] is True
     state = json.loads(agent_service.state_path().read_text(encoding="utf-8"))
     assert state["pid"] == 43210
     assert state["model"] == "/models/model.gguf"
+    assert state["sunmap"]["token_budget"] == 2048
     assert result["reused"] is False
+
+
+def test_start_forwards_gpu_split_overrides(isolated_agent_dirs, monkeypatch):
+    monkeypatch.setattr(agent_service.sys, "platform", "linux")
+    captured = {}
+
+    class FakeProcess:
+        pid = 43211
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        return FakeProcess()
+
+    monkeypatch.setattr(agent_service.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(agent_service, "_port_busy", lambda _port: False)
+    monkeypatch.setattr(agent_service, "_ready", lambda _port, _token: True)
+    monkeypatch.setattr(
+        agent_service,
+        "server_status",
+        lambda: {"status": "ready", "running": True, "healthy": True, "url": "http://127.0.0.1:8111"},
+    )
+
+    result = agent_service.start_server(
+        "/models/model.gguf",
+        context="8192",
+        gpu_layers="24",
+        cpu_moe="on",
+    )
+
+    command = captured["command"]
+    assert command[command.index("--gpu-layers") + 1] == "24"
+    assert command[command.index("--cpu-moe") + 1] == "on"
+    state = json.loads(agent_service.state_path().read_text(encoding="utf-8"))
+    assert state["gpu_layers"] == "24"
+    assert state["cpu_moe"] == "on"
+    assert result["reused"] is False
+
+
+def test_ollama_agent_start_refuses_context_smaller_than_advertised(isolated_agent_dirs, monkeypatch):
+    monkeypatch.setattr(agent_service.sys, "platform", "linux")
+    monkeypatch.setattr(agent_service, "_ollama_context", lambda _model: 4096)
+
+    with pytest.raises(IntegrationError, match="configured for 4096 tokens") as error:
+        agent_service.start_server("ollama://qwen:small", context="16384")
+
+    assert "PARAMETER num_ctx 16384" in str(error.value.hint)
 
 
 def test_stop_refuses_stale_pid_without_signaling(isolated_agent_dirs, monkeypatch):

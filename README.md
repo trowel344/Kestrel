@@ -82,6 +82,67 @@ kestrel agents status
 kestrel agents stop            # release model memory
 ```
 
+Long-running agents can opt into bounded, persistent Sun Map context. Install
+the companion project into Kestrel's environment, then enable it for the
+managed server or one-command launch:
+
+```bash
+uv pip install --python .venv/bin/python --no-deps ../sunmap
+.venv/bin/kestrel agents launch pi --sunmap
+# Equivalent server-only form: .venv/bin/kestrel agents start --sunmap
+# Optional reproducible evaluator trace:
+.venv/bin/kestrel agents start --sunmap --sunmap-trace .sunmap/trajectory.jsonl
+```
+
+An Ollama-managed model can use the same authenticated, memory-aware Chat
+Completions boundary without copying its GGUF into Kestrel. Its Modelfile must
+set a context at least as large as the context advertised to the agent:
+
+```text
+FROM qwen3.5:4b
+PARAMETER num_ctx 16384
+```
+
+```bash
+ollama create qwen3.5-kestrel-16k -f Modelfile
+.venv/bin/kestrel agents launch pi --model ollama://qwen3.5-kestrel-16k --context 16384 --sunmap
+```
+
+Kestrel does not start or stop the user's Ollama daemon. The proxy validates
+the Kestrel credential, strips it before forwarding, rewrites the public model
+alias to the selected Ollama model, and reports Responses/Anthropic routes as
+unsupported rather than claiming compatibility.
+Startup fails if the Ollama alias has a smaller `num_ctx` than Kestrel's agent
+profile, preventing silent mid-task truncation.
+
+Memory is stored by default in a private database keyed to the directory where
+`agents start` or `agents launch` was invoked, and survives both client and
+model-server restarts. This prevents unrelated projects from sharing prompt
+history. `--sunmap-db PATH` selects an intentionally shared SQLite store and
+also enables memory; `--sunmap-tokens 4096` controls the maximum injected
+context. `--sunmap-trace PATH` appends a mode-0600, redacted, bounded JSONL
+trajectory with structured tool summaries but no raw tool output or source
+bodies. Kestrel records user and completed assistant messages, but
+deliberately does not persist raw tool output because source
+files and web results may contain prompt-injection text. Sun Map is inserted as
+quoted evidence below current system/developer policy, and request streaming is
+still forwarded live. `kestrel agents status --json` reports the active memory
+database, budget, and the last estimated semantic/code/task injection cost.
+For llama.cpp, token accounting uses its tokenizer route with a bounded
+fallback; Ollama uses the conservative estimate. Channel budgets are dynamic:
+unused code capacity returns to semantic memory, and direct task-state
+questions suppress unrelated history. `--reasoning off` is forwarded to
+Ollama as `reasoning_effort: none`, preventing Qwen from spending the response
+allowance in a hidden reasoning field.
+
+The long-horizon path also maintains a durable structured task checkpoint,
+detects repeated no-progress actions, tracks file digests and verification
+state, and retrieves current code from a separate secret-filtered index. A
+client-reported test pass is only `ready_for_verification`; an independent gate
+is required for `complete`. See
+[Long-horizon agent memory](docs/LONG_HORIZON_MEMORY.md) for the trust model,
+research basis, and comparative benchmark boundary.
+
 When the normal context setting is `auto`, work mode uses an explicit 32K
 window; contexts below 8K are rejected because coding-agent instructions and
 tool schemas need real headroom. The managed lifecycle currently requires
@@ -187,6 +248,9 @@ kestrel build           build the pinned llama.cpp engine safely
 | --- | --- |
 | `--ctx-size 8192` | Override the saved or automatic context window for this launch. |
 | `--reasoning high` | Give supported reasoning models an 8,192-token thinking budget. |
+| `--threads-batch 16` | Dedicated CPU prompt-processing threads, separate from decode threads. |
+| `--cache-reuse 0` | Disable llama-server KV chunk reuse across requests (default: 256 tokens). |
+| `--no-auto-tune` | Skip the measured placement scan for a model that has no tuning profile (auto-tune is on by default). |
 | `--direct-io` | Bypass the page cache for a cold NVMe load. |
 | `--mlock` | Pin CPU-offloaded weights when enough RAM exists. |
 | `--tensor-split 60,40` | Override multi-GPU split ratios. |
@@ -229,6 +293,13 @@ Benchmark and evaluation reports are deliberately separate. A model can fit
 and run reliably while remaining slow, or generate quickly while failing a
 capability check. Kestrel does not collapse those outcomes into a projected
 score.
+
+`run`/`serve` auto-tune on the first launch of a model that has no measured
+profile: a bounded llama-bench scan compares candidate placements, persists the
+fastest safe one for future launches, and reports the measured decode/prompt
+rates instead of an analytic estimate. Use `--no-auto-tune` to keep the
+conservative planner defaults, or `kestrel optimize MODEL --benchmark` to
+search a wider placement space manually.
 
 ## Install and develop
 

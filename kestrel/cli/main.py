@@ -66,7 +66,7 @@ def main() -> int:
 
 def _run_dispatched(parser, args) -> int:
     try:
-        config_independent_agent_actions = {"token", "stop", "status", "doctor", "logs", "remove", "list"}
+        config_independent_agent_actions = {"token", "stop", "status", "usage", "doctor", "logs", "remove", "list"}
         agent_action = getattr(args, "agents_action", None)
         config_independent = args.command == "agents" and agent_action in config_independent_agent_actions
         if state.CONFIG_ERROR and not config_independent and not (args.command == "setup" and args.reset):

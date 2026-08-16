@@ -29,7 +29,7 @@ def test_save_config_uses_atomic_writer(monkeypatch, tmp_path):
     assert result == target
     assert calls and calls[0][0] == target
     assert 'default_model = "m"\n' in calls[0][1]
-    assert calls[0][1].endswith('reasoning_level = "auto"\n')
+    assert calls[0][1].endswith('reasoning_level = "auto"\nkv_cache_turbo = false\n')
 
 
 def test_planner_cache_write_is_atomic(monkeypatch, tmp_path):

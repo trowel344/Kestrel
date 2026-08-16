@@ -243,10 +243,12 @@ class LlamaCppBackend:
         spec_type: str = "none",
         spec_draft_n: int = 3,
         cpu_moe: bool = False,
+        n_cpu_moe_layers: int | None = None,
         fit: bool = True,
         fit_target_mib: int = 1024,
         cache_type_k: str = "q8_0",
         cache_type_v: str = "q8_0",
+        turbo_kv: bool = False,
         use_mmap: bool = True,
         use_mlock: bool = False,
         n_threads: int = 0,
@@ -257,6 +259,9 @@ class LlamaCppBackend:
         rpc_endpoints: list[str] | tuple[str, ...] | None = None,
         extra_args: list[str] | None = None,
         reasoning_level: str = "auto",
+        threads_batch: int | None = None,
+        cache_reuse: int = 0,
+        ctx_checkpoints: int = 0,
     ):
         self.model_path = model_path
         self.n_gpu_layers = n_gpu_layers
@@ -268,10 +273,12 @@ class LlamaCppBackend:
         self.spec_type = spec_type
         self.spec_draft_n = spec_draft_n
         self.cpu_moe = cpu_moe
+        self.n_cpu_moe_layers = n_cpu_moe_layers
         self.fit = fit
         self.fit_target_mib = fit_target_mib
         self.cache_type_k = cache_type_k
         self.cache_type_v = cache_type_v
+        self.turbo_kv = bool(turbo_kv)
         self.use_mmap = use_mmap
         self.use_mlock = use_mlock
         self.direct_io = direct_io
@@ -282,6 +289,19 @@ class LlamaCppBackend:
             raise ValueError(f"invalid reasoning level: {reasoning_level}")
         self.reasoning_level = reasoning_level
         self.n_threads = max(0, n_threads)
+        # Dedicated prompt-processing thread budget. None/0 means "reuse the
+        # decode thread count"; a positive value is passed to --threads-batch.
+        self.threads_batch = max(0, int(threads_batch)) if threads_batch else None
+        # llama-server --cache-reuse: minimum chunk size (tokens) whose KV
+        # state is kept and shifted for reuse by the next request. 0 disables
+        # (llama.cpp's own default), so Kestrel is a strict no-op unless the
+        # server path opts in via the --cache-reuse flag.
+        self.cache_reuse = max(0, int(cache_reuse or 0))
+        # llama-server --ctx-checkpoints: how many per-slot checkpoints keep
+        # KV state restorable across context truncation. Batch checkpoints
+        # mean a wrapped/truncated context can still reuse its prefix instead
+        # of forcing a full re-prefill on the next request. 0 disables.
+        self.ctx_checkpoints = max(0, int(ctx_checkpoints or 0))
         self.moe_cache = moe_cache
         self.llama_cpp_dir = llama_cpp_dir or default_llama_cpp_dir()
         self._proc: subprocess.Popen | None = None
@@ -363,7 +383,11 @@ class LlamaCppBackend:
         if self.n_threads and caps.supports("--threads"):
             args += ["--threads", str(self.n_threads)]
         if self.n_threads and caps.supports("--threads-batch"):
-            args += ["--threads-batch", str(self.n_threads)]
+            # Prompt processing is heavily parallel CPU work when layers stay
+            # on the CPU; give it a dedicated thread budget instead of reusing
+            # the tuned decode value (which is lower on hybrid parts to leave
+            # room for CUDA/runtime work).
+            args += ["--threads-batch", str(self.threads_batch or self.n_threads)]
 
         # Direct I/O bypasses the page cache and loads uncached model weights
         # at sequential disk speed; it is fastest on a cold launch from NVMe.
@@ -393,7 +417,9 @@ class LlamaCppBackend:
             args += ["--fit", "on"]
             if caps.supports("--fit-target"):
                 args += ["--fit-target", str(self.fit_target_mib)]
-        if self.cpu_moe and caps.supports("--cpu-moe"):
+        if self.n_cpu_moe_layers is not None and caps.supports("--n-cpu-moe"):
+            args += ["--n-cpu-moe", str(self.n_cpu_moe_layers)]
+        elif self.cpu_moe and caps.supports("--cpu-moe"):
             args.append("--cpu-moe")
         if self.moe_cache != "auto" and caps.supports("--moe-cache"):
             args += ["--moe-cache", self.moe_cache]
@@ -401,6 +427,12 @@ class LlamaCppBackend:
             args += ["--cache-type-k", self.cache_type_k]
         if self.cache_type_v and caps.supports("--cache-type-v"):
             args += ["--cache-type-v", self.cache_type_v]
+        # TurboQuant KV: random orthogonal rotation before K/V quantization
+        # (recovers most low-bit KV quality; works with any --cache-type).
+        # Not yet in upstream llama.cpp, so this is strictly opt-in and is
+        # silently skipped until the selected engine exposes --turbo-kv.
+        if self.turbo_kv and caps.supports("--turbo-kv"):
+            args.append("--turbo-kv")
         if caps.supports("--flash-attn"):
             args += ["--flash-attn", "auto"]
 
@@ -446,6 +478,7 @@ class LlamaCppBackend:
         alias: str | None = None,
         embeddings: bool = False,
         api_key_file: str | None = None,
+        parallel: int | None = None,
     ) -> list[str]:
         caps = self.server_capabilities()
         cmd = [
@@ -466,7 +499,25 @@ class LlamaCppBackend:
                     hint="run `kestrel build` to update the engine",
                 )
             cmd += ["--api-key-file", api_key_file]
+        if parallel is not None:
+            if parallel <= 0:
+                raise ValueError("parallel must be positive")
+            if not caps.supports("--parallel"):
+                raise BackendError(
+                    "selected llama-server does not support an explicit slot count",
+                    hint="run `kestrel build` to update the engine",
+                )
+            cmd += ["--parallel", str(parallel)]
         cmd += self._common_engine_args(caps)
+        # Reuse the KV cache of matching prompt chunks across requests (KV
+        # shifting). Coding agents resend a huge system prompt and tool schema
+        # on every turn; without this the server re-processes the full prefix
+        # each time. Default 0 in llama.cpp disables it, so this is opt-in via
+        # the serve flag rather than a silent behavior change.
+        if self.cache_reuse and caps.supports("--cache-reuse"):
+            cmd += ["--cache-reuse", str(self.cache_reuse)]
+        if self.ctx_checkpoints and caps.supports("--ctx-checkpoints"):
+            cmd += ["--ctx-checkpoints", str(self.ctx_checkpoints)]
         if embeddings and caps.supports("--embeddings"):
             cmd.append("--embeddings")
         return cmd

@@ -315,6 +315,9 @@ def _configure_backend(model_info: dict, config: dict, args=None) -> LlamaCppBac
                 f"--tensor-split has {actual} entries but local plus RPC enumeration has {expected} devices",
                 hint="omit --tensor-split to use live per-device free-memory ratios",
             )
+    kv_cache_type = getattr(args, "kv_cache_type", "auto") if args else "auto"
+    cache_type_k = config["cache_type_k"] if kv_cache_type in (None, "auto") else kv_cache_type
+    cache_type_v = config["cache_type_v"] if kv_cache_type in (None, "auto") else kv_cache_type
     return LlamaCppBackend(
         model_path=model_info["path"],
         n_gpu_layers=config["gpu_layers"],
@@ -324,10 +327,13 @@ def _configure_backend(model_info: dict, config: dict, args=None) -> LlamaCppBac
         spec_type="mtp" if use_mtp else "none",
         spec_draft_n=args.mtp_tokens if args else 3,
         cpu_moe=config["cpu_moe"],
+        n_cpu_moe_layers=config.get("n_cpu_moe_layers"),
         fit=config["fit"],
         fit_target_mib=(args.fit_target if args and args.fit_target else config["fit_target_mib"]),
-        cache_type_k=args.kv_cache_type if args else config["cache_type_k"],
-        cache_type_v=args.kv_cache_type if args else config["cache_type_v"],
+        cache_type_k=cache_type_k,
+        cache_type_v=cache_type_v,
+        turbo_kv=(getattr(args, "turbo_kv", None) if args else None)
+        or config.get("kv_cache_turbo", False),
         use_mmap=not (args and args.no_mmap),
         use_mlock=bool(args and args.mlock),
         direct_io=bool(args and args.direct_io),
@@ -343,6 +349,13 @@ def _configure_backend(model_info: dict, config: dict, args=None) -> LlamaCppBac
         extra_args=_flatten_extra(args.extra if args else None),
         reasoning_level=(getattr(args, "reasoning", "auto") if args else "auto"),
         n_threads=(args.threads if args and args.threads is not None else config["threads"]),
+        threads_batch=(
+            args.threads_batch
+            if args and getattr(args, "threads_batch", None) is not None
+            else (config.get("threads_batch") or 0)
+        ),
+        cache_reuse=(getattr(args, "cache_reuse", None) if args else None) or 0,
+        ctx_checkpoints=(getattr(args, "ctx_checkpoints", None) if args else None) or 0,
         llama_cpp_dir=state.LLAMA_CPP_DIR,
         moe_cache=(
             str(config["moe_cache_budget_mib"])
@@ -402,6 +415,19 @@ def _lower_memory_command(command: list[str]) -> tuple[list[str], list[str]] | N
     ubatch = increase_or_reduce("-ub", lambda value: max(16, value // 2))
     if ubatch is not None:
         changes.append(f"micro-batch {ubatch}")
+    try:
+        ngl_index = len(lowered) - 1 - lowered[::-1].index("-ngl")
+        cpu_moe_index = len(lowered) - 1 - lowered[::-1].index("--n-cpu-moe")
+        max_cpu_layers = max(0, int(lowered[ngl_index + 1]) - 1)
+        current_cpu_layers = int(lowered[cpu_moe_index + 1])
+    except (ValueError, IndexError):
+        pass
+    else:
+        if current_cpu_layers < max_cpu_layers:
+            step = max(1, (max_cpu_layers - current_cpu_layers + 1) // 2)
+            safer_cpu_layers = min(max_cpu_layers, current_cpu_layers + step)
+            lowered[cpu_moe_index + 1] = str(safer_cpu_layers)
+            changes.append(f"CPU experts through layer {safer_cpu_layers}")
     fit_target = increase_or_reduce("--fit-target", lambda value: value + 512)
     if fit_target is not None:
         changes.append("a larger VRAM margin")
@@ -705,4 +731,5 @@ def _build_server_cmd(model_info: dict, config: dict, args=None) -> list[str]:
         alias=getattr(args, "alias", None),
         embeddings=bool(args and args.embeddings),
         api_key_file=getattr(args, "api_key_file", None),
+        parallel=getattr(args, "parallel", None),
     )

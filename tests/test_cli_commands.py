@@ -24,6 +24,34 @@ from kestrel.model_store import ModelStoreError, OllamaModel
 from kestrel.providers.ollama import OllamaError, OllamaGeneration
 
 
+class _FakeBenchProcess:
+    """Popen-shaped stand-in for llama-bench runs in cmd_benchmark."""
+
+    def __init__(self, command, *, stdout="", stderr="", returncode=0, timeout_error=None, **kwargs):
+        self.command = command
+        self._stdout = stdout
+        self._stderr = stderr
+        self.returncode = returncode
+        self._timeout_error = timeout_error
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        self.communicate_timeout = timeout
+        if self._timeout_error is not None and not self.killed:
+            raise self._timeout_error
+        return self._stdout, self._stderr
+
+    def kill(self):
+        self.killed = True
+
+    @classmethod
+    def for_success(cls, command, rows, **kwargs):
+        return cls(command, stdout=json.dumps(rows), returncode=0, **kwargs)
+
+
 def _dispatch(argv: list[str]) -> int:
     cli_parser = parser.build_parser()
     return main._run_dispatched(cli_parser, cli_parser.parse_args(argv))
@@ -108,6 +136,7 @@ def test_benchmark_local_builds_exact_command_and_report(monkeypatch, tmp_path):
     monkeypatch.setattr(bench.parser, "_default_model", lambda args, error: str(model))
     monkeypatch.setattr(bench.model_source, "detect_model", lambda value: {"type": "gguf", "path": str(model)})
     monkeypatch.setattr(bench, "resolve_llama_binary", lambda name, dirs=None: "/fake/llama-bench")
+    monkeypatch.setattr(bench, "_load_capabilities", lambda binary, refresh=False: SimpleNamespace(supports=lambda flag: False))
     monkeypatch.setattr(bench.probes, "detect_gpu", lambda: None)
     monkeypatch.setattr(
         bench.planning,
@@ -122,20 +151,51 @@ def test_benchmark_local_builds_exact_command_and_report(monkeypatch, tmp_path):
         },
     )
 
-    def fake_run(command, **kwargs):
-        command_seen.append((command, kwargs))
-        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(rows), stderr="")
+    processes = []
 
-    monkeypatch.setattr(bench.subprocess, "run", fake_run)
+    def fake_popen(command, **kwargs):
+        command_seen.append(command)
+        proc = _FakeBenchProcess.for_success(command, rows)
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(bench.subprocess, "Popen", fake_popen)
     report = bench.cmd_benchmark(_bench_args(str(model), output=str(tmp_path / "report.json")))
 
-    command, kwargs = command_seen[0]
+    command = command_seen[0]
     assert command[:4] == ["/fake/llama-bench", "-m", str(model), "-p"]
     assert "-fitt" in command and "-ncmoe" in command
     assert "--moe-cache" not in command
-    assert kwargs["timeout"] == 30 * 60 * 2
+    assert "-tb" not in command
+    assert processes[0].communicate_timeout == 30 * 60 * 2
     assert report["placement"]["threads"] == 8
     assert report["decode_tokens_per_second"] == 12.5
+
+
+def test_benchmark_emits_threads_batch_when_llama_bench_supports_it(monkeypatch, tmp_path):
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"GGUF")
+    rows = [{"n_prompt": 8, "n_threads": 4, "avg_ts": 100.0}, {"n_gen": 4, "n_threads": 4, "avg_ts": 12.5}]
+    command_seen = []
+    monkeypatch.setattr(bench.parser, "_default_model", lambda args, error: str(model))
+    monkeypatch.setattr(bench.model_source, "detect_model", lambda value: {"type": "gguf", "path": str(model)})
+    monkeypatch.setattr(bench, "resolve_llama_binary", lambda name, dirs=None: "/fake/llama-bench")
+    monkeypatch.setattr(bench, "_load_capabilities", lambda binary, refresh=False: SimpleNamespace(supports=lambda flag: True))
+    monkeypatch.setattr(bench.probes, "detect_gpu", lambda: None)
+    monkeypatch.setattr(
+        bench.planning,
+        "estimate_config",
+        lambda info, gpu, args: {"gpu_layers": "33", "cpu_moe": True, "n_layers": 48, "threads": 4, "threads_batch": 16, "model_size_gib": 3.5},
+    )
+
+    def fake_popen(command, **kwargs):
+        command_seen.append(command)
+        return _FakeBenchProcess.for_success(command, rows)
+
+    monkeypatch.setattr(bench.subprocess, "Popen", fake_popen)
+    bench.cmd_benchmark(_bench_args(str(model)))
+    command = command_seen[0]
+    assert "-tb" in command and command[command.index("-tb") + 1] == "16"
 
 
 @pytest.mark.parametrize(
@@ -157,11 +217,14 @@ def test_benchmark_local_process_failures(monkeypatch, tmp_path, result, excepti
         "estimate_config",
         lambda *args: {"gpu_layers": "all", "cpu_moe": False, "threads": 4, "model_size_gib": 1},
     )
-    monkeypatch.setattr(
-        bench.subprocess,
-        "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(result) if isinstance(result, Exception) else result,
-    )
+    monkeypatch.setattr(bench, "_load_capabilities", lambda binary, refresh=False: None)
+
+    def fake_popen(command, **kwargs):
+        if isinstance(result, Exception):
+            return _FakeBenchProcess(command, timeout_error=result)
+        return _FakeBenchProcess(command, returncode=result.returncode, stderr=result.stderr)
+
+    monkeypatch.setattr(bench.subprocess, "Popen", fake_popen)
     with pytest.raises(exception):
         bench.cmd_benchmark(_bench_args(str(model)))
 
@@ -179,10 +242,11 @@ def test_benchmark_rejects_invalid_success_json(monkeypatch, tmp_path, payload):
         "estimate_config",
         lambda *args: {"gpu_layers": "all", "cpu_moe": False, "threads": 4, "model_size_gib": 1},
     )
+    monkeypatch.setattr(bench, "_load_capabilities", lambda binary, refresh=False: None)
     monkeypatch.setattr(
         bench.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr=""),
+        "Popen",
+        lambda command, **kwargs: _FakeBenchProcess.for_success(command, payload),
     )
 
     with pytest.raises(BackendError, match="schema|missing"):
@@ -553,6 +617,58 @@ def test_settings_show_and_update_persistent_model_defaults(monkeypatch, tmp_pat
     assert payload["reasoning_level"] == "medium"
     assert payload["reasoning_budgets"]["medium"] == 2048
     assert saved[0].default_model == "model.gguf"
+
+
+def test_settings_persist_kv_and_placement_defaults(monkeypatch, tmp_path, capsys):
+    current = config.KestrelConfig(
+        default_model="model.gguf",
+        context_size="auto",
+        reasoning_level="auto",
+        kv_cache_type="auto",
+        kv_cache_turbo=False,
+        gpu_layers="auto",
+        cpu_moe="auto",
+    )
+    monkeypatch.setattr(health, "load_config", lambda: current)
+    saved = []
+    monkeypatch.setattr(health, "save_config", lambda value: saved.append(value) or tmp_path / "config.toml")
+    monkeypatch.setattr(health.state, "reload_state", lambda: None)
+
+    rc = _dispatch(
+        [
+            "settings",
+            "--kv-cache-type",
+            "q4_0",
+            "--turbo-kv",
+            "--gpu-layers",
+            "24",
+            "--cpu-moe",
+            "on",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kv_cache_type"] == "q4_0"
+    assert payload["kv_cache_turbo"] is True
+    assert payload["gpu_layers"] == "24"
+    assert payload["cpu_moe"] == "on"
+    assert saved[0].kv_cache_type == "q4_0"
+    assert saved[0].kv_cache_turbo is True
+    assert saved[0].gpu_layers == "24"
+    assert saved[0].cpu_moe == "on"
+
+
+def test_settings_turbo_kv_toggle_can_turn_off(monkeypatch, tmp_path, capsys):
+    current = config.KestrelConfig(default_model="model.gguf", kv_cache_turbo=True)
+    monkeypatch.setattr(health, "load_config", lambda: current)
+    saved = []
+    monkeypatch.setattr(health, "save_config", lambda value: saved.append(value) or tmp_path / "config.toml")
+    monkeypatch.setattr(health.state, "reload_state", lambda: None)
+
+    assert _dispatch(["settings", "--no-turbo-kv", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["kv_cache_turbo"] is False
+    assert saved[0].kv_cache_turbo is False
 
 
 def test_run_parser_uses_saved_settings_and_allows_one_launch_override(monkeypatch):
