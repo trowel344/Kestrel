@@ -431,6 +431,7 @@ def test_proxy_enriches_request_and_observes_streamed_response():
 
 
 def test_proxy_live_sunmap_checkpoint_and_code_evidence_round_trip(tmp_path):
+    pytest.importorskip("kestrel.sunmap_memory")
     from kestrel.sunmap_memory import SunMapMemory
 
     source = tmp_path / "service.py"
